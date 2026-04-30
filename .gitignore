@@ -1,1 +1,29 @@
 .crew/
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Persistent data
+data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
