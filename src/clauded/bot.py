@@ -1,8 +1,8 @@
 """Discord bot entrypoint for claudeD.
 
 Wires up event handlers (on_ready, on_message) and registers slash command
-groups (`/project`, `/session`). Handlers are placeholders at this stage —
-real logic arrives in later subtasks.
+groups (`/project`, `/session`). The on_message handler bridges Discord
+messages to a per-thread :class:`ClaudeBridge` session.
 """
 
 from __future__ import annotations
@@ -13,10 +13,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from .claude_bridge import AssistantMessage, ClaudeBridge, TextBlock
 from .config import Config, load_config
 from .project_manager import ProjectManager
+from .session_manager import SessionManager
 
 log = logging.getLogger("clauded.bot")
+
+# Discord hard-caps message content at 2000 characters; leave a small margin.
+DISCORD_MAX_LEN = 1900
 
 
 def _build_intents() -> discord.Intents:
@@ -28,12 +33,70 @@ def _build_intents() -> discord.Intents:
     return intents
 
 
+def _split_for_discord(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
+    """Split ``text`` into Discord-sized chunks, preferring line breaks."""
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        # Prefer splitting on a newline within the limit window.
+        cut = remaining.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def _collect_text(messages: list[object]) -> str:
+    """Collect text from ``AssistantMessage``/``TextBlock`` entries."""
+    parts: list[str] = []
+    for msg in messages:
+        if isinstance(msg, AssistantMessage):
+            for block in getattr(msg, "content", []) or []:
+                if isinstance(block, TextBlock):
+                    text = getattr(block, "text", "")
+                    if text:
+                        parts.append(text)
+    return "\n".join(parts).strip()
+
+
+async def _run_and_reply(
+    bridge: ClaudeBridge,
+    text: str,
+    target: discord.abc.Messageable,
+) -> None:
+    """Send ``text`` to ``bridge`` and forward Claude's text reply to ``target``."""
+    try:
+        collected: list[object] = []
+        async for msg in bridge.send_message(text):
+            collected.append(msg)
+    except Exception as exc:
+        log.exception("ClaudeBridge.send_message failed")
+        await target.send(f"Error talking to Claude: `{exc}`")
+        return
+
+    reply = _collect_text(collected)
+    if not reply:
+        await target.send("(Claude returned no text response)")
+        return
+
+    for chunk in _split_for_discord(reply):
+        await target.send(chunk)
+
+
 class ClaudedBot(commands.Bot):
     """Discord bot for the claudeD bridge."""
 
     def __init__(self, config: Config) -> None:
         super().__init__(command_prefix="!", intents=_build_intents())
-        self.config = config
+        self.session_manager = SessionManager()
         self.project_manager = ProjectManager()
 
     async def setup_hook(self) -> None:
@@ -52,15 +115,89 @@ class ClaudedBot(commands.Bot):
         if message.author.bot:
             return
 
+        channel = message.channel
+        parent_id = getattr(channel, "parent_id", None)
+
         log.info(
             "on_message channel=%s thread=%s author=%s len=%d",
-            message.channel.id,
-            getattr(message.channel, "parent_id", None),
+            channel.id,
+            parent_id,
             message.author,
             len(message.content),
         )
-        # Real bridging logic arrives in a later subtask.
+
+        try:
+            if parent_id is None:
+                await self._handle_channel_message(message)
+            else:
+                await self._handle_thread_message(message, parent_id)
+        except Exception:
+            log.exception("on_message handling failed")
+
         await self.process_commands(message)
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    async def _handle_channel_message(self, message: discord.Message) -> None:
+        """Channel (non-thread) message: open a new thread + session."""
+        channel = message.channel
+        if not self.project_manager.is_bound(channel.id):
+            return  # Channel isn't wired up; ignore.
+
+        project_path = self.project_manager.get_path(channel.id)
+        if project_path is None:
+            log.warning("Channel %s reports bound but has no path", channel.id)
+            return
+
+        if not isinstance(channel, discord.TextChannel):
+            log.warning("Bound channel %s is not a TextChannel; skipping", channel.id)
+            return
+
+        thread_name = (message.content or "claude session")[:80] or "claude session"
+        try:
+            thread = await message.create_thread(name=thread_name)
+        except Exception:
+            log.exception("Failed to create thread for channel=%s", channel.id)
+            return
+
+        try:
+            bridge = await self.session_manager.create_session(
+                thread.id, project_path, self.config
+            )
+        except Exception as exc:
+            log.exception("Failed to start ClaudeBridge")
+            await thread.send(f"Failed to start Claude session: `{exc}`")
+            return
+
+        await _run_and_reply(bridge, message.content, thread)
+
+    async def _handle_thread_message(
+        self, message: discord.Message, parent_id: int
+    ) -> None:
+        """Thread message: route to the existing/new session for that thread."""
+        if not self.project_manager.is_bound(parent_id):
+            return  # Parent channel isn't bound; ignore.
+
+        project_path = self.project_manager.get_path(parent_id)
+        if project_path is None:
+            log.warning("Parent channel %s bound but has no path", parent_id)
+            return
+
+        thread_id = message.channel.id
+        bridge = self.session_manager.get_session(thread_id)
+        if bridge is None or not bridge.is_active:
+            try:
+                bridge = await self.session_manager.create_session(
+                    thread_id, project_path, self.config
+                )
+            except Exception as exc:
+                log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
+                await message.channel.send(f"Failed to start Claude session: `{exc}`")
+                return
+
+        await _run_and_reply(bridge, message.content, message.channel)
 
 
 # ---------------------------------------------------------------------------
@@ -146,19 +283,49 @@ session_group = app_commands.Group(
 @session_group.command(name="stop", description="Stop the Claude session in this thread.")
 async def session_stop(interaction: discord.Interaction) -> None:
     log.info("/session stop channel=%s", interaction.channel_id)
-    await interaction.response.send_message(
-        "(placeholder) would stop the Claude session",
-        ephemeral=True,
-    )
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message(
+            "No thread context for this command.", ephemeral=True
+        )
+        return
+
+    stopped = await bot.session_manager.stop_session(thread_id)
+    if stopped:
+        await interaction.response.send_message(
+            "Claude session stopped.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "No active Claude session in this thread.", ephemeral=True
+        )
 
 
 @session_group.command(name="info", description="Show the current session's status.")
 async def session_info(interaction: discord.Interaction) -> None:
     log.info("/session info channel=%s", interaction.channel_id)
-    await interaction.response.send_message(
-        "(placeholder) session info goes here",
-        ephemeral=True,
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel_id
+    bridge = (
+        bot.session_manager.get_session(thread_id) if thread_id is not None else None
     )
+    if bridge is not None and bridge.is_active:
+        await interaction.response.send_message(
+            f"Session active — cwd `{bridge.project_path}`.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "No active Claude session in this thread.", ephemeral=True
+        )
 
 
 # ---------------------------------------------------------------------------
