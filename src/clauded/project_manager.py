@@ -79,6 +79,11 @@ class ProjectManager:
         entry = self._projects.get(str(channel_id))
         return entry["path"] if entry else None
 
+    # Alias used by callers that prefer the "path" terminology.
+    def get_path(self, channel_id: int) -> str | None:
+        """Alias of :meth:`get_project`."""
+        return self.get_project(channel_id)
+
     def is_bound(self, channel_id: int) -> bool:
         """Return True if ``channel_id`` has a binding."""
         return str(channel_id) in self._projects
