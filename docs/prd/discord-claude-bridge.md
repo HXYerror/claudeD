@@ -1,7 +1,7 @@
 # Discord-Claude Bridge (claudeD)
 
 ## Status
-Approved
+Done
 
 ## Overview
 
