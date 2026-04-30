@@ -15,6 +15,7 @@ from discord.ext import commands
 
 from .config import Config, load_config
 from .discord_renderer import DiscordRenderer
+from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
 
@@ -35,6 +36,7 @@ class ClaudedBot(commands.Bot):
 
     def __init__(self, config: Config) -> None:
         super().__init__(command_prefix="!", intents=_build_intents())
+        self.config = config
         self.session_manager = SessionManager()
         self.project_manager = ProjectManager()
 
@@ -102,8 +104,12 @@ class ClaudedBot(commands.Bot):
             return
 
         try:
+            handler = InteractionHandler(thread)
             bridge = await self.session_manager.create_session(
-                thread.id, project_path, self.config
+                thread.id,
+                project_path,
+                self.config,
+                on_ask_user=handler.handle_ask_user_question,
             )
         except Exception as exc:
             log.exception("Failed to start ClaudeBridge")
@@ -129,8 +135,12 @@ class ClaudedBot(commands.Bot):
         bridge = self.session_manager.get_session(thread_id)
         if bridge is None or not bridge.is_active:
             try:
+                handler = InteractionHandler(message.channel)
                 bridge = await self.session_manager.create_session(
-                    thread_id, project_path, self.config
+                    thread_id,
+                    project_path,
+                    self.config,
+                    on_ask_user=handler.handle_ask_user_question,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
