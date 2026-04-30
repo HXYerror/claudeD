@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from .claude_bridge import ClaudeBridge
+from .claude_bridge import ClaudeBridge, OnAskUser
 from .config import Config
 
 log = logging.getLogger("clauded.session_manager")
@@ -17,7 +17,11 @@ class SessionManager:
         self._sessions: dict[int, ClaudeBridge] = {}
 
     async def create_session(
-        self, thread_id: int, project_path: str, config: Config
+        self,
+        thread_id: int,
+        project_path: str,
+        config: Config,
+        on_ask_user: OnAskUser | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -29,7 +33,11 @@ class SessionManager:
             log.info("Replacing existing session for thread=%s", thread_id)
             await existing.stop()
 
-        bridge = ClaudeBridge(project_path=project_path, config=config)
+        bridge = ClaudeBridge(
+            project_path=project_path,
+            config=config,
+            on_ask_user=on_ask_user,
+        )
         await bridge.start()
         self._sessions[thread_id] = bridge
         log.info("Created session thread=%s cwd=%s", thread_id, project_path)
