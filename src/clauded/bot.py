@@ -14,6 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .config import Config, load_config
+from .project_manager import ProjectManager
 
 log = logging.getLogger("clauded.bot")
 
@@ -33,6 +34,7 @@ class ClaudedBot(commands.Bot):
     def __init__(self, config: Config) -> None:
         super().__init__(command_prefix="!", intents=_build_intents())
         self.config = config
+        self.project_manager = ProjectManager()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -62,7 +64,7 @@ class ClaudedBot(commands.Bot):
 
 
 # ---------------------------------------------------------------------------
-# Slash command groups (placeholder handlers).
+# Slash command groups.
 # ---------------------------------------------------------------------------
 
 project_group = app_commands.Group(
@@ -75,28 +77,64 @@ project_group = app_commands.Group(
 @app_commands.describe(path="Absolute path to the project directory")
 async def project_bind(interaction: discord.Interaction, path: str) -> None:
     log.info("/project bind path=%s channel=%s", path, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message(
+            "Cannot bind: no channel context.", ephemeral=True
+        )
+        return
+
+    try:
+        stored = bot.project_manager.bind(channel_id, path)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+
     await interaction.response.send_message(
-        f"(placeholder) would bind this channel to `{path}`",
-        ephemeral=True,
+        f"✅ Bound this channel to `{stored}`", ephemeral=True
     )
 
 
 @project_group.command(name="info", description="Show this channel's current binding.")
 async def project_info(interaction: discord.Interaction) -> None:
     log.info("/project info channel=%s", interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+
+    bound_path = bot.project_manager.get_project(channel_id)
+    if bound_path is None:
+        await interaction.response.send_message(
+            "This channel is not bound to a project. Use `/project bind` to set one.",
+            ephemeral=True,
+        )
+        return
+
     await interaction.response.send_message(
-        "(placeholder) project info goes here",
-        ephemeral=True,
+        f"📁 This channel is bound to `{bound_path}`", ephemeral=True
     )
 
 
 @project_group.command(name="unbind", description="Remove this channel's binding.")
 async def project_unbind(interaction: discord.Interaction) -> None:
     log.info("/project unbind channel=%s", interaction.channel_id)
-    await interaction.response.send_message(
-        "(placeholder) would unbind this channel",
-        ephemeral=True,
-    )
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+
+    if bot.project_manager.unbind(channel_id):
+        await interaction.response.send_message(
+            "✅ Removed this channel's project binding.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "This channel had no binding to remove.", ephemeral=True
+        )
 
 
 session_group = app_commands.Group(
