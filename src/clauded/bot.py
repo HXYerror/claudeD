@@ -13,15 +13,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .claude_bridge import AssistantMessage, ClaudeBridge, TextBlock
 from .config import Config, load_config
+from .discord_renderer import DiscordRenderer
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
 
 log = logging.getLogger("clauded.bot")
-
-# Discord hard-caps message content at 2000 characters; leave a small margin.
-DISCORD_MAX_LEN = 1900
 
 
 def _build_intents() -> discord.Intents:
@@ -31,64 +28,6 @@ def _build_intents() -> discord.Intents:
     intents.messages = True
     intents.guilds = True
     return intents
-
-
-def _split_for_discord(text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
-    """Split ``text`` into Discord-sized chunks, preferring line breaks."""
-    if not text:
-        return []
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        # Prefer splitting on a newline within the limit window.
-        cut = remaining.rfind("\n", 0, limit)
-        if cut <= 0:
-            cut = limit
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip("\n")
-    if remaining:
-        chunks.append(remaining)
-    return chunks
-
-
-def _collect_text(messages: list[object]) -> str:
-    """Collect text from ``AssistantMessage``/``TextBlock`` entries."""
-    parts: list[str] = []
-    for msg in messages:
-        if isinstance(msg, AssistantMessage):
-            for block in getattr(msg, "content", []) or []:
-                if isinstance(block, TextBlock):
-                    text = getattr(block, "text", "")
-                    if text:
-                        parts.append(text)
-    return "\n".join(parts).strip()
-
-
-async def _run_and_reply(
-    bridge: ClaudeBridge,
-    text: str,
-    target: discord.abc.Messageable,
-) -> None:
-    """Send ``text`` to ``bridge`` and forward Claude's text reply to ``target``."""
-    try:
-        collected: list[object] = []
-        async for msg in bridge.send_message(text):
-            collected.append(msg)
-    except Exception as exc:
-        log.exception("ClaudeBridge.send_message failed")
-        await target.send(f"Error talking to Claude: `{exc}`")
-        return
-
-    reply = _collect_text(collected)
-    if not reply:
-        await target.send("(Claude returned no text response)")
-        return
-
-    for chunk in _split_for_discord(reply):
-        await target.send(chunk)
 
 
 class ClaudedBot(commands.Bot):
@@ -171,7 +110,8 @@ class ClaudedBot(commands.Bot):
             await thread.send(f"Failed to start Claude session: `{exc}`")
             return
 
-        await _run_and_reply(bridge, message.content, thread)
+        renderer = DiscordRenderer(thread)
+        await renderer.render_response(bridge, message.content)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -197,7 +137,8 @@ class ClaudedBot(commands.Bot):
                 await message.channel.send(f"Failed to start Claude session: `{exc}`")
                 return
 
-        await _run_and_reply(bridge, message.content, message.channel)
+        renderer = DiscordRenderer(message.channel)
+        await renderer.render_response(bridge, message.content)
 
 
 # ---------------------------------------------------------------------------
