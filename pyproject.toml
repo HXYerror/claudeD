@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clauded"
+version = "0.1.0"
+description = "Discord-Claude Bridge: expose Claude Code via a Discord bot"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [
+    { name = "claudeD contributors" },
+]
+dependencies = [
+    "discord.py>=2.4,<3.0",
+    "claude-code-sdk>=0.0.10",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+clauded = "clauded.bot:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
