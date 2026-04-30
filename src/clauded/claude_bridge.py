@@ -87,13 +87,22 @@ class ClaudeBridge:
 
         Yields the raw SDK message objects (``AssistantMessage``,
         ``ResultMessage``, etc.) so callers can decide how to render them.
+
+        If the underlying SDK raises, the bridge marks itself inactive so
+        callers can detect the dead session and recreate it on the next
+        request. The exception is re-raised so the renderer can surface it.
         """
         if self._client is None or not self._active:
             raise RuntimeError("ClaudeBridge.send_message called before start()")
 
-        await self._client.query(text)
-        async for msg in self._client.receive_response():
-            yield msg
+        try:
+            await self._client.query(text)
+            async for msg in self._client.receive_response():
+                yield msg
+        except Exception:
+            log.exception("Claude SDK stream failed; marking bridge inactive")
+            self._active = False
+            raise
 
     async def stop(self) -> None:
         """Disconnect the underlying client (idempotent)."""

@@ -99,8 +99,21 @@ class ClaudedBot(commands.Bot):
         thread_name = (message.content or "claude session")[:80] or "claude session"
         try:
             thread = await message.create_thread(name=thread_name)
-        except Exception:
+        except discord.Forbidden:
+            log.exception("Missing permission to create threads in channel=%s", channel.id)
+            try:
+                await channel.send(
+                    "❌ I don't have permission to create threads in this channel."
+                )
+            except discord.HTTPException:
+                log.debug("Could not surface thread-permission error to channel")
+            return
+        except discord.HTTPException:
             log.exception("Failed to create thread for channel=%s", channel.id)
+            try:
+                await channel.send("❌ Failed to create a thread for this message.")
+            except discord.HTTPException:
+                log.debug("Could not surface thread-creation error to channel")
             return
 
         try:
@@ -113,11 +126,20 @@ class ClaudedBot(commands.Bot):
             )
         except Exception as exc:
             log.exception("Failed to start ClaudeBridge")
-            await thread.send(f"Failed to start Claude session: `{exc}`")
+            try:
+                await thread.send(f"❌ Failed to start Claude session: `{exc}`")
+            except discord.HTTPException:
+                log.debug("Could not post session-start error to thread")
             return
 
         renderer = DiscordRenderer(thread)
-        await renderer.render_response(bridge, message.content)
+        try:
+            await renderer.render_response(bridge, message.content)
+        except Exception:
+            log.exception("Renderer failed for thread=%s", thread.id)
+            # The bridge is likely in a bad state — drop it so the next
+            # message in this thread starts a fresh session.
+            await self.session_manager.stop_session(thread.id)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -144,11 +166,21 @@ class ClaudedBot(commands.Bot):
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
-                await message.channel.send(f"Failed to start Claude session: `{exc}`")
+                try:
+                    await message.channel.send(
+                        f"❌ Failed to start Claude session: `{exc}`"
+                    )
+                except discord.HTTPException:
+                    log.debug("Could not post session-start error to thread")
                 return
 
         renderer = DiscordRenderer(message.channel)
-        await renderer.render_response(bridge, message.content)
+        try:
+            await renderer.render_response(bridge, message.content)
+        except Exception:
+            log.exception("Renderer failed for thread=%s", thread_id)
+            # Drop the dead bridge so the next message recreates it.
+            await self.session_manager.stop_session(thread_id)
 
 
 # ---------------------------------------------------------------------------

@@ -251,6 +251,15 @@ class DiscordRenderer:
             return None
         try:
             return await self.target.send(content)
+        except discord.RateLimited as exc:
+            retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
+            log.warning("Discord send rate-limited; sleeping %.2fs", retry)
+            await asyncio.sleep(retry)
+            try:
+                return await self.target.send(content)
+            except discord.HTTPException:
+                log.exception("Discord send failed after rate-limit backoff; dropping")
+                return None
         except discord.HTTPException:
             log.warning("Discord send failed; backing off and retrying once")
             await asyncio.sleep(HTTP_BACKOFF_SECONDS)
@@ -265,6 +274,14 @@ class DiscordRenderer:
         try:
             await msg.edit(content=content)
             return
+        except discord.RateLimited as exc:
+            retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
+            log.debug("Discord edit rate-limited; sleeping %.2fs", retry)
+            await asyncio.sleep(retry)
+            try:
+                await msg.edit(content=content)
+            except discord.HTTPException:
+                log.warning("Discord edit failed after rate-limit backoff; dropping")
         except discord.HTTPException:
             log.debug("Discord edit failed; backing off and retrying once")
             await asyncio.sleep(HTTP_BACKOFF_SECONDS)
