@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -23,6 +24,22 @@ from .project_manager import ProjectManager
 from .session_manager import SessionManager
 
 log = logging.getLogger("clauded.bot")
+
+
+def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
+    """Best-effort cleanup of an attachment temp directory.
+
+    Called after the renderer finishes (success or failure) to avoid
+    leaking on-disk attachments for the lifetime of the process. We
+    swallow ``OSError`` because the worst case is a stale temp dir that
+    the OS will eventually clean up.
+    """
+    if tmp_dir is None:
+        return
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except OSError:  # pragma: no cover - rmtree(ignore_errors=True) shouldn't raise
+        log.debug("Failed to clean up attachment tempdir %s", tmp_dir)
 
 
 def _build_intents() -> discord.Intents:
@@ -119,34 +136,38 @@ class ClaudedBot(commands.Bot):
                 log.debug("Could not surface thread-creation error to channel")
             return
 
-        try:
-            handler = InteractionHandler(thread)
-            bridge = await self.session_manager.create_session(
-                thread.id,
-                project_path,
-                self.config,
-                on_ask_user=handler.handle_ask_user_question,
-            )
-        except Exception as exc:
-            log.exception("Failed to start ClaudeBridge")
-            try:
-                await thread.send(f"❌ Failed to start Claude session: `{exc}`")
-            except discord.HTTPException:
-                log.debug("Could not post session-start error to thread")
-            return
-
-        user_text = await self._compose_user_text(message)
-        renderer = DiscordRenderer(thread)
-        # Serialize against any concurrent message that lands in this brand-new
-        # thread (rare, but possible if Discord delivers events out of order).
+        # Acquire the per-thread lock *before* creating the session so a
+        # concurrent thread message that Discord delivers out of order can't
+        # race in and replace+disconnect the bridge we're about to build.
         async with self.session_manager.get_lock(thread.id):
-            await self._render_with_retry(
-                renderer=renderer,
-                bridge=bridge,
-                user_text=user_text,
-                thread=thread,
-                project_path=project_path,
-            )
+            try:
+                handler = InteractionHandler(thread)
+                bridge = await self.session_manager.create_session(
+                    thread.id,
+                    project_path,
+                    self.config,
+                    on_ask_user=handler.handle_ask_user_question,
+                )
+            except Exception as exc:
+                log.exception("Failed to start ClaudeBridge")
+                try:
+                    await thread.send(f"❌ Failed to start Claude session: `{exc}`")
+                except discord.HTTPException:
+                    log.debug("Could not post session-start error to thread")
+                return
+
+            user_text, tmp_dir = await self._compose_user_text(message)
+            renderer = DiscordRenderer(thread)
+            try:
+                await self._render_with_retry(
+                    renderer=renderer,
+                    bridge=bridge,
+                    user_text=user_text,
+                    thread=thread,
+                    project_path=project_path,
+                )
+            finally:
+                _cleanup_tmp_dir(tmp_dir)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -185,35 +206,39 @@ class ClaudedBot(commands.Bot):
                         log.debug("Could not post session-start error to thread")
                     return
 
-            user_text = await self._compose_user_text(message)
+            user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel)
-            await self._render_with_retry(
-                renderer=renderer,
-                bridge=bridge,
-                user_text=user_text,
-                thread=message.channel,
-                project_path=project_path,
-            )
+            try:
+                await self._render_with_retry(
+                    renderer=renderer,
+                    bridge=bridge,
+                    user_text=user_text,
+                    thread=message.channel,
+                    project_path=project_path,
+                )
+            finally:
+                _cleanup_tmp_dir(tmp_dir)
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
     # ------------------------------------------------------------------
 
-    async def _compose_user_text(self, message: discord.Message) -> str:
+    async def _compose_user_text(
+        self, message: discord.Message
+    ) -> tuple[str, Path | None]:
         """Build the text prompt sent to Claude, including any attachments.
 
         For each attachment we download it to a per-message temp directory
         and prepend a line announcing the filename and on-disk path so
-        Claude can choose to ``Read`` it. The temp directory persists for
-        the life of the bot process — we don't try to clean it up here
-        because Claude may still be reading from it after this method
-        returns. Discord caps attachment size at 25MB on free guilds, so
-        the on-disk footprint is bounded.
+        Claude can choose to ``Read`` it. The temp directory is returned
+        alongside the prompt so the caller can clean it up after Claude
+        finishes processing the message. Discord caps attachment size at
+        25MB on free guilds, so the on-disk footprint is bounded.
         """
         text = message.content or ""
         attachments = list(message.attachments or [])
         if not attachments:
-            return text
+            return text, None
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="clauded_att_"))
         notes: list[str] = []
@@ -233,10 +258,13 @@ class ClaudedBot(commands.Bot):
             notes.append(f"User attached file: {safe_name} at {target}")
 
         if not notes:
-            return text
+            # No attachments actually saved — drop the empty tmp dir now.
+            _cleanup_tmp_dir(tmp_dir)
+            return text, None
         # Prepend so Claude sees the file references before the user's prose.
         prefix = "\n".join(notes)
-        return f"{prefix}\n\n{text}" if text else prefix
+        composed = f"{prefix}\n\n{text}" if text else prefix
+        return composed, tmp_dir
 
     async def _render_with_retry(
         self,
