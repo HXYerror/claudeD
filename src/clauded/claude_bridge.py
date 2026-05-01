@@ -55,14 +55,17 @@ class ClaudeBridge:
         on_ask_user: OnAskUser | None = None,
         system_prompt: str | None = None,
         model_override: str | None = None,
+        resume_session_id: str | None = None,
     ) -> None:
         self.project_path = project_path
         self._config = config
         self.on_ask_user = on_ask_user
         self.system_prompt = system_prompt
         self._model_override = model_override
+        self._resume_session_id = resume_session_id
         self._client: ClaudeSDKClient | None = None
         self._active = False
+        self._session_id: str | None = None
         # Aggregate stats updated whenever we observe a ResultMessage. They
         # are purely informational (surfaced via /session info) so the
         # exact semantics — total cost across the session, last-known turn
@@ -70,6 +73,11 @@ class ClaudeBridge:
         self.total_cost: float = 0.0
         self.num_turns: int = 0
         self._sdk_model: str | None = None
+
+    @property
+    def session_id(self) -> str | None:
+        """Return the session ID from the last ResultMessage."""
+        return self._session_id
 
     @property
     def config(self) -> Config:
@@ -96,6 +104,7 @@ class ClaudeBridge:
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
+            resume=self._resume_session_id,
             **({"append_system_prompt": self.system_prompt} if self.system_prompt else {}),
         )
         client = ClaudeSDKClient(options=options)
@@ -103,9 +112,10 @@ class ClaudeBridge:
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s",
+            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s",
             self.project_path,
             bool(self.on_ask_user),
+            self._resume_session_id,
         )
 
     async def send_message(self, text: str) -> AsyncIterator[object]:
@@ -182,6 +192,11 @@ class ClaudeBridge:
         missing — newer/older SDKs may rename fields, and we'd rather
         surface partial stats than crash the stream.
         """
+        # Extract session_id from ResultMessage
+        sid = getattr(msg, "session_id", None)
+        if isinstance(sid, str) and sid:
+            self._session_id = sid
+
         cost = getattr(msg, "total_cost_usd", None)
         if isinstance(cost, (int, float)):
             # ResultMessage carries the cumulative cost of the whole

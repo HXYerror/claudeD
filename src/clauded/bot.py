@@ -25,8 +25,12 @@ from .discord_renderer import DiscordRenderer
 from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
+from .session_store import SessionStore
+from .cost_tracker import CostTracker
 
 log = logging.getLogger("clauded.bot")
+
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
 
 def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
@@ -60,14 +64,16 @@ class ClaudedBot(commands.Bot):
     def __init__(self, config: Config) -> None:
         super().__init__(command_prefix="!", intents=_build_intents())
         self.config = config
-        self.session_manager = SessionManager()
+        self.session_manager = SessionManager(session_store=SessionStore())
         self.project_manager = ProjectManager(projects_root=config.projects_root)
         self._start_time = time.time()
+        self.cost_tracker = CostTracker()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
+        self.tree.add_command(cost_group)
         self.tree.add_command(switch_model)
         self.tree.add_command(health_check)
         synced = await self.tree.sync()
@@ -183,6 +189,7 @@ class ClaudedBot(commands.Bot):
             else:
                 user_text = content
             renderer = DiscordRenderer(thread)
+            cost_before = bridge.total_cost if bridge else 0.0
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -193,6 +200,11 @@ class ClaudedBot(commands.Bot):
                 )
             finally:
                 _cleanup_tmp_dir(tmp_dir)
+                cost_after = bridge.total_cost if bridge else 0.0
+                response_cost = cost_after - cost_before
+                if response_cost > 0:
+                    self.cost_tracker.record(channel.id, response_cost)
+                self.session_manager.save_session_state(thread.id)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -216,12 +228,19 @@ class ClaudedBot(commands.Bot):
                 try:
                     handler = InteractionHandler(message.channel)
                     system_prompt = self.project_manager.get_system_prompt(parent_id)
+                    # Check for stored session to resume
+                    stored = self.session_manager.get_stored_session(thread_id)
+                    resume_id = stored.get("session_id") if stored else None
+                    stored_model = stored.get("model") if stored else None
+                    stored_prompt = stored.get("system_prompt") if stored else None
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
                         on_ask_user=handler.handle_ask_user_question,
-                        system_prompt=system_prompt,
+                        system_prompt=stored_prompt or system_prompt,
+                        model_override=stored_model,
+                        resume_session_id=resume_id,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -235,6 +254,7 @@ class ClaudedBot(commands.Bot):
 
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel)
+            cost_before = bridge.total_cost if bridge else 0.0
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -245,6 +265,11 @@ class ClaudedBot(commands.Bot):
                 )
             finally:
                 _cleanup_tmp_dir(tmp_dir)
+                cost_after = bridge.total_cost if bridge else 0.0
+                response_cost = cost_after - cost_before
+                if response_cost > 0:
+                    self.cost_tracker.record(parent_id, response_cost)
+                self.session_manager.save_session_state(thread_id)
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -282,7 +307,11 @@ class ClaudedBot(commands.Bot):
             except (discord.HTTPException, OSError):
                 log.exception("Failed to save attachment %s", safe_name)
                 continue
-            notes.append(f"User attached file: {safe_name} at {target}")
+            ext = os.path.splitext(safe_name)[1].lower()
+            if ext in _IMAGE_EXTENSIONS:
+                notes.append(f"[User attached image: {safe_name}]\nImage file saved at: {target}")
+            else:
+                notes.append(f"[User attached file: {safe_name}]\nFile saved at: {target}")
 
         if not notes:
             # No attachments actually saved — drop the empty tmp dir now.
@@ -349,6 +378,56 @@ class ClaudedBot(commands.Bot):
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
+
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking slash commands.
+# ---------------------------------------------------------------------------
+
+cost_group = app_commands.Group(
+    name="cost",
+    description="Track API costs.",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@cost_group.command(name="show", description="Show cost for this channel")
+async def cost_show(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    total, calls = bot.cost_tracker.get_channel_cost(parent_id)
+    await interaction.response.send_message(
+        f"\U0001f4b0 Channel cost: ${total:.4f} ({calls} API calls)", ephemeral=True
+    )
+
+
+@cost_group.command(name="total", description="Show total cost across all channels")
+async def cost_total(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    total = bot.cost_tracker.get_total_cost()
+    await interaction.response.send_message(
+        f"\U0001f4b0 Total cost: ${total:.4f}", ephemeral=True
+    )
+
+
+@cost_group.command(name="reset", description="Reset cost for this channel")
+async def cost_reset(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    bot.cost_tracker.reset_channel(parent_id)
+    await interaction.response.send_message("\u2705 Channel cost reset.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -541,6 +620,41 @@ async def session_interrupt(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Failed to interrupt.", ephemeral=True)
 
 
+
+@session_group.command(name="resume", description="Resume the previous Claude session in this thread")
+async def session_resume(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("No thread context.", ephemeral=True)
+        return
+    stored = bot.session_manager.get_stored_session(thread_id)
+    if not stored:
+        await interaction.response.send_message("No saved session to resume.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    # Stop any existing session and create new one under lock
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        handler = InteractionHandler(interaction.channel)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, stored["project_path"], bot.config,
+                system_prompt=stored.get("system_prompt"),
+                model_override=stored.get("model"),
+                on_ask_user=handler.handle_ask_user_question,
+                resume_session_id=stored["session_id"],
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to resume: `{exc}`", ephemeral=True)
+            return
+    await interaction.followup.send("🔄 Session resumed with previous context.")
+
+
 @session_group.command(name="list", description="List all active Claude sessions")
 async def session_list(interaction: discord.Interaction) -> None:
     bot = interaction.client
@@ -585,6 +699,7 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     if not project_path:
         await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
         return
+    await interaction.response.defer()
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
     # Find the thread/channel for InteractionHandler
     channel = interaction.channel
@@ -598,7 +713,7 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
             model_override=name,
             on_ask_user=handler.handle_ask_user_question,
         )
-    await interaction.response.send_message(f"🔄 Switched to `{name}`. New session started.")
+    await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
 
 @app_commands.command(name="health", description="Show bot health and status")

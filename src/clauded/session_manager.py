@@ -7,6 +7,7 @@ import logging
 
 from .claude_bridge import ClaudeBridge, OnAskUser
 from .config import Config
+from .session_store import SessionStore
 
 log = logging.getLogger("clauded.session_manager")
 
@@ -14,13 +15,14 @@ log = logging.getLogger("clauded.session_manager")
 class SessionManager:
     """Tracks one :class:`ClaudeBridge` per Discord thread."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_store: SessionStore | None = None) -> None:
         self._sessions: dict[int, ClaudeBridge] = {}
         # One asyncio.Lock per thread, used by callers to serialize message
         # processing against the same Claude session. The lock outlives any
         # single bridge so concurrent producers don't all race to (re)create
         # a session in parallel.
         self._locks: dict[int, asyncio.Lock] = {}
+        self._session_store = session_store or SessionStore()
 
     def get_lock(self, thread_id: int) -> asyncio.Lock:
         """Return (creating if needed) the lock for ``thread_id``.
@@ -42,6 +44,7 @@ class SessionManager:
         on_ask_user: OnAskUser | None = None,
         system_prompt: str | None = None,
         model_override: str | None = None,
+        resume_session_id: str | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -59,12 +62,13 @@ class SessionManager:
             on_ask_user=on_ask_user,
             system_prompt=system_prompt,
             model_override=model_override,
+            resume_session_id=resume_session_id,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge
         # Make sure a lock exists for this thread; future callers will reuse it.
         self.get_lock(thread_id)
-        log.info("Created session thread=%s cwd=%s", thread_id, project_path)
+        log.info("Created session thread=%s cwd=%s resume=%s", thread_id, project_path, resume_session_id)
         return bridge
 
     def get_session(self, thread_id: int) -> ClaudeBridge | None:
@@ -92,6 +96,18 @@ class SessionManager:
         log.info("Stopped session thread=%s", thread_id)
         return True
 
+    def save_session_state(self, thread_id: int) -> None:
+        """Persist the current session state for ``thread_id`` to the store."""
+        bridge = self._sessions.get(thread_id)
+        if bridge and bridge.session_id:
+            self._session_store.save_session(
+                thread_id, bridge.session_id, bridge.project_path,
+                model=bridge.model, system_prompt=bridge.system_prompt,
+            )
+
+    def get_stored_session(self, thread_id: int) -> dict | None:
+        """Return persisted session metadata for ``thread_id``, or ``None``."""
+        return self._session_store.get_session_info(thread_id)
 
     def list_sessions(self) -> dict[int, ClaudeBridge]:
         """Return a snapshot of all active sessions."""
