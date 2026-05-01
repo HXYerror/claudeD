@@ -186,25 +186,46 @@ class _BaseAskView(discord.ui.View):
 
     def __init__(self, *, timeout: float) -> None:
         super().__init__(timeout=timeout)
-        self._result_future: asyncio.Future[list[int] | None] = (
-            asyncio.get_running_loop().create_future()
-        )
+        # Defer creating the asyncio.Future until ``wait_for_result`` is
+        # actually called. ``asyncio.get_running_loop()`` raises when no
+        # loop is running, which makes constructing a view from sync code
+        # (tests, early init) impossible if we eagerly bound the future
+        # here. Instead, callbacks stash the result in ``_result`` and the
+        # future — if any waiter has registered — is resolved at that point.
+        self._result_future: asyncio.Future[list[int] | None] | None = None
+        self._result: list[int] | None = None
+        self._resolved: bool = False
 
     async def wait_for_result(self) -> list[int] | None:
         """Block until the user picks (or the view times out)."""
+        # If a callback (or the timeout) already fired before we started
+        # waiting, return the captured value immediately rather than
+        # blocking on a future that will never be set.
+        if self._resolved:
+            return self._result
+        if self._result_future is None:
+            self._result_future = asyncio.get_running_loop().create_future()
         try:
             return await self._result_future
         except asyncio.CancelledError:
             return None
 
     async def on_timeout(self) -> None:  # type: ignore[override]
-        if not self._result_future.done():
-            self._result_future.set_result(None)
+        self._set_result(None)
 
     def _resolve(self, indices: list[int]) -> None:
-        if not self._result_future.done():
-            self._result_future.set_result(indices)
+        self._set_result(indices)
         self.stop()
+
+    def _set_result(self, value: list[int] | None) -> None:
+        """Capture the outcome and notify any pending ``wait_for_result``."""
+        if self._resolved:
+            return
+        self._resolved = True
+        self._result = value
+        fut = self._result_future
+        if fut is not None and not fut.done():
+            fut.set_result(value)
 
 
 class AskButtonView(_BaseAskView):
