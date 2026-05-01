@@ -11,6 +11,9 @@ import logging
 import os
 import shutil
 import tempfile
+import time
+import sys
+import asyncio
 from pathlib import Path
 
 import discord
@@ -59,11 +62,14 @@ class ClaudedBot(commands.Bot):
         self.config = config
         self.session_manager = SessionManager()
         self.project_manager = ProjectManager(projects_root=config.projects_root)
+        self._start_time = time.time()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
+        self.tree.add_command(switch_model)
+        self.tree.add_command(health_check)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -103,6 +109,10 @@ class ClaudedBot(commands.Bot):
 
     async def _handle_channel_message(self, message: discord.Message) -> None:
         """Channel (non-thread) message: open a new thread + session."""
+        # Only trigger if bot is mentioned
+        if self.user and self.user.id not in [m.id for m in message.mentions]:
+            return
+
         channel = message.channel
         if not self.project_manager.is_bound(channel.id):
             return  # Channel isn't wired up; ignore.
@@ -116,7 +126,14 @@ class ClaudedBot(commands.Bot):
             log.warning("Bound channel %s is not a TextChannel; skipping", channel.id)
             return
 
-        thread_name = (message.content or "claude session")[:100] or "claude session"
+        # Strip the bot mention from the message content
+        content = message.content
+        if self.user:
+            content = content.replace(f'<@{self.user.id}>', '').replace(f'<@!{self.user.id}>', '').strip()
+        if not content:
+            content = "Hello"  # fallback if user only typed @bot with no message
+
+        thread_name = (content or "claude session")[:100] or "claude session"
         try:
             thread = await message.create_thread(name=thread_name)
         except discord.Forbidden:
@@ -142,11 +159,13 @@ class ClaudedBot(commands.Bot):
         async with self.session_manager.get_lock(thread.id):
             try:
                 handler = InteractionHandler(thread)
+                system_prompt = self.project_manager.get_system_prompt(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
                     on_ask_user=handler.handle_ask_user_question,
+                    system_prompt=system_prompt,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -157,6 +176,12 @@ class ClaudedBot(commands.Bot):
                 return
 
             user_text, tmp_dir = await self._compose_user_text(message)
+            # Use mention-stripped content instead of raw message content
+            if tmp_dir is not None:
+                # Attachments present: replace raw content portion with stripped content
+                user_text = user_text.replace(message.content, content) if message.content else user_text
+            else:
+                user_text = content
             renderer = DiscordRenderer(thread)
             try:
                 await self._render_with_retry(
@@ -190,11 +215,13 @@ class ClaudedBot(commands.Bot):
             if bridge is None or not bridge.is_active:
                 try:
                     handler = InteractionHandler(message.channel)
+                    system_prompt = self.project_manager.get_system_prompt(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
                         on_ask_user=handler.handle_ask_user_question,
+                        system_prompt=system_prompt,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -381,9 +408,11 @@ async def project_info(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.send_message(
-        f"📁 This channel is bound to `{bound_path}`", ephemeral=True
-    )
+    lines = [f"📁 This channel is bound to `{bound_path}`"]
+    sp = bot.project_manager.get_system_prompt(channel_id)
+    if sp:
+        lines.append(f"📝 System prompt: {sp}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @project_group.command(name="unbind", description="Remove this channel's binding.")
@@ -403,6 +432,28 @@ async def project_unbind(interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "This channel had no binding to remove.", ephemeral=True
         )
+
+
+@project_group.command(name="system-prompt", description="Set a system prompt for this project")
+@app_commands.describe(text="System prompt text, or 'clear' to remove")
+async def project_system_prompt(interaction: discord.Interaction, text: str) -> None:
+    log.info("/project system-prompt channel=%s", interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+
+    if not bot.project_manager.is_bound(channel_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+
+    if text.lower() == "clear":
+        bot.project_manager.clear_system_prompt(channel_id)
+        await interaction.response.send_message("✅ System prompt cleared", ephemeral=True)
+    else:
+        bot.project_manager.set_system_prompt(channel_id, text)
+        await interaction.response.send_message("✅ System prompt set", ephemeral=True)
 
 
 session_group = app_commands.Group(
@@ -467,6 +518,124 @@ async def session_info(interaction: discord.Interaction) -> None:
             "No active Claude session in this thread.", ephemeral=True
         )
 
+
+
+@session_group.command(name="interrupt", description="Interrupt the current Claude operation in this thread")
+async def session_interrupt(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("Use this in a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session in this thread.", ephemeral=True)
+        return
+    interrupted = await bridge.interrupt()
+    if interrupted:
+        await interaction.response.send_message("⚠️ Claude interrupted by user.")
+    else:
+        await interaction.response.send_message("Failed to interrupt.", ephemeral=True)
+
+
+@session_group.command(name="list", description="List all active Claude sessions")
+async def session_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    sessions = bot.session_manager.list_sessions()
+    if not sessions:
+        await interaction.response.send_message("No active sessions.", ephemeral=True)
+        return
+    embed = discord.Embed(title="📋 Active Sessions", color=discord.Color.blue())
+    for thread_id, bridge in sessions.items():
+        model = getattr(bridge, 'model', 'unknown')
+        cost = f"${bridge.total_cost:.4f}" if hasattr(bridge, 'total_cost') else "N/A"
+        turns = getattr(bridge, 'num_turns', 0)
+        embed.add_field(
+            name=f"Thread {thread_id}",
+            value=f"📁 `{bridge.project_path}`\n🤖 {model} | 💰 {cost} | 🔄 {turns} turns",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Top-level slash commands
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="model", description="Switch Claude model for this thread")
+@app_commands.describe(name="Model: sonnet, opus, haiku, or full model ID")
+async def switch_model(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    # Get project path and system prompt
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    # Find the thread/channel for InteractionHandler
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        await bot.session_manager.create_session(
+            thread_id, project_path, bot.config,
+            system_prompt=system_prompt,
+            model_override=name,
+            on_ask_user=handler.handle_ask_user_question,
+        )
+    await interaction.response.send_message(f"🔄 Switched to `{name}`. New session started.")
+
+
+@app_commands.command(name="health", description="Show bot health and status")
+async def health_check(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+
+    uptime_s = int(time.time() - bot._start_time)
+    hours, remainder = divmod(uptime_s, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+    active_sessions = len(bot.session_manager.list_sessions())
+    bound_projects = len(bot.project_manager._projects)
+
+    # Get claude version
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        claude_version = stdout.decode().strip() or "unknown"
+    except Exception:
+        claude_version = "unavailable"
+
+    embed = discord.Embed(title="🏥 Bot Health", color=discord.Color.green())
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Active Sessions", value=str(active_sessions), inline=True)
+    embed.add_field(name="Bound Projects", value=str(bound_projects), inline=True)
+    embed.add_field(name="Claude CLI", value=claude_version, inline=True)
+    embed.add_field(name="Python", value=sys.version.split()[0], inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------------------------------------------------------------------
 # Entrypoint
