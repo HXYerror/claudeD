@@ -515,6 +515,28 @@ async def session_info(interaction: discord.Interaction) -> None:
 
 
 
+@session_group.command(name="interrupt", description="Interrupt the current Claude operation in this thread")
+async def session_interrupt(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("Use this in a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session in this thread.", ephemeral=True)
+        return
+    interrupted = await bridge.interrupt()
+    if interrupted:
+        await interaction.response.send_message("⚠️ Claude interrupted by user.")
+    else:
+        await interaction.response.send_message("Failed to interrupt.", ephemeral=True)
+
+
+
 
 # ---------------------------------------------------------------------------
 # Top-level slash commands

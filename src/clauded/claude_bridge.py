@@ -131,6 +131,17 @@ class ClaudeBridge:
                     )
             raise
 
+    async def interrupt(self) -> bool:
+        """Interrupt the current Claude operation. Returns True if interrupted."""
+        if not self._active or self._client is None:
+            return False
+        try:
+            await self._client.interrupt()
+            return True
+        except Exception:
+            log.warning("Failed to interrupt Claude session", exc_info=True)
+            return False
+
     async def stop(self) -> None:
         """Disconnect the underlying client (idempotent)."""
         if self._client is None:
