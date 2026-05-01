@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
 
+import re
+
 from .claude_bridge import (
     ResultMessage,
     TextBlock,
@@ -59,6 +61,10 @@ EDIT_INTERVAL_SECONDS = 1.2
 
 # Sleep used when an edit/send fails (likely rate-limited) before continuing.
 HTTP_BACKOFF_SECONDS = 0.5
+
+# Regex patterns for Claude channel/thread management markers.
+_THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
+_CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
 
 
 class DiscordRenderer:
@@ -203,6 +209,40 @@ class DiscordRenderer:
     # Streaming helpers
     # ------------------------------------------------------------------
 
+    async def _process_markers(self, text: str) -> str:
+        """Replace [CREATE_THREAD: x] and [CREATE_CHANNEL: x] markers with results."""
+
+        # Process thread markers
+        for match in _THREAD_PATTERN.finditer(text):
+            thread_name = match.group(1).strip()[:100]
+            try:
+                # self.target should be a thread or channel
+                channel = self.target
+                if hasattr(channel, 'parent'):
+                    channel = channel.parent  # if we're in a thread, create in parent
+
+                # Create a thread (need a message to attach it to)
+                msg = await channel.send(f"📌 Creating thread: {thread_name}")
+                thread = await msg.create_thread(name=thread_name)
+                text = text.replace(match.group(0), f"✅ Created thread: {thread.mention}")
+            except Exception as e:
+                text = text.replace(match.group(0), f"❌ Failed to create thread: {e}")
+
+        # Process channel markers
+        for match in _CHANNEL_PATTERN.finditer(text):
+            channel_name = match.group(1).strip()[:100]
+            try:
+                guild = self.target.guild
+                if guild is None:
+                    text = text.replace(match.group(0), "❌ Cannot create channel: no guild context")
+                    continue
+                new_channel = await guild.create_text_channel(name=channel_name)
+                text = text.replace(match.group(0), f"✅ Created channel: {new_channel.mention}")
+            except Exception as e:
+                text = text.replace(match.group(0), f"❌ Failed to create channel: {e}")
+
+        return text
+
     async def _typewriter_tick(
         self, live_msg: discord.Message | None, buffer: str
     ) -> tuple[discord.Message | None, str]:
@@ -272,6 +312,10 @@ class DiscordRenderer:
         tool_msgs: dict[str, tuple[discord.Message, str]],
     ) -> None:
         """Send any remaining text once the stream completes."""
+        # Process channel/thread management markers before sending.
+        if buffer:
+            buffer = await self._process_markers(buffer)
+
         if typewriter and live_msg is not None:
             await self._finalize_typewriter(live_msg, buffer)
             return
