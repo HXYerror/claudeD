@@ -108,6 +108,10 @@ class ClaudedBot(commands.Bot):
 
     async def _handle_channel_message(self, message: discord.Message) -> None:
         """Channel (non-thread) message: open a new thread + session."""
+        # Only trigger if bot is mentioned
+        if self.user and self.user.id not in [m.id for m in message.mentions]:
+            return
+
         channel = message.channel
         if not self.project_manager.is_bound(channel.id):
             return  # Channel isn't wired up; ignore.
@@ -121,7 +125,14 @@ class ClaudedBot(commands.Bot):
             log.warning("Bound channel %s is not a TextChannel; skipping", channel.id)
             return
 
-        thread_name = (message.content or "claude session")[:100] or "claude session"
+        # Strip the bot mention from the message content
+        content = message.content
+        if self.user:
+            content = content.replace(f'<@{self.user.id}>', '').replace(f'<@!{self.user.id}>', '').strip()
+        if not content:
+            content = "Hello"  # fallback if user only typed @bot with no message
+
+        thread_name = (content or "claude session")[:100] or "claude session"
         try:
             thread = await message.create_thread(name=thread_name)
         except discord.Forbidden:
@@ -164,6 +175,12 @@ class ClaudedBot(commands.Bot):
                 return
 
             user_text, tmp_dir = await self._compose_user_text(message)
+            # Use mention-stripped content instead of raw message content
+            if tmp_dir is not None:
+                # Attachments present: replace raw content portion with stripped content
+                user_text = user_text.replace(message.content, content) if message.content else user_text
+            else:
+                user_text = content
             renderer = DiscordRenderer(thread)
             try:
                 await self._render_with_retry(
