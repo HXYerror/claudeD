@@ -74,12 +74,17 @@ class SessionManager:
         nothing to stop.
         """
         bridge = self._sessions.pop(thread_id, None)
-        # Note: we deliberately keep the lock around. A retry handler or
-        # follow-up message may still want to serialize against the just-
-        # stopped session, and locks are cheap.
         if bridge is None:
             return False
         await bridge.stop()
+        # Reap the lock entry if no one is currently waiting on it.
+        # Without this the dict grows unbounded over the bot's lifetime,
+        # one entry per thread we've ever served. Holding the lock means
+        # there's an in-flight render — leave the entry alone in that case
+        # and let the next stop_session sweep it up.
+        lock = self._locks.get(thread_id)
+        if lock is not None and not lock.locked():
+            self._locks.pop(thread_id, None)
         log.info("Stopped session thread=%s", thread_id)
         return True
 

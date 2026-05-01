@@ -1,0 +1,165 @@
+"""Unit tests for ``DiscordRenderer._smart_split`` and ``_detect_open_fence_lang``."""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from clauded.discord_renderer import DISCORD_MAX_LEN, DiscordRenderer
+
+
+@pytest.fixture
+def renderer() -> DiscordRenderer:
+    """Return a renderer with a mock target — _smart_split doesn't touch it."""
+    return DiscordRenderer(target=MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# Basic splitting
+# ---------------------------------------------------------------------------
+
+
+def test_smart_split_short_text(renderer: DiscordRenderer) -> None:
+    """Text under the limit is returned as a single chunk."""
+    assert renderer._smart_split("hello world", limit=100) == ["hello world"]
+
+
+def test_smart_split_text_exactly_at_limit(renderer: DiscordRenderer) -> None:
+    """Text whose length equals the limit is returned as a single chunk."""
+    text = "a" * 50
+    assert renderer._smart_split(text, limit=50) == [text]
+
+
+def test_smart_split_empty(renderer: DiscordRenderer) -> None:
+    """Empty input yields the empty list."""
+    assert renderer._smart_split("", limit=100) == []
+
+
+def test_smart_split_default_limit_is_discord_max(renderer: DiscordRenderer) -> None:
+    """The default limit matches Discord's safety margin constant."""
+    text = "x" * (DISCORD_MAX_LEN - 1)
+    assert renderer._smart_split(text) == [text]
+
+
+# ---------------------------------------------------------------------------
+# Boundary preferences: paragraph > line > space > hard cut
+# ---------------------------------------------------------------------------
+
+
+def test_smart_split_paragraph_boundary(renderer: DiscordRenderer) -> None:
+    """A paragraph break (``\\n\\n``) is preferred when present."""
+    # Build: 60 chars of "a", paragraph break, 60 of "b". Limit 80 forces a
+    # split — the paragraph break sits at index 60, well above limit//2.
+    text = ("a" * 60) + "\n\n" + ("b" * 60)
+    chunks = renderer._smart_split(text, limit=80)
+    assert len(chunks) == 2
+    # The cut sits *after* the ``\n\n`` so the first chunk owns both newlines;
+    # lstrip("\n") on the tail prevents leading-blank-line bleed in chunk 2.
+    assert chunks[0] == ("a" * 60) + "\n\n"
+    assert chunks[1] == "b" * 60
+
+
+def test_smart_split_line_boundary(renderer: DiscordRenderer) -> None:
+    """A line break (``\\n``) is used when no paragraph break is in range."""
+    text = ("a" * 60) + "\n" + ("b" * 60)
+    chunks = renderer._smart_split(text, limit=80)
+    assert len(chunks) == 2
+    # Cut sits after the ``\n``; the tail's leading newline is then stripped.
+    assert chunks[0] == ("a" * 60) + "\n"
+    assert chunks[1] == "b" * 60
+
+
+def test_smart_split_space_boundary(renderer: DiscordRenderer) -> None:
+    """A space is used when no newline is present."""
+    text = ("a" * 60) + " " + ("b" * 60)
+    chunks = renderer._smart_split(text, limit=80)
+    assert len(chunks) == 2
+    # Cut sits after the space; the tail starts with the next non-newline char.
+    assert chunks[0] == ("a" * 60) + " "
+    assert chunks[1] == "b" * 60
+
+
+def test_smart_split_hard_cut(renderer: DiscordRenderer) -> None:
+    """When no good break exists, the chunk is hard-cut at ``limit``."""
+    # Solid run of one character — no paragraph, line, or space break.
+    text = "a" * 200
+    # fence_reserve = 4, so each chunk is at most limit - 4 chars.
+    chunks = renderer._smart_split(text, limit=80)
+    assert "".join(chunks) == text
+    # Since there are no fences in the text, no fence reserve fixups apply
+    # to the *content*, but the cut index is limit - fence_reserve = 76.
+    assert all(len(c) <= 80 for c in chunks)
+    assert len(chunks[0]) == 76  # 80 - len("\n```")
+
+
+# ---------------------------------------------------------------------------
+# Code-fence protection
+# ---------------------------------------------------------------------------
+
+
+def test_smart_split_unclosed_fence_is_closed_and_reopened(
+    renderer: DiscordRenderer,
+) -> None:
+    """An unclosed ``\u0060\u0060\u0060`` block is closed at the cut and reopened after."""
+    text = "```\n" + ("a" * 200) + "\n```\nafter"
+    chunks = renderer._smart_split(text, limit=80)
+    # First chunk ends inside the fence: it must be closed with "\n```".
+    assert chunks[0].endswith("\n```")
+    # The next chunk (still inside the original block) reopens the fence.
+    assert chunks[1].startswith("```\n")
+    # Every chunk must have an even number of fences (self-contained).
+    for chunk in chunks:
+        assert chunk.count("```") % 2 == 0, chunk
+
+
+def test_smart_split_fence_with_language_tag_reopens_with_lang(
+    renderer: DiscordRenderer,
+) -> None:
+    """The reopened fence preserves the original language tag."""
+    text = "```python\n" + ("x" * 200) + "\n```\nafter"
+    chunks = renderer._smart_split(text, limit=80)
+    assert chunks[0].endswith("\n```")
+    # The reopen must include the python language tag.
+    assert chunks[1].startswith("```python\n")
+    for chunk in chunks:
+        assert chunk.count("```") % 2 == 0, chunk
+
+
+def test_smart_split_multiple_code_blocks(renderer: DiscordRenderer) -> None:
+    """A long body containing several closed code blocks splits cleanly."""
+    block_a = "```python\n" + ("a" * 50) + "\n```"
+    block_b = "```js\n" + ("b" * 50) + "\n```"
+    text = block_a + "\n\nmiddle text\n\n" + block_b
+    chunks = renderer._smart_split(text, limit=90)
+    # Every chunk must have balanced fences.
+    for chunk in chunks:
+        assert chunk.count("```") % 2 == 0, chunk
+    # The reconstructed text (after fence-reopen surgery) must contain the
+    # same characters as the input minus the bookkeeping fences.
+    joined = "".join(chunks)
+    assert "middle text" in joined
+
+
+# ---------------------------------------------------------------------------
+# _detect_open_fence_lang
+# ---------------------------------------------------------------------------
+
+
+def test_detect_open_fence_lang_with_language() -> None:
+    assert DiscordRenderer._detect_open_fence_lang("```python\nhello") == "python"
+
+
+def test_detect_open_fence_lang_without_language() -> None:
+    assert DiscordRenderer._detect_open_fence_lang("```\nhello") == ""
+
+
+def test_detect_open_fence_lang_no_fence_returns_empty() -> None:
+    assert DiscordRenderer._detect_open_fence_lang("just text, no fence") == ""
+
+
+def test_detect_open_fence_lang_picks_last_open_fence() -> None:
+    """When multiple open fences exist, the *currently open* one wins."""
+    # Two fences (closed pair) followed by a third open one with lang "rust".
+    chunk = "```py\nfoo\n```\nbetween\n```rust\nbar"
+    assert DiscordRenderer._detect_open_fence_lang(chunk) == "rust"
