@@ -81,6 +81,7 @@ class DiscordRenderer:
         saw_text = False                          # any TextBlock seen?
         # tool_use_id -> (discord.Message, tool_name)
         tool_msgs: dict[str, tuple[discord.Message, str]] = {}
+        tool_names: dict[str, str] = {}
 
         try:
             async for event in bridge.send_message(user_text):
@@ -137,9 +138,42 @@ class DiscordRenderer:
 
                             name = getattr(block, "name", "tool") or "tool"
                             tool_id = getattr(block, "id", None)
+                            if tool_id:
+                                tool_names[tool_id] = name
                             tmsg = await self._safe_send(f"⚙️ Running: `{name}`…")
                             if tmsg is not None and tool_id:
                                 tool_msgs[tool_id] = (tmsg, name)
+
+                            # Show file content preview for Write/Edit tools
+                            if block.name == "Write":
+                                file_path = block.input.get("file_path", "unknown")
+                                file_content = block.input.get("content", "")
+                                ext = file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+                                lang = ext if ext in ("py", "js", "ts", "go", "rs", "java", "c", "cpp", "h", "md", "yaml", "yml", "json", "toml", "sh", "bash", "sql", "html", "css") else ""
+                                preview = file_content[:1500]
+                                if len(file_content) > 1500:
+                                    preview += "\n... (truncated)"
+                                try:
+                                    await self.target.send(f"📝 `{file_path}`\n```{lang}\n{preview}\n```")
+                                except discord.HTTPException:
+                                    pass
+
+                            if block.name == "Edit":
+                                file_path = block.input.get("file_path", "unknown")
+                                old_text = block.input.get("old_text", "")
+                                new_text = block.input.get("new_text", "")
+                                diff_lines = []
+                                for line in old_text.splitlines():
+                                    diff_lines.append(f"- {line}")
+                                for line in new_text.splitlines():
+                                    diff_lines.append(f"+ {line}")
+                                diff_str = "\n".join(diff_lines)[:1500]
+                                if len("\n".join(diff_lines)) > 1500:
+                                    diff_str += "\n... (truncated)"
+                                try:
+                                    await self.target.send(f"✏️ `{file_path}`\n```diff\n{diff_str}\n```")
+                                except discord.HTTPException:
+                                    pass
 
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
