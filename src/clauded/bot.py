@@ -472,12 +472,40 @@ async def session_info(interaction: discord.Interaction) -> None:
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+def _ensure_cli_path() -> None:
+    """Make sure common ``claude`` CLI install locations are on ``$PATH``.
+
+    The ``claude-code-sdk`` resolves the ``claude`` binary via
+    ``shutil.which`` at session-start time. Inside a Python venv on macOS
+    the activated ``$PATH`` often omits ``/opt/homebrew/bin`` (and on Linux
+    setups, ``/usr/local/bin`` or ``~/.local/bin``), which makes the SDK
+    fail to start with a confusing "claude not found" error even though
+    the CLI is installed. We prepend known-good locations once at process
+    startup so the lookup succeeds regardless of how the bot was launched.
+    """
+    current = os.environ.get("PATH", "")
+    parts = current.split(os.pathsep) if current else []
+    extra = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(Path.home() / ".local" / "bin"),
+    ]
+    prepend = [p for p in extra if p and p not in parts]
+    if prepend:
+        os.environ["PATH"] = (
+            os.pathsep.join(prepend + parts) if parts else os.pathsep.join(prepend)
+        )
+
+
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Ensure the Claude CLI is discoverable before we touch the SDK.
+    _ensure_cli_path()
 
     config = load_config()
     bot = ClaudedBot(config)
