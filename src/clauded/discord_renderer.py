@@ -156,7 +156,7 @@ class DiscordRenderer:
                                 file_content = block.input.get("content", "")
                                 ext = file_path.rsplit(".", 1)[-1] if "." in file_path else ""
                                 lang = ext if ext in ("py", "js", "ts", "go", "rs", "java", "c", "cpp", "h", "md", "yaml", "yml", "json", "toml", "sh", "bash", "sql", "html", "css") else ""
-                                preview = file_content[:1500]
+                                preview = file_content[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
                                 if len(file_content) > 1500:
                                     preview += "\n... (truncated)"
                                 try:
@@ -173,7 +173,7 @@ class DiscordRenderer:
                                     diff_lines.append(f"- {line}")
                                 for line in new_text.splitlines():
                                     diff_lines.append(f"+ {line}")
-                                diff_str = "\n".join(diff_lines)[:1500]
+                                diff_str = "\n".join(diff_lines)[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
                                 if len("\n".join(diff_lines)) > 1500:
                                     diff_str += "\n... (truncated)"
                                 try:
@@ -212,34 +212,55 @@ class DiscordRenderer:
     async def _process_markers(self, text: str) -> str:
         """Replace [CREATE_THREAD: x] and [CREATE_CHANNEL: x] markers with results."""
 
-        # Process thread markers
-        for match in _THREAD_PATTERN.finditer(text):
+        # SEC1: Permission pre-checks — bail early if the bot lacks rights.
+        guild = getattr(self.target, 'guild', None)
+        if guild is None:
+            text = _THREAD_PATTERN.sub("❌ Cannot manage channels: no server context", text)
+            text = _CHANNEL_PATTERN.sub("❌ Cannot manage channels: no server context", text)
+            return text
+
+        bot_member = guild.me
+        if bot_member is None:
+            return text
+
+        # For channel creation, check bot permission
+        if not bot_member.guild_permissions.manage_channels:
+            text = _CHANNEL_PATTERN.sub("❌ Bot lacks manage_channels permission", text)
+
+        # For thread creation, check bot permission
+        if not bot_member.guild_permissions.create_public_threads:
+            text = _THREAD_PATTERN.sub("❌ Bot lacks create_threads permission", text)
+
+        # If either permission was missing the markers are already replaced;
+        # only proceed if markers survive the checks above.
+
+        # E2: Process thread markers in reverse order so offset shifts don't
+        # corrupt subsequent replacements (fixes duplicate-marker bug).
+        matches = list(_THREAD_PATTERN.finditer(text))
+        for match in reversed(matches):
             thread_name = match.group(1).strip()[:100]
             try:
-                # self.target should be a thread or channel
                 channel = self.target
-                if hasattr(channel, 'parent'):
+                if hasattr(channel, 'parent') and channel.parent:
                     channel = channel.parent  # if we're in a thread, create in parent
 
-                # Create a thread (need a message to attach it to)
                 msg = await channel.send(f"📌 Creating thread: {thread_name}")
                 thread = await msg.create_thread(name=thread_name)
-                text = text.replace(match.group(0), f"✅ Created thread: {thread.mention}")
+                replacement = f"✅ Created thread: {thread.mention}"
             except Exception as e:
-                text = text.replace(match.group(0), f"❌ Failed to create thread: {e}")
+                replacement = f"❌ Failed to create thread: {e}"
+            text = text[:match.start()] + replacement + text[match.end():]
 
-        # Process channel markers
-        for match in _CHANNEL_PATTERN.finditer(text):
+        # E2: Process channel markers in reverse order.
+        matches = list(_CHANNEL_PATTERN.finditer(text))
+        for match in reversed(matches):
             channel_name = match.group(1).strip()[:100]
             try:
-                guild = self.target.guild
-                if guild is None:
-                    text = text.replace(match.group(0), "❌ Cannot create channel: no guild context")
-                    continue
                 new_channel = await guild.create_text_channel(name=channel_name)
-                text = text.replace(match.group(0), f"✅ Created channel: {new_channel.mention}")
+                replacement = f"✅ Created channel: {new_channel.mention}"
             except Exception as e:
-                text = text.replace(match.group(0), f"❌ Failed to create channel: {e}")
+                replacement = f"❌ Failed to create channel: {e}"
+            text = text[:match.start()] + replacement + text[match.end():]
 
         return text
 
@@ -290,6 +311,8 @@ class DiscordRenderer:
         self, live_msg: discord.Message, buffer: str
     ) -> None:
         """Replace the cursor in ``live_msg`` and emit any overflow as new messages."""
+        # E1: Process channel/thread markers before finalizing.
+        buffer = await self._process_markers(buffer)
         if len(buffer) <= DISCORD_MAX_LEN:
             await self._safe_edit(live_msg, buffer)
             return
