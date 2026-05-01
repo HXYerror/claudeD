@@ -11,6 +11,9 @@ import logging
 import os
 import shutil
 import tempfile
+import time
+import sys
+import subprocess
 from pathlib import Path
 
 import discord
@@ -59,11 +62,13 @@ class ClaudedBot(commands.Bot):
         self.config = config
         self.session_manager = SessionManager()
         self.project_manager = ProjectManager(projects_root=config.projects_root)
+        self._start_time = time.time()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
+        self.tree.add_command(health_check)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -491,6 +496,43 @@ async def session_info(interaction: discord.Interaction) -> None:
             "No active Claude session in this thread.", ephemeral=True
         )
 
+
+
+
+# ---------------------------------------------------------------------------
+# Top-level slash commands
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="health", description="Show bot health and status")
+async def health_check(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+
+    uptime_s = int(time.time() - bot._start_time)
+    hours, remainder = divmod(uptime_s, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+    active_sessions = len(bot.session_manager.list_sessions())
+    bound_projects = len(bot.project_manager._projects)
+
+    # Get claude version
+    try:
+        result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+        claude_version = result.stdout.strip() or "unknown"
+    except Exception:
+        claude_version = "unavailable"
+
+    embed = discord.Embed(title="🏥 Bot Health", color=discord.Color.green())
+    embed.add_field(name="Uptime", value=uptime_str, inline=True)
+    embed.add_field(name="Active Sessions", value=str(active_sessions), inline=True)
+    embed.add_field(name="Bound Projects", value=str(bound_projects), inline=True)
+    embed.add_field(name="Claude CLI", value=claude_version, inline=True)
+    embed.add_field(name="Python", value=sys.version.split()[0], inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------------------------------------------------------------------
 # Entrypoint
