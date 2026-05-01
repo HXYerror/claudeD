@@ -25,6 +25,7 @@ from .discord_renderer import DiscordRenderer
 from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
+from .cost_tracker import CostTracker
 
 log = logging.getLogger("clauded.bot")
 
@@ -65,11 +66,13 @@ class ClaudedBot(commands.Bot):
         self.session_manager = SessionManager()
         self.project_manager = ProjectManager(projects_root=config.projects_root)
         self._start_time = time.time()
+        self.cost_tracker = CostTracker()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
+        self.tree.add_command(cost_group)
         self.tree.add_command(switch_model)
         self.tree.add_command(health_check)
         synced = await self.tree.sync()
@@ -185,6 +188,7 @@ class ClaudedBot(commands.Bot):
             else:
                 user_text = content
             renderer = DiscordRenderer(thread)
+            cost_before = bridge.total_cost if bridge else 0.0
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -195,6 +199,10 @@ class ClaudedBot(commands.Bot):
                 )
             finally:
                 _cleanup_tmp_dir(tmp_dir)
+                cost_after = bridge.total_cost if bridge else 0.0
+                response_cost = cost_after - cost_before
+                if response_cost > 0:
+                    self.cost_tracker.record(channel.id, response_cost)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -237,6 +245,7 @@ class ClaudedBot(commands.Bot):
 
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel)
+            cost_before = bridge.total_cost if bridge else 0.0
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -247,6 +256,10 @@ class ClaudedBot(commands.Bot):
                 )
             finally:
                 _cleanup_tmp_dir(tmp_dir)
+                cost_after = bridge.total_cost if bridge else 0.0
+                response_cost = cost_after - cost_before
+                if response_cost > 0:
+                    self.cost_tracker.record(parent_id, response_cost)
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -355,6 +368,55 @@ class ClaudedBot(commands.Bot):
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
+
+
+
+# ---------------------------------------------------------------------------
+# Cost tracking slash commands.
+# ---------------------------------------------------------------------------
+
+cost_group = app_commands.Group(
+    name="cost",
+    description="Track API costs.",
+)
+
+
+@cost_group.command(name="show", description="Show cost for this channel")
+async def cost_show(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    total, calls = bot.cost_tracker.get_channel_cost(parent_id)
+    await interaction.response.send_message(
+        f"\U0001f4b0 Channel cost: ${total:.4f} ({calls} API calls)", ephemeral=True
+    )
+
+
+@cost_group.command(name="total", description="Show total cost across all channels")
+async def cost_total(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    total = bot.cost_tracker.get_total_cost()
+    await interaction.response.send_message(
+        f"\U0001f4b0 Total cost: ${total:.4f}", ephemeral=True
+    )
+
+
+@cost_group.command(name="reset", description="Reset cost for this channel")
+async def cost_reset(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    bot.cost_tracker.reset_channel(parent_id)
+    await interaction.response.send_message("\u2705 Channel cost reset.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
