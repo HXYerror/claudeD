@@ -145,7 +145,7 @@ async def test_result_message_updates_stats(
     await bridge.start()
     assert bridge.total_cost == 0.0
     assert bridge.num_turns == 0
-    assert bridge.model is None
+    assert bridge.model == "sonnet"  # defaults to config claude_model
 
     received: list[Any] = []
     async for event in bridge.send_message("ping"):

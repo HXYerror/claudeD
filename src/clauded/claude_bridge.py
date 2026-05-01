@@ -54,11 +54,13 @@ class ClaudeBridge:
         config: Config,
         on_ask_user: OnAskUser | None = None,
         system_prompt: str | None = None,
+        model_override: str | None = None,
     ) -> None:
         self.project_path = project_path
-        self.config = config
+        self._config = config
         self.on_ask_user = on_ask_user
         self.system_prompt = system_prompt
+        self._model_override = model_override
         self._client: ClaudeSDKClient | None = None
         self._active = False
         # Aggregate stats updated whenever we observe a ResultMessage. They
@@ -67,7 +69,20 @@ class ClaudeBridge:
         # count and model — are good enough.
         self.total_cost: float = 0.0
         self.num_turns: int = 0
-        self.model: str | None = None
+        self._sdk_model: str | None = None
+
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    @config.setter
+    def config(self, value: Config) -> None:
+        self._config = value
+
+    @property
+    def model(self) -> str:
+        """Return the active model: explicit override, SDK-reported, or config default."""
+        return self._model_override or self._sdk_model or self._config.claude_model
 
     @property
     def is_active(self) -> bool:
@@ -78,8 +93,8 @@ class ClaudeBridge:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         options = ClaudeCodeOptions(
             cwd=self.project_path,
-            permission_mode=self.config.claude_permission_mode,
-            model=self.config.claude_model,
+            permission_mode=self._config.claude_permission_mode,
+            model=self.model,
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
             **({"append_system_prompt": self.system_prompt} if self.system_prompt else {}),
         )
@@ -177,7 +192,7 @@ class ClaudeBridge:
             self.num_turns = turns
         model = getattr(msg, "model", None)
         if isinstance(model, str) and model:
-            self.model = model
+            self._sdk_model = model
 
     async def _can_use_tool(
         self,

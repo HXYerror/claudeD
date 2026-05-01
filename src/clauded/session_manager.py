@@ -41,6 +41,7 @@ class SessionManager:
         config: Config,
         on_ask_user: OnAskUser | None = None,
         system_prompt: str | None = None,
+        model_override: str | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -57,6 +58,7 @@ class SessionManager:
             config=config,
             on_ask_user=on_ask_user,
             system_prompt=system_prompt,
+            model_override=model_override,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge
@@ -89,6 +91,11 @@ class SessionManager:
             self._locks.pop(thread_id, None)
         log.info("Stopped session thread=%s", thread_id)
         return True
+
+
+    def list_sessions(self) -> dict[int, ClaudeBridge]:
+        """Return a snapshot of all active sessions."""
+        return dict(self._sessions)
 
 
 __all__ = ["SessionManager"]

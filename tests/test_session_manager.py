@@ -41,7 +41,7 @@ class _FakeBridge:
 
     instances: list["_FakeBridge"] = []
 
-    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None) -> None:
+    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None, model_override: Any = None) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user

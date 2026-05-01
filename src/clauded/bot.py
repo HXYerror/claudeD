@@ -68,6 +68,7 @@ class ClaudedBot(commands.Bot):
         """Register slash command groups and sync to Discord."""
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
+        self.tree.add_command(switch_model)
         self.tree.add_command(health_check)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
@@ -536,11 +537,56 @@ async def session_interrupt(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Failed to interrupt.", ephemeral=True)
 
 
+@session_group.command(name="list", description="List all active Claude sessions")
+async def session_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    sessions = bot.session_manager.list_sessions()
+    if not sessions:
+        await interaction.response.send_message("No active sessions.", ephemeral=True)
+        return
+    embed = discord.Embed(title="📋 Active Sessions", color=discord.Color.blue())
+    for thread_id, bridge in sessions.items():
+        model = getattr(bridge, 'model', 'unknown')
+        cost = f"${bridge.total_cost:.4f}" if hasattr(bridge, 'total_cost') else "N/A"
+        turns = getattr(bridge, 'num_turns', 0)
+        embed.add_field(
+            name=f"Thread {thread_id}",
+            value=f"📁 `{bridge.project_path}`\n🤖 {model} | 💰 {cost} | 🔄 {turns} turns",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
 # Top-level slash commands
 # ---------------------------------------------------------------------------
+
+@app_commands.command(name="model", description="Switch Claude model for this thread")
+@app_commands.describe(name="Model: sonnet, opus, haiku, or full model ID")
+async def switch_model(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    # Stop existing session
+    await bot.session_manager.stop_session(thread_id)
+    # Get project path and system prompt
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    await bot.session_manager.create_session(thread_id, project_path, bot.config, system_prompt=system_prompt, model_override=name)
+    await interaction.response.send_message(f"🔄 Switched to `{name}`. New session started.")
+
 
 @app_commands.command(name="health", description="Show bot health and status")
 async def health_check(interaction: discord.Interaction) -> None:
