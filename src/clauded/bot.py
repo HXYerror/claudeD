@@ -388,6 +388,7 @@ class ClaudedBot(commands.Bot):
 cost_group = app_commands.Group(
     name="cost",
     description="Track API costs.",
+    default_permissions=discord.Permissions(administrator=True),
 )
 
 
@@ -634,21 +635,24 @@ async def session_resume(interaction: discord.Interaction) -> None:
     if not stored:
         await interaction.response.send_message("No saved session to resume.", ephemeral=True)
         return
-    # Stop any existing session
-    await bot.session_manager.stop_session(thread_id)
-    handler = InteractionHandler(interaction.channel)
-    try:
-        await bot.session_manager.create_session(
-            thread_id, stored["project_path"], bot.config,
-            system_prompt=stored.get("system_prompt"),
-            model_override=stored.get("model"),
-            on_ask_user=handler.handle_ask_user_question,
-            resume_session_id=stored["session_id"],
-        )
-    except Exception as exc:
-        await interaction.response.send_message(f"❌ Failed to resume: `{exc}`", ephemeral=True)
-        return
-    await interaction.response.send_message("🔄 Session resumed with previous context.")
+    await interaction.response.defer()
+    # Stop any existing session and create new one under lock
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        handler = InteractionHandler(interaction.channel)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, stored["project_path"], bot.config,
+                system_prompt=stored.get("system_prompt"),
+                model_override=stored.get("model"),
+                on_ask_user=handler.handle_ask_user_question,
+                resume_session_id=stored["session_id"],
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to resume: `{exc}`", ephemeral=True)
+            return
+    await interaction.followup.send("🔄 Session resumed with previous context.")
 
 
 @session_group.command(name="list", description="List all active Claude sessions")
@@ -695,6 +699,7 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     if not project_path:
         await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
         return
+    await interaction.response.defer()
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
     # Find the thread/channel for InteractionHandler
     channel = interaction.channel
@@ -708,7 +713,7 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
             model_override=name,
             on_ask_user=handler.handle_ask_user_question,
         )
-    await interaction.response.send_message(f"🔄 Switched to `{name}`. New session started.")
+    await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
 
 @app_commands.command(name="health", description="Show bot health and status")
