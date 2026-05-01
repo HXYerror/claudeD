@@ -45,6 +45,17 @@ log = logging.getLogger("clauded.claude_bridge")
 OnAskUser = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
 
+_CHANNEL_MGMT_PROMPT = """
+You can create Discord threads and channels by including these markers in your output:
+- [CREATE_THREAD: thread name] — creates a new thread in the current channel
+- [CREATE_CHANNEL: channel-name] — creates a new text channel in the server
+
+The system will detect these markers and execute them. You will see the result in the chat.
+Only use these when the user explicitly asks to create threads or channels.
+"""
+
+
+
 class ClaudeBridge:
     """Wrapper around a ``ClaudeSDKClient`` for a single project session."""
 
@@ -99,13 +110,14 @@ class ClaudeBridge:
 
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
+        full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT
         options = ClaudeCodeOptions(
             cwd=self.project_path,
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
             resume=self._resume_session_id,
-            **({"append_system_prompt": self.system_prompt} if self.system_prompt else {}),
+            append_system_prompt=full_system_prompt,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()

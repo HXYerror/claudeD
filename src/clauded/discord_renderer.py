@@ -28,6 +28,8 @@ from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
 
+import re
+
 from .claude_bridge import (
     ResultMessage,
     TextBlock,
@@ -60,6 +62,10 @@ EDIT_INTERVAL_SECONDS = 1.2
 # Sleep used when an edit/send fails (likely rate-limited) before continuing.
 HTTP_BACKOFF_SECONDS = 0.5
 
+# Regex patterns for Claude channel/thread management markers.
+_THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
+_CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
+
 
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
@@ -81,6 +87,7 @@ class DiscordRenderer:
         saw_text = False                          # any TextBlock seen?
         # tool_use_id -> (discord.Message, tool_name)
         tool_msgs: dict[str, tuple[discord.Message, str]] = {}
+        tool_names: dict[str, str] = {}
 
         try:
             async for event in bridge.send_message(user_text):
@@ -137,9 +144,42 @@ class DiscordRenderer:
 
                             name = getattr(block, "name", "tool") or "tool"
                             tool_id = getattr(block, "id", None)
+                            if tool_id:
+                                tool_names[tool_id] = name
                             tmsg = await self._safe_send(f"⚙️ Running: `{name}`…")
                             if tmsg is not None and tool_id:
                                 tool_msgs[tool_id] = (tmsg, name)
+
+                            # Show file content preview for Write/Edit tools
+                            if block.name == "Write":
+                                file_path = block.input.get("file_path", "unknown")
+                                file_content = block.input.get("content", "")
+                                ext = file_path.rsplit(".", 1)[-1] if "." in file_path else ""
+                                lang = ext if ext in ("py", "js", "ts", "go", "rs", "java", "c", "cpp", "h", "md", "yaml", "yml", "json", "toml", "sh", "bash", "sql", "html", "css") else ""
+                                preview = file_content[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
+                                if len(file_content) > 1500:
+                                    preview += "\n... (truncated)"
+                                try:
+                                    await self.target.send(f"📝 `{file_path}`\n```{lang}\n{preview}\n```")
+                                except discord.HTTPException:
+                                    pass
+
+                            if block.name == "Edit":
+                                file_path = block.input.get("file_path", "unknown")
+                                old_text = block.input.get("old_text", "")
+                                new_text = block.input.get("new_text", "")
+                                diff_lines = []
+                                for line in old_text.splitlines():
+                                    diff_lines.append(f"- {line}")
+                                for line in new_text.splitlines():
+                                    diff_lines.append(f"+ {line}")
+                                diff_str = "\n".join(diff_lines)[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
+                                if len("\n".join(diff_lines)) > 1500:
+                                    diff_str += "\n... (truncated)"
+                                try:
+                                    await self.target.send(f"✏️ `{file_path}`\n```diff\n{diff_str}\n```")
+                                except discord.HTTPException:
+                                    pass
 
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
@@ -168,6 +208,61 @@ class DiscordRenderer:
     # ------------------------------------------------------------------
     # Streaming helpers
     # ------------------------------------------------------------------
+
+    async def _process_markers(self, text: str) -> str:
+        """Replace [CREATE_THREAD: x] and [CREATE_CHANNEL: x] markers with results."""
+
+        # SEC1: Permission pre-checks — bail early if the bot lacks rights.
+        guild = getattr(self.target, 'guild', None)
+        if guild is None:
+            text = _THREAD_PATTERN.sub("❌ Cannot manage channels: no server context", text)
+            text = _CHANNEL_PATTERN.sub("❌ Cannot manage channels: no server context", text)
+            return text
+
+        bot_member = guild.me
+        if bot_member is None:
+            return text
+
+        # For channel creation, check bot permission
+        if not bot_member.guild_permissions.manage_channels:
+            text = _CHANNEL_PATTERN.sub("❌ Bot lacks manage_channels permission", text)
+
+        # For thread creation, check bot permission
+        if not bot_member.guild_permissions.create_public_threads:
+            text = _THREAD_PATTERN.sub("❌ Bot lacks create_threads permission", text)
+
+        # If either permission was missing the markers are already replaced;
+        # only proceed if markers survive the checks above.
+
+        # E2: Process thread markers in reverse order so offset shifts don't
+        # corrupt subsequent replacements (fixes duplicate-marker bug).
+        matches = list(_THREAD_PATTERN.finditer(text))
+        for match in reversed(matches):
+            thread_name = match.group(1).strip()[:100]
+            try:
+                channel = self.target
+                if hasattr(channel, 'parent') and channel.parent:
+                    channel = channel.parent  # if we're in a thread, create in parent
+
+                msg = await channel.send(f"📌 Creating thread: {thread_name}")
+                thread = await msg.create_thread(name=thread_name)
+                replacement = f"✅ Created thread: {thread.mention}"
+            except Exception as e:
+                replacement = f"❌ Failed to create thread: {e}"
+            text = text[:match.start()] + replacement + text[match.end():]
+
+        # E2: Process channel markers in reverse order.
+        matches = list(_CHANNEL_PATTERN.finditer(text))
+        for match in reversed(matches):
+            channel_name = match.group(1).strip()[:100]
+            try:
+                new_channel = await guild.create_text_channel(name=channel_name)
+                replacement = f"✅ Created channel: {new_channel.mention}"
+            except Exception as e:
+                replacement = f"❌ Failed to create channel: {e}"
+            text = text[:match.start()] + replacement + text[match.end():]
+
+        return text
 
     async def _typewriter_tick(
         self, live_msg: discord.Message | None, buffer: str
@@ -216,6 +311,8 @@ class DiscordRenderer:
         self, live_msg: discord.Message, buffer: str
     ) -> None:
         """Replace the cursor in ``live_msg`` and emit any overflow as new messages."""
+        # E1: Process channel/thread markers before finalizing.
+        buffer = await self._process_markers(buffer)
         if len(buffer) <= DISCORD_MAX_LEN:
             await self._safe_edit(live_msg, buffer)
             return
@@ -238,6 +335,10 @@ class DiscordRenderer:
         tool_msgs: dict[str, tuple[discord.Message, str]],
     ) -> None:
         """Send any remaining text once the stream completes."""
+        # Process channel/thread management markers before sending.
+        if buffer:
+            buffer = await self._process_markers(buffer)
+
         if typewriter and live_msg is not None:
             await self._finalize_typewriter(live_msg, buffer)
             return
