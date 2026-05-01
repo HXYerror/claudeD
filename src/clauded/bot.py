@@ -28,6 +28,8 @@ from .session_manager import SessionManager
 
 log = logging.getLogger("clauded.bot")
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
+
 
 def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
     """Best-effort cleanup of an attachment temp directory.
@@ -282,7 +284,11 @@ class ClaudedBot(commands.Bot):
             except (discord.HTTPException, OSError):
                 log.exception("Failed to save attachment %s", safe_name)
                 continue
-            notes.append(f"User attached file: {safe_name} at {target}")
+            ext = os.path.splitext(safe_name)[1].lower()
+            if ext in _IMAGE_EXTENSIONS:
+                notes.append(f"[User attached image: {safe_name}]\nImage file saved at: {target}")
+            else:
+                notes.append(f"[User attached file: {safe_name}]\nFile saved at: {target}")
 
         if not notes:
             # No attachments actually saved — drop the empty tmp dir now.
