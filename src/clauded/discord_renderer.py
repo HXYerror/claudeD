@@ -93,7 +93,7 @@ class DiscordRenderer:
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, ThinkingBlock):
-                            thinking_text = block.thinking[:1900]
+                            thinking_text = block.thinking[:1900].replace("||", "\\|\\|")
                             try:
                                 await self.target.send(f"💭 ||{thinking_text}||")
                             except discord.HTTPException:

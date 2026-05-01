@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import time
 import sys
-import subprocess
+import asyncio
 from pathlib import Path
 
 import discord
@@ -444,6 +444,10 @@ async def project_system_prompt(interaction: discord.Interaction, text: str) -> 
         await interaction.response.send_message("No channel context.", ephemeral=True)
         return
 
+    if not bot.project_manager.is_bound(channel_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+
     if text.lower() == "clear":
         bot.project_manager.clear_system_prompt(channel_id)
         await interaction.response.send_message("✅ System prompt cleared", ephemeral=True)
@@ -576,15 +580,24 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     if parent_id is None:
         await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
         return
-    # Stop existing session
-    await bot.session_manager.stop_session(thread_id)
     # Get project path and system prompt
     project_path = bot.project_manager.get_path(parent_id)
     if not project_path:
         await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
         return
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    await bot.session_manager.create_session(thread_id, project_path, bot.config, system_prompt=system_prompt, model_override=name)
+    # Find the thread/channel for InteractionHandler
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        await bot.session_manager.create_session(
+            thread_id, project_path, bot.config,
+            system_prompt=system_prompt,
+            model_override=name,
+            on_ask_user=handler.handle_ask_user_question,
+        )
     await interaction.response.send_message(f"🔄 Switched to `{name}`. New session started.")
 
 
@@ -605,8 +618,13 @@ async def health_check(interaction: discord.Interaction) -> None:
 
     # Get claude version
     try:
-        result = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
-        claude_version = result.stdout.strip() or "unknown"
+        proc = await asyncio.create_subprocess_exec(
+            "claude", "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        claude_version = stdout.decode().strip() or "unknown"
     except Exception:
         claude_version = "unavailable"
 
