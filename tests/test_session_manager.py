@@ -15,6 +15,7 @@ import pytest
 
 from clauded.config import Config
 from clauded.session_manager import SessionManager
+from clauded.session_store import SessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -41,13 +42,18 @@ class _FakeBridge:
 
     instances: list["_FakeBridge"] = []
 
-    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None, model_override: Any = None) -> None:
+    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None, model_override: Any = None, resume_session_id: Any = None) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
+        self.resume_session_id = resume_session_id
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
+
+    @property
+    def session_id(self) -> str | None:
+        return None
 
     async def start(self) -> None:
         self.started = True
@@ -66,20 +72,36 @@ def _patch_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for SessionStore
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_store(tmp_path) -> SessionStore:
+    return SessionStore(data_dir=str(tmp_path / "test_store"))
+
+
+def _make_sm(tmp_path=None) -> SessionManager:
+    """Create a SessionManager with a temp SessionStore."""
+    import tempfile
+    d = tmp_path or tempfile.mkdtemp()
+    return SessionManager(session_store=SessionStore(data_dir=str(d)))
+
+
+# ---------------------------------------------------------------------------
 # get_lock
 # ---------------------------------------------------------------------------
 
 
-def test_get_lock_returns_same_lock_for_same_thread() -> None:
-    sm = SessionManager()
+def test_get_lock_returns_same_lock_for_same_thread(tmp_path) -> None:
+    sm = _make_sm(tmp_path)
     lock_a = sm.get_lock(42)
     lock_b = sm.get_lock(42)
     assert lock_a is lock_b
     assert isinstance(lock_a, asyncio.Lock)
 
 
-def test_get_lock_returns_different_locks_for_different_threads() -> None:
-    sm = SessionManager()
+def test_get_lock_returns_different_locks_for_different_threads(tmp_path) -> None:
+    sm = _make_sm(tmp_path)
     assert sm.get_lock(1) is not sm.get_lock(2)
 
 
@@ -89,9 +111,9 @@ def test_get_lock_returns_different_locks_for_different_threads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_session_replaces_existing(cfg: Config) -> None:
+async def test_create_session_replaces_existing(cfg: Config, tmp_path) -> None:
     """A second create_session call stops the old bridge and registers a new one."""
-    sm = SessionManager()
+    sm = _make_sm(tmp_path)
     first = await sm.create_session(7, "/tmp/p", cfg)
     second = await sm.create_session(7, "/tmp/p", cfg)
 
@@ -109,15 +131,15 @@ async def test_create_session_replaces_existing(cfg: Config) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_session_returns_false_for_unknown_thread() -> None:
-    sm = SessionManager()
+async def test_stop_session_returns_false_for_unknown_thread(tmp_path) -> None:
+    sm = _make_sm(tmp_path)
     assert await sm.stop_session(999) is False
 
 
 @pytest.mark.asyncio
-async def test_stop_session_reaps_lock_entry(cfg: Config) -> None:
+async def test_stop_session_reaps_lock_entry(cfg: Config, tmp_path) -> None:
     """After a clean stop, the per-thread lock entry is removed."""
-    sm = SessionManager()
+    sm = _make_sm(tmp_path)
     await sm.create_session(11, "/tmp/p", cfg)
     # Touch the lock so we can verify the same key disappears.
     lock = sm.get_lock(11)
@@ -131,13 +153,13 @@ async def test_stop_session_reaps_lock_entry(cfg: Config) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stop_session_keeps_lock_when_held(cfg: Config) -> None:
+async def test_stop_session_keeps_lock_when_held(cfg: Config, tmp_path) -> None:
     """If the per-thread lock is currently held, stop_session must not reap it.
 
     Reaping a held lock would let a follow-up message acquire a fresh
     lock object and race with the in-flight task.
     """
-    sm = SessionManager()
+    sm = _make_sm(tmp_path)
     await sm.create_session(13, "/tmp/p", cfg)
     lock = sm.get_lock(13)
     await lock.acquire()

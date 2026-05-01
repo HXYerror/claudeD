@@ -25,6 +25,7 @@ from .discord_renderer import DiscordRenderer
 from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
+from .session_store import SessionStore
 from .cost_tracker import CostTracker
 
 log = logging.getLogger("clauded.bot")
@@ -63,7 +64,7 @@ class ClaudedBot(commands.Bot):
     def __init__(self, config: Config) -> None:
         super().__init__(command_prefix="!", intents=_build_intents())
         self.config = config
-        self.session_manager = SessionManager()
+        self.session_manager = SessionManager(session_store=SessionStore())
         self.project_manager = ProjectManager(projects_root=config.projects_root)
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
@@ -203,6 +204,7 @@ class ClaudedBot(commands.Bot):
                 response_cost = cost_after - cost_before
                 if response_cost > 0:
                     self.cost_tracker.record(channel.id, response_cost)
+                self.session_manager.save_session_state(thread.id)
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -226,12 +228,19 @@ class ClaudedBot(commands.Bot):
                 try:
                     handler = InteractionHandler(message.channel)
                     system_prompt = self.project_manager.get_system_prompt(parent_id)
+                    # Check for stored session to resume
+                    stored = self.session_manager.get_stored_session(thread_id)
+                    resume_id = stored.get("session_id") if stored else None
+                    stored_model = stored.get("model") if stored else None
+                    stored_prompt = stored.get("system_prompt") if stored else None
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
                         on_ask_user=handler.handle_ask_user_question,
-                        system_prompt=system_prompt,
+                        system_prompt=stored_prompt or system_prompt,
+                        model_override=stored_model,
+                        resume_session_id=resume_id,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -260,6 +269,7 @@ class ClaudedBot(commands.Bot):
                 response_cost = cost_after - cost_before
                 if response_cost > 0:
                     self.cost_tracker.record(parent_id, response_cost)
+                self.session_manager.save_session_state(thread_id)
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -607,6 +617,38 @@ async def session_interrupt(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("⚠️ Claude interrupted by user.")
     else:
         await interaction.response.send_message("Failed to interrupt.", ephemeral=True)
+
+
+
+@session_group.command(name="resume", description="Resume the previous Claude session in this thread")
+async def session_resume(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("No thread context.", ephemeral=True)
+        return
+    stored = bot.session_manager.get_stored_session(thread_id)
+    if not stored:
+        await interaction.response.send_message("No saved session to resume.", ephemeral=True)
+        return
+    # Stop any existing session
+    await bot.session_manager.stop_session(thread_id)
+    handler = InteractionHandler(interaction.channel)
+    try:
+        await bot.session_manager.create_session(
+            thread_id, stored["project_path"], bot.config,
+            system_prompt=stored.get("system_prompt"),
+            model_override=stored.get("model"),
+            on_ask_user=handler.handle_ask_user_question,
+            resume_session_id=stored["session_id"],
+        )
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ Failed to resume: `{exc}`", ephemeral=True)
+        return
+    await interaction.response.send_message("🔄 Session resumed with previous context.")
 
 
 @session_group.command(name="list", description="List all active Claude sessions")
