@@ -23,6 +23,7 @@ from claude_code_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -198,6 +199,7 @@ __all__ = [
     # message/block types without importing the SDK directly.
     "AssistantMessage",
     "TextBlock",
+    "ThinkingBlock",
     "ToolUseBlock",
     "ToolResultBlock",
     "ResultMessage",

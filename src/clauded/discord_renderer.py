@@ -31,6 +31,7 @@ import discord
 from .claude_bridge import (
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -91,6 +92,14 @@ class DiscordRenderer:
 
                 if isinstance(content, list):
                     for block in content:
+                        if isinstance(block, ThinkingBlock):
+                            thinking_text = block.thinking[:1900]
+                            try:
+                                await self.target.send(f"💭 ||{thinking_text}||")
+                            except discord.HTTPException:
+                                pass
+                            continue
+
                         if isinstance(block, TextBlock):
                             text = getattr(block, "text", "") or ""
                             if not text:
