@@ -187,3 +187,51 @@ def test_load_skipped_when_no_file(tmp_path: Path) -> None:
     assert pm.is_bound(1) is False
     # No file should have been created yet — _save is only called on bind.
     assert not os.path.exists(os.path.join(str(tmp_path / "fresh"), "projects.json"))
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+
+def test_set_and_get_system_prompt(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """set_system_prompt stores a prompt retrievable via get_system_prompt."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(10, str(proj))
+
+    assert manager.get_system_prompt(10) is None
+    manager.set_system_prompt(10, "You are a helpful assistant.")
+    assert manager.get_system_prompt(10) == "You are a helpful assistant."
+
+
+def test_clear_system_prompt(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """clear_system_prompt removes the prompt; get returns None afterwards."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(20, str(proj))
+
+    manager.set_system_prompt(20, "Be concise.")
+    assert manager.get_system_prompt(20) == "Be concise."
+
+    manager.clear_system_prompt(20)
+    assert manager.get_system_prompt(20) is None
+
+
+def test_system_prompt_persists(
+    data_dir: Path, projects_root: Path
+) -> None:
+    """System prompt survives a round-trip through save/load."""
+    proj = projects_root / "p"
+    proj.mkdir()
+
+    pm1 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+    pm1.bind(30, str(proj))
+    pm1.set_system_prompt(30, "Always respond in JSON.")
+
+    pm2 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+    assert pm2.get_system_prompt(30) == "Always respond in JSON."

@@ -40,6 +40,7 @@ class SessionManager:
         project_path: str,
         config: Config,
         on_ask_user: OnAskUser | None = None,
+        system_prompt: str | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -55,6 +56,7 @@ class SessionManager:
             project_path=project_path,
             config=config,
             on_ask_user=on_ask_user,
+            system_prompt=system_prompt,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge

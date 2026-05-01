@@ -136,3 +136,31 @@ class ProjectManager:
     def is_bound(self, channel_id: int) -> bool:
         """Return True if ``channel_id`` has a binding."""
         return str(channel_id) in self._projects
+
+    # ------------------------------------------------------------------
+    # System prompt
+    # ------------------------------------------------------------------
+    def set_system_prompt(self, channel_id: int, prompt: str) -> None:
+        """Store a system prompt for the given channel binding."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is None:
+            entry = {}
+            self._projects[key] = entry
+        entry["system_prompt"] = prompt
+        self._save()
+
+    def get_system_prompt(self, channel_id: int) -> str | None:
+        """Return the system prompt for ``channel_id``, or None."""
+        entry = self._projects.get(str(channel_id))
+        if entry is None:
+            return None
+        return entry.get("system_prompt")
+
+    def clear_system_prompt(self, channel_id: int) -> None:
+        """Remove the system prompt for ``channel_id`` if present."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is not None and "system_prompt" in entry:
+            del entry["system_prompt"]
+            self._save()

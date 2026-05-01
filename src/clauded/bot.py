@@ -142,11 +142,13 @@ class ClaudedBot(commands.Bot):
         async with self.session_manager.get_lock(thread.id):
             try:
                 handler = InteractionHandler(thread)
+                system_prompt = self.project_manager.get_system_prompt(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
                     on_ask_user=handler.handle_ask_user_question,
+                    system_prompt=system_prompt,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -190,11 +192,13 @@ class ClaudedBot(commands.Bot):
             if bridge is None or not bridge.is_active:
                 try:
                     handler = InteractionHandler(message.channel)
+                    system_prompt = self.project_manager.get_system_prompt(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
                         on_ask_user=handler.handle_ask_user_question,
+                        system_prompt=system_prompt,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -381,9 +385,11 @@ async def project_info(interaction: discord.Interaction) -> None:
         )
         return
 
-    await interaction.response.send_message(
-        f"📁 This channel is bound to `{bound_path}`", ephemeral=True
-    )
+    lines = [f"📁 This channel is bound to `{bound_path}`"]
+    sp = bot.project_manager.get_system_prompt(channel_id)
+    if sp:
+        lines.append(f"📝 System prompt: {sp}")
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 @project_group.command(name="unbind", description="Remove this channel's binding.")
@@ -403,6 +409,24 @@ async def project_unbind(interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "This channel had no binding to remove.", ephemeral=True
         )
+
+
+@project_group.command(name="system-prompt", description="Set a system prompt for this project")
+@app_commands.describe(text="System prompt text, or 'clear' to remove")
+async def project_system_prompt(interaction: discord.Interaction, text: str) -> None:
+    log.info("/project system-prompt channel=%s", interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+
+    if text.lower() == "clear":
+        bot.project_manager.clear_system_prompt(channel_id)
+        await interaction.response.send_message("✅ System prompt cleared", ephemeral=True)
+    else:
+        bot.project_manager.set_system_prompt(channel_id, text)
+        await interaction.response.send_message("✅ System prompt set", ephemeral=True)
 
 
 session_group = app_commands.Group(

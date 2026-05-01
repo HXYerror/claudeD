@@ -53,10 +53,12 @@ class ClaudeBridge:
         project_path: str,
         config: Config,
         on_ask_user: OnAskUser | None = None,
+        system_prompt: str | None = None,
     ) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
+        self.system_prompt = system_prompt
         self._client: ClaudeSDKClient | None = None
         self._active = False
         # Aggregate stats updated whenever we observe a ResultMessage. They
@@ -79,6 +81,7 @@ class ClaudeBridge:
             permission_mode=self.config.claude_permission_mode,
             model=self.config.claude_model,
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
+            **({"append_system_prompt": self.system_prompt} if self.system_prompt else {}),
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
