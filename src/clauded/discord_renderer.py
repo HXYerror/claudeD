@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
 
@@ -143,13 +143,15 @@ class DiscordRenderer:
                                     )
                                 else:
                                     await self._safe_edit(tmsg, f"✅ `{name}`")
-        except Exception as exc:
+        except Exception:
             log.exception("ClaudeBridge stream failed")
-            # Best-effort: clean up the live cursor and report the error.
+            # Best-effort: clean up the live cursor. Don't try to surface a
+            # plain-text error here — callers (bot.py) wrap render_response
+            # in the crash-notification flow which posts a richer embed
+            # with a retry button. Re-raise so they can do so.
             if live_msg is not None:
                 await self._safe_edit(live_msg, buffer[:DISCORD_MAX_LEN] or "…")
-            await self._safe_send(f"Error talking to Claude: `{exc}`")
-            return
+            raise
 
         # Stream finished cleanly. Flush whatever is left.
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
@@ -391,5 +393,93 @@ class DiscordRenderer:
             return chunk[idx + 3 :].strip()
         return chunk[idx + 3 : nl].strip()
 
+    # ------------------------------------------------------------------
+    # Crash notification with retry
+    # ------------------------------------------------------------------
 
-__all__ = ["DiscordRenderer"]
+    async def send_error_with_retry(
+        self,
+        exc: BaseException,
+        on_retry: Callable[[], Awaitable[None]],
+    ) -> None:
+        """Post a crash embed with a 🔄 Retry button.
+
+        ``on_retry`` is invoked when the user clicks the button. It should
+        re-send the last user message through a fresh bridge; this class
+        does not know about sessions, so the wiring lives in the bot.
+        """
+        embed = discord.Embed(
+            title="❌ Claude session crashed",
+            description=(
+                "Something went wrong while talking to Claude. You can retry the "
+                "last message — a fresh session will be started for it.\n\n"
+                f"Error: `{exc}`"
+            )[:_RETRY_EMBED_DESC_MAX],
+            color=discord.Color.red(),
+        )
+        view = RetryView(on_retry=on_retry)
+        try:
+            await self.target.send(embed=embed, view=view)
+        except discord.HTTPException:
+            log.exception("Failed to post crash-with-retry embed")
+
+
+# ---------------------------------------------------------------------------
+# Retry view
+# ---------------------------------------------------------------------------
+
+
+_RETRY_EMBED_DESC_MAX = 4000
+_RETRY_TIMEOUT_SECONDS = 600.0
+
+
+class RetryView(discord.ui.View):
+    """View attached to a crash embed that re-runs the last user message."""
+
+    def __init__(
+        self,
+        *,
+        on_retry: Callable[[], Awaitable[None]],
+        timeout: float = _RETRY_TIMEOUT_SECONDS,
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self._on_retry = on_retry
+        self._fired = False
+
+    @discord.ui.button(
+        label="Retry",
+        style=discord.ButtonStyle.primary,
+        emoji="🔄",
+        custom_id="clauded_retry_btn",
+    )
+    async def retry_button(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        # Single-shot: disable the button immediately so a double-click
+        # doesn't queue two retries against the same dead session.
+        if self._fired:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                pass
+            return
+        self._fired = True
+        button.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.HTTPException:
+            try:
+                await interaction.response.defer()
+            except discord.HTTPException:
+                log.debug("Retry: failed to defer interaction")
+        try:
+            await self._on_retry()
+        except Exception:
+            log.exception("Retry callback raised")
+        finally:
+            self.stop()
+
+
+__all__ = ["DiscordRenderer", "RetryView"]

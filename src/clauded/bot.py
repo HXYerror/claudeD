@@ -8,6 +8,9 @@ messages to a per-thread :class:`ClaudeBridge` session.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -38,7 +41,7 @@ class ClaudedBot(commands.Bot):
         super().__init__(command_prefix="!", intents=_build_intents())
         self.config = config
         self.session_manager = SessionManager()
-        self.project_manager = ProjectManager()
+        self.project_manager = ProjectManager(projects_root=config.projects_root)
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -96,7 +99,7 @@ class ClaudedBot(commands.Bot):
             log.warning("Bound channel %s is not a TextChannel; skipping", channel.id)
             return
 
-        thread_name = (message.content or "claude session")[:80] or "claude session"
+        thread_name = (message.content or "claude session")[:100] or "claude session"
         try:
             thread = await message.create_thread(name=thread_name)
         except discord.Forbidden:
@@ -132,14 +135,18 @@ class ClaudedBot(commands.Bot):
                 log.debug("Could not post session-start error to thread")
             return
 
+        user_text = await self._compose_user_text(message)
         renderer = DiscordRenderer(thread)
-        try:
-            await renderer.render_response(bridge, message.content)
-        except Exception:
-            log.exception("Renderer failed for thread=%s", thread.id)
-            # The bridge is likely in a bad state — drop it so the next
-            # message in this thread starts a fresh session.
-            await self.session_manager.stop_session(thread.id)
+        # Serialize against any concurrent message that lands in this brand-new
+        # thread (rare, but possible if Discord delivers events out of order).
+        async with self.session_manager.get_lock(thread.id):
+            await self._render_with_retry(
+                renderer=renderer,
+                bridge=bridge,
+                user_text=user_text,
+                thread=thread,
+                project_path=project_path,
+            )
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -154,33 +161,139 @@ class ClaudedBot(commands.Bot):
             return
 
         thread_id = message.channel.id
-        bridge = self.session_manager.get_session(thread_id)
-        if bridge is None or not bridge.is_active:
-            try:
-                handler = InteractionHandler(message.channel)
-                bridge = await self.session_manager.create_session(
-                    thread_id,
-                    project_path,
-                    self.config,
-                    on_ask_user=handler.handle_ask_user_question,
-                )
-            except Exception as exc:
-                log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
+        # Acquire the per-thread lock for the entire send/render cycle so
+        # concurrent messages in the same thread are processed in order
+        # rather than racing each other into the SDK.
+        async with self.session_manager.get_lock(thread_id):
+            bridge = self.session_manager.get_session(thread_id)
+            if bridge is None or not bridge.is_active:
                 try:
-                    await message.channel.send(
-                        f"❌ Failed to start Claude session: `{exc}`"
+                    handler = InteractionHandler(message.channel)
+                    bridge = await self.session_manager.create_session(
+                        thread_id,
+                        project_path,
+                        self.config,
+                        on_ask_user=handler.handle_ask_user_question,
                     )
-                except discord.HTTPException:
-                    log.debug("Could not post session-start error to thread")
-                return
+                except Exception as exc:
+                    log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
+                    try:
+                        await message.channel.send(
+                            f"❌ Failed to start Claude session: `{exc}`"
+                        )
+                    except discord.HTTPException:
+                        log.debug("Could not post session-start error to thread")
+                    return
 
-        renderer = DiscordRenderer(message.channel)
+            user_text = await self._compose_user_text(message)
+            renderer = DiscordRenderer(message.channel)
+            await self._render_with_retry(
+                renderer=renderer,
+                bridge=bridge,
+                user_text=user_text,
+                thread=message.channel,
+                project_path=project_path,
+            )
+
+    # ------------------------------------------------------------------
+    # Helpers used by both channel- and thread-message handlers
+    # ------------------------------------------------------------------
+
+    async def _compose_user_text(self, message: discord.Message) -> str:
+        """Build the text prompt sent to Claude, including any attachments.
+
+        For each attachment we download it to a per-message temp directory
+        and prepend a line announcing the filename and on-disk path so
+        Claude can choose to ``Read`` it. The temp directory persists for
+        the life of the bot process — we don't try to clean it up here
+        because Claude may still be reading from it after this method
+        returns. Discord caps attachment size at 25MB on free guilds, so
+        the on-disk footprint is bounded.
+        """
+        text = message.content or ""
+        attachments = list(message.attachments or [])
+        if not attachments:
+            return text
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="clauded_att_"))
+        notes: list[str] = []
+        for att in attachments:
+            # Sanitize the filename: take the basename and drop anything that
+            # looks like path traversal. Discord already restricts these but
+            # better safe.
+            safe_name = os.path.basename(att.filename or "attachment")
+            if not safe_name or safe_name in ("", ".", ".."):
+                safe_name = f"attachment-{att.id}"
+            target = tmp_dir / safe_name
+            try:
+                await att.save(target)
+            except (discord.HTTPException, OSError):
+                log.exception("Failed to save attachment %s", safe_name)
+                continue
+            notes.append(f"User attached file: {safe_name} at {target}")
+
+        if not notes:
+            return text
+        # Prepend so Claude sees the file references before the user's prose.
+        prefix = "\n".join(notes)
+        return f"{prefix}\n\n{text}" if text else prefix
+
+    async def _render_with_retry(
+        self,
+        *,
+        renderer: DiscordRenderer,
+        bridge,  # ClaudeBridge — typed loosely to avoid an extra import
+        user_text: str,
+        thread: discord.abc.Messageable,
+        project_path: str,
+    ) -> None:
+        """Run ``renderer.render_response`` and surface a retry button on crash.
+
+        On exception we drop the (now-dead) bridge so the next message —
+        either via the retry button or a fresh user message — recreates a
+        clean session.
+        """
         try:
-            await renderer.render_response(bridge, message.content)
-        except Exception:
-            log.exception("Renderer failed for thread=%s", thread_id)
-            # Drop the dead bridge so the next message recreates it.
-            await self.session_manager.stop_session(thread_id)
+            await renderer.render_response(bridge, user_text)
+        except Exception as exc:
+            log.exception("Renderer failed; offering retry button")
+            thread_id = getattr(thread, "id", None)
+            if thread_id is not None:
+                await self.session_manager.stop_session(thread_id)
+
+            async def _on_retry() -> None:
+                # Re-acquire the lock so a manual click can't race with a
+                # follow-up message the user just typed.
+                if thread_id is None:
+                    return
+                async with self.session_manager.get_lock(thread_id):
+                    try:
+                        new_handler = InteractionHandler(thread)
+                        new_bridge = await self.session_manager.create_session(
+                            thread_id,
+                            project_path,
+                            self.config,
+                            on_ask_user=new_handler.handle_ask_user_question,
+                        )
+                    except Exception as start_exc:
+                        log.exception("Retry: failed to restart ClaudeBridge")
+                        try:
+                            await thread.send(
+                                f"❌ Retry failed to start session: `{start_exc}`"
+                            )
+                        except discord.HTTPException:
+                            log.debug("Retry: could not surface restart error")
+                        return
+                    new_renderer = DiscordRenderer(thread)
+                    await self._render_with_retry(
+                        renderer=new_renderer,
+                        bridge=new_bridge,
+                        user_text=user_text,
+                        thread=thread,
+                        project_path=project_path,
+                    )
+
+            await renderer.send_error_with_retry(exc, _on_retry)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +303,13 @@ class ClaudedBot(commands.Bot):
 project_group = app_commands.Group(
     name="project",
     description="Manage channel ↔ project-directory bindings.",
+    # Restrict the entire /project group to guild administrators. Binding a
+    # channel to a directory effectively grants every poster shell access to
+    # that path (Claude can run tools); this is not a power we want to give
+    # to ordinary members. ``default_permissions`` is the slash-command
+    # equivalent of a permission gate — non-admins won't even see the
+    # commands in their picker.
+    default_permissions=discord.Permissions(administrator=True),
 )
 
 
@@ -302,9 +422,18 @@ async def session_info(interaction: discord.Interaction) -> None:
         bot.session_manager.get_session(thread_id) if thread_id is not None else None
     )
     if bridge is not None and bridge.is_active:
-        await interaction.response.send_message(
-            f"Session active — cwd `{bridge.project_path}`.", ephemeral=True
-        )
+        # Pull the running totals the bridge has been collecting from
+        # ResultMessage events. Defaults are sensible for a session that
+        # hasn't completed a turn yet.
+        model = bridge.model or bot.config.claude_model
+        cost_str = f"${bridge.total_cost:.4f}" if bridge.total_cost else "$0.0000"
+        lines = [
+            f"📡 **Session active** — cwd `{bridge.project_path}`",
+            f"• Model: `{model}`",
+            f"• Turns: `{bridge.num_turns}`",
+            f"• Total cost: `{cost_str}`",
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
     else:
         await interaction.response.send_message(
             "No active Claude session in this thread.", ephemeral=True
