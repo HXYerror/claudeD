@@ -58,6 +58,13 @@ class ClaudeBridge:
         self.on_ask_user = on_ask_user
         self._client: ClaudeSDKClient | None = None
         self._active = False
+        # Aggregate stats updated whenever we observe a ResultMessage. They
+        # are purely informational (surfaced via /session info) so the
+        # exact semantics — total cost across the session, last-known turn
+        # count and model — are good enough.
+        self.total_cost: float = 0.0
+        self.num_turns: int = 0
+        self.model: str | None = None
 
     @property
     def is_active(self) -> bool:
@@ -98,10 +105,26 @@ class ClaudeBridge:
         try:
             await self._client.query(text)
             async for msg in self._client.receive_response():
+                # Update session stats opportunistically — ResultMessage
+                # carries the per-turn totals from the SDK.
+                if isinstance(msg, ResultMessage):
+                    self._update_stats(msg)
                 yield msg
         except Exception:
             log.exception("Claude SDK stream failed; marking bridge inactive")
             self._active = False
+            # Best-effort: tear down the underlying client so we don't leak
+            # a half-broken connection. Swallow disconnect errors — the
+            # original exception is what callers care about.
+            client = self._client
+            self._client = None
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:  # pragma: no cover - defensive
+                    log.exception(
+                        "Error disconnecting ClaudeSDKClient after stream failure"
+                    )
             raise
 
     async def stop(self) -> None:
@@ -120,6 +143,26 @@ class ClaudeBridge:
     # ------------------------------------------------------------------
     # SDK callbacks
     # ------------------------------------------------------------------
+
+    def _update_stats(self, msg: ResultMessage) -> None:
+        """Pull per-turn totals off a ``ResultMessage`` into instance state.
+
+        The Claude SDK exposes ``total_cost_usd``, ``num_turns`` and
+        ``model`` on ``ResultMessage``. We tolerate any of those being
+        missing — newer/older SDKs may rename fields, and we'd rather
+        surface partial stats than crash the stream.
+        """
+        cost = getattr(msg, "total_cost_usd", None)
+        if isinstance(cost, (int, float)):
+            # ResultMessage carries the cumulative cost of the whole
+            # conversation so we replace rather than accumulate.
+            self.total_cost = float(cost)
+        turns = getattr(msg, "num_turns", None)
+        if isinstance(turns, int):
+            self.num_turns = turns
+        model = getattr(msg, "model", None)
+        if isinstance(model, str) and model:
+            self.model = model
 
     async def _can_use_tool(
         self,

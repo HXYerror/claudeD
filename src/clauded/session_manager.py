@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .claude_bridge import ClaudeBridge, OnAskUser
@@ -15,6 +16,23 @@ class SessionManager:
 
     def __init__(self) -> None:
         self._sessions: dict[int, ClaudeBridge] = {}
+        # One asyncio.Lock per thread, used by callers to serialize message
+        # processing against the same Claude session. The lock outlives any
+        # single bridge so concurrent producers don't all race to (re)create
+        # a session in parallel.
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    def get_lock(self, thread_id: int) -> asyncio.Lock:
+        """Return (creating if needed) the lock for ``thread_id``.
+
+        Callers should ``async with manager.get_lock(thread_id):`` around
+        any send/render cycle so messages in the same thread don't race.
+        """
+        lock = self._locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[thread_id] = lock
+        return lock
 
     async def create_session(
         self,
@@ -40,6 +58,8 @@ class SessionManager:
         )
         await bridge.start()
         self._sessions[thread_id] = bridge
+        # Make sure a lock exists for this thread; future callers will reuse it.
+        self.get_lock(thread_id)
         log.info("Created session thread=%s cwd=%s", thread_id, project_path)
         return bridge
 
@@ -54,6 +74,9 @@ class SessionManager:
         nothing to stop.
         """
         bridge = self._sessions.pop(thread_id, None)
+        # Note: we deliberately keep the lock around. A retry handler or
+        # follow-up message may still want to serialize against the just-
+        # stopped session, and locks are cheap.
         if bridge is None:
             return False
         await bridge.stop()
