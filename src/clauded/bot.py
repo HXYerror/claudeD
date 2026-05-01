@@ -52,7 +52,15 @@ def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
 def _build_intents() -> discord.Intents:
     """Intents needed: messages + content for bridging, guilds for commands."""
     intents = discord.Intents.default()
-    intents.message_content = True
+    intents.message_content = True  # Requires Portal toggle; bot degrades if unavailable
+    intents.messages = True
+    intents.guilds = True
+    return intents
+
+
+def _build_intents_safe() -> discord.Intents:
+    """Fallback intents without privileged message_content."""
+    intents = discord.Intents.default()
     intents.messages = True
     intents.guilds = True
     return intents
@@ -793,7 +801,24 @@ def main() -> None:
 
     config = load_config()
     bot = ClaudedBot(config)
-    bot.run(config.discord_bot_token, log_handler=None)
+    try:
+        bot.run(config.discord_bot_token, log_handler=None)
+    except discord.errors.PrivilegedIntentsRequired:
+        log.warning(
+            "Message Content Intent not enabled in Discord Developer Portal. "
+            "Retrying without message_content intent — @mention triggers will "
+            "not work, but slash commands will. Enable the intent at "
+            "https://discord.com/developers/applications/ for full functionality."
+        )
+        # Retry with safe intents
+        bot2 = ClaudedBot.__new__(ClaudedBot)
+        commands.Bot.__init__(bot2, command_prefix="!", intents=_build_intents_safe())
+        bot2.config = config
+        bot2.project_manager = bot.project_manager
+        bot2.session_manager = bot.session_manager
+        bot2.cost_tracker = bot.cost_tracker
+        bot2._start_time = bot._start_time
+        bot2.run(config.discord_bot_token, log_handler=None)
 
 
 if __name__ == "__main__":
