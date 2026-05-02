@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from claude_code_sdk import (
@@ -56,6 +57,14 @@ OnAskUser = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 # name and the raw tool input dict before execution begins.
 OnPreToolUse = Callable[[str, dict[str, Any]], Awaitable[None]]
 
+# Type alias for the PostToolUse notification callback. Receives the tool
+# name and the raw tool input dict after execution completes.
+OnPostToolUse = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+# Type alias for the Stop hook callback. Receives the raw input data when
+# Claude stops.
+OnStop = Callable[[dict[str, Any]], Awaitable[None]]
+
 
 _CHANNEL_MGMT_PROMPT = """
 You can create Discord threads and channels by including these markers in your output:
@@ -77,7 +86,10 @@ class ClaudeBridge:
         config: Config,
         on_ask_user: OnAskUser | None = None,
         on_pre_tool_use: OnPreToolUse | None = None,
+        on_post_tool_use: OnPostToolUse | None = None,
+        on_stop: OnStop | None = None,
         system_prompt: str | None = None,
+        env: dict[str, str] | None = None,
         model_override: str | None = None,
         resume_session_id: str | None = None,
         effort: str | None = None,
@@ -100,7 +112,12 @@ class ClaudeBridge:
         self._config = config
         self.on_ask_user = on_ask_user
         self._on_pre_tool_use = on_pre_tool_use
+        self._on_post_tool_use = on_post_tool_use
+        self._on_stop = on_stop
         self.system_prompt = system_prompt
+        self._env = env
+        self._last_activity = time.time()
+        self._start_time = time.time()
         self._model_override = model_override
         self._resume_session_id = resume_session_id
         self._effort = effort
@@ -182,6 +199,8 @@ class ClaudeBridge:
         # Feature #60: PreToolUse hook for early notification
         # ------------------------------------------------------------------
         hooks: dict[str, list[HookMatcher]] | None = None
+        _hooks_dict: dict[str, list[HookMatcher]] = {}
+
         if self._on_pre_tool_use is not None:
             on_pre = self._on_pre_tool_use  # capture for closure
 
@@ -197,9 +216,43 @@ class ClaudeBridge:
                     log.debug("on_pre_tool_use callback raised; ignoring", exc_info=True)
                 return {}  # empty dict = continue normally
 
-            hooks = {
-                "PreToolUse": [HookMatcher(matcher=None, hooks=[_hook_pre_tool])],
-            }
+            _hooks_dict["PreToolUse"] = [HookMatcher(matcher=None, hooks=[_hook_pre_tool])]
+
+        if self._on_post_tool_use is not None:
+            on_post = self._on_post_tool_use  # capture for closure
+
+            async def _hook_post_tool(
+                input_data: dict[str, Any],
+                tool_use_id: str | None,
+                context: HookContext,
+            ) -> dict[str, Any]:
+                tool_name = input_data.get("tool_name", "unknown")
+                try:
+                    await on_post(tool_name, input_data)
+                except Exception:
+                    log.debug("on_post_tool_use callback raised; ignoring", exc_info=True)
+                return {}
+
+            _hooks_dict["PostToolUse"] = [HookMatcher(matcher=None, hooks=[_hook_post_tool])]
+
+        if self._on_stop is not None:
+            on_stop_cb = self._on_stop  # capture for closure
+
+            async def _hook_stop(
+                input_data: dict[str, Any],
+                tool_use_id: str | None,
+                context: HookContext,
+            ) -> dict[str, Any]:
+                try:
+                    await on_stop_cb(input_data)
+                except Exception:
+                    log.debug("on_stop callback raised; ignoring", exc_info=True)
+                return {}
+
+            _hooks_dict["Stop"] = [HookMatcher(matcher=None, hooks=[_hook_stop])]
+
+        if _hooks_dict:
+            hooks = _hooks_dict
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
@@ -225,13 +278,14 @@ class ClaudeBridge:
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s",
+            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s env=%s",
             self.project_path,
             bool(self.on_ask_user),
             self._resume_session_id,
             self._effort,
             bool(hooks),
             True,
+            bool(self._env),
         )
 
     async def send_message(self, text: str) -> AsyncIterator[object]:
@@ -247,6 +301,8 @@ class ClaudeBridge:
         """
         if self._client is None or not self._active:
             raise RuntimeError("ClaudeBridge.send_message called before start()")
+
+        self._last_activity = time.time()
 
         try:
             await self._client.query(text)
@@ -357,6 +413,8 @@ __all__ = [
     "ClaudeBridge",
     "OnAskUser",
     "OnPreToolUse",
+    "OnPostToolUse",
+    "OnStop",
     # Re-export for convenience so callers can ``isinstance`` against the
     # message/block types without importing the SDK directly.
     "AssistantMessage",

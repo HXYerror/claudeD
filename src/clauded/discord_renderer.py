@@ -331,6 +331,46 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
+                            # --- Special tool display: Worktree (#73) ---
+                            if name == "EnterWorktree":
+                                wt_name = block.input.get("name", "")[:100]
+                                tool_embed = discord.Embed(title=f"🌳 Entered worktree: {wt_name}", color=COLOR_INFO)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            if name == "ExitWorktree":
+                                tool_embed = discord.Embed(title="🌳 Exited worktree", color=COLOR_INFO)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: Cron (#73) ---
+                            if name == "CronCreate":
+                                schedule = block.input.get("schedule", "")[:100]
+                                cmd = block.input.get("command", "")[:200]
+                                tool_embed = discord.Embed(title="⏰ Cron Created", description=f"`{schedule}`\n```\n{cmd}\n```", color=COLOR_INFO)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            if name == "CronDelete":
+                                tool_embed = discord.Embed(title="⏰ Cron Deleted", color=COLOR_TOOL_FAILURE)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            if name == "CronList":
+                                tool_embed = discord.Embed(title="⏰ Listing Crons", color=COLOR_INFO)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
                             # Build a colored embed for the tool execution
                             tool_embed = discord.Embed(
                                 title=f"🔄 {name}",

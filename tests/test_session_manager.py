@@ -49,7 +49,10 @@ class _FakeBridge:
         config: Config,
         on_ask_user: Any = None,
         on_pre_tool_use: Any = None,
+        on_post_tool_use: Any = None,
+        on_stop: Any = None,
         system_prompt: Any = None,
+        env: Any = None,
         model_override: Any = None,
         resume_session_id: Any = None,
         effort: Any = None,
@@ -72,6 +75,9 @@ class _FakeBridge:
         self.config = config
         self.on_ask_user = on_ask_user
         self.on_pre_tool_use = on_pre_tool_use
+        self.on_post_tool_use = on_post_tool_use
+        self.on_stop = on_stop
+        self.env = env
         self.resume_session_id = resume_session_id
         self.effort = effort
         self.allowed_tools = allowed_tools

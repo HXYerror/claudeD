@@ -18,7 +18,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from .config import Config, load_config
 from .discord_renderer import DiscordRenderer, COLOR_INFO, COLOR_TOOL_FAILURE
@@ -81,6 +81,7 @@ class ClaudedBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
+        self._cleanup_task.start()
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
@@ -96,8 +97,28 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(fallback_model_cmd)
         self.tree.add_command(plugin_group)
         self.tree.add_command(send_to_claude)
+        self.tree.add_command(env_group)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
+
+    @tasks.loop(minutes=5)
+    async def _cleanup_task(self) -> None:
+        """Clean up sessions idle for > 1 hour."""
+        timeout = int(os.environ.get("CLAUDED_SESSION_TIMEOUT", "3600"))
+        now = time.time()
+        to_remove = []
+        for thread_id, bridge in list(self.session_manager.list_sessions().items()):
+            last = getattr(bridge, '_last_activity', getattr(bridge, '_start_time', now))
+            if now - last > timeout:
+                to_remove.append(thread_id)
+        for tid in to_remove:
+            self.session_manager.save_session_state(tid)
+            await self.session_manager.stop_session(tid)
+            log.info("Auto-expired session for thread %s", tid)
+
+    @_cleanup_task.before_loop
+    async def _before_cleanup(self) -> None:
+        await self.wait_until_ready()
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -194,6 +215,7 @@ class ClaudedBot(commands.Bot):
                     except Exception:
                         pass  # best-effort; don't break the stream
 
+                env_vars = self.project_manager.get_env(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
@@ -203,6 +225,7 @@ class ClaudedBot(commands.Bot):
                     system_prompt=system_prompt,
                     add_dirs=extra_dirs or None,
                     mcp_servers=mcp_servers or None,
+                    env=env_vars or None,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -300,6 +323,7 @@ class ClaudedBot(commands.Bot):
                         except Exception:
                             pass  # best-effort; don't break the stream
 
+                    env_vars = self.project_manager.get_env(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
@@ -311,6 +335,7 @@ class ClaudedBot(commands.Bot):
                         resume_session_id=resume_id,
                         add_dirs=extra_dirs or None,
                         mcp_servers=mcp_servers or None,
+                        env=env_vars or None,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -616,9 +641,44 @@ async def project_unbind(interaction: discord.Interaction) -> None:
         )
 
 
-@project_group.command(name="system-prompt", description="Set a system prompt for this project")
-@app_commands.describe(text="System prompt text, or 'clear' to remove")
-async def project_system_prompt(interaction: discord.Interaction, text: str) -> None:
+class SystemPromptModal(discord.ui.Modal, title="Set System Prompt"):
+    """Modal dialog for editing the channel's system prompt."""
+
+    prompt_input = discord.ui.TextInput(
+        label="System Prompt",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe the project context, coding style, etc.",
+        max_length=4000,
+        required=False,
+    )
+
+    def __init__(self, channel_id: int, project_manager: ProjectManager) -> None:
+        super().__init__()
+        self._channel_id = channel_id
+        self._pm = project_manager
+        existing = project_manager.get_system_prompt(channel_id)
+        if existing:
+            self.prompt_input.default = existing
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.prompt_input.value.strip()
+        if text:
+            self._pm.set_system_prompt(self._channel_id, text)
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="✅ System prompt updated",
+                    description=f"```\n{text[:200]}\n```",
+                    color=COLOR_INFO,
+                ),
+                ephemeral=True,
+            )
+        else:
+            self._pm.clear_system_prompt(self._channel_id)
+            await interaction.response.send_message("✅ System prompt cleared.", ephemeral=True)
+
+
+@project_group.command(name="system-prompt", description="Set system prompt for this project")
+async def project_system_prompt(interaction: discord.Interaction) -> None:
     log.info("/project system-prompt channel=%s", interaction.channel_id)
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
     channel_id = interaction.channel_id
@@ -630,12 +690,8 @@ async def project_system_prompt(interaction: discord.Interaction, text: str) -> 
         await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
         return
 
-    if text.lower() == "clear":
-        bot.project_manager.clear_system_prompt(channel_id)
-        await interaction.response.send_message("✅ System prompt cleared", ephemeral=True)
-    else:
-        bot.project_manager.set_system_prompt(channel_id, text)
-        await interaction.response.send_message("✅ System prompt set", ephemeral=True)
+    modal = SystemPromptModal(channel_id, bot.project_manager)
+    await interaction.response.send_modal(modal)
 
 
 @project_group.command(name="add-dir", description="Add extra directory access for Claude")
@@ -1889,6 +1945,79 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
     await interaction.followup.send(embed=embed)
 
 
+
+
+# ---------------------------------------------------------------------------
+# /env command group (#71)
+# ---------------------------------------------------------------------------
+
+env_group = app_commands.Group(
+    name="env",
+    description="Manage environment variables for Claude sessions.",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@env_group.command(name="set", description="Set environment variable")
+@app_commands.describe(key="Variable name", value="Variable value")
+async def env_set(interaction: discord.Interaction, key: str, value: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if not bot.project_manager.is_bound(parent_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+    bot.project_manager.set_env(parent_id, key, value)
+    embed = discord.Embed(
+        title="✅ Environment Variable Set",
+        description=f"`{key}` = `{value[:100]}{'…' if len(value) > 100 else ''}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@env_group.command(name="list", description="List environment variables")
+async def env_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    env = bot.project_manager.get_env(parent_id)
+    if not env:
+        await interaction.response.send_message("No environment variables configured.", ephemeral=True)
+        return
+    listing = "\n".join(f"• `{k}` = `{v[:50]}{'…' if len(v) > 50 else ''}`" for k, v in env.items())
+    embed = discord.Embed(
+        title="🔐 Environment Variables",
+        description=listing,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@env_group.command(name="remove", description="Remove environment variable")
+@app_commands.describe(key="Variable name")
+async def env_remove(interaction: discord.Interaction, key: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if bot.project_manager.remove_env(parent_id, key):
+        embed = discord.Embed(
+            title="✅ Environment Variable Removed",
+            description=f"Removed `{key}`",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Variable `{key}` not found.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
