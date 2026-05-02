@@ -13,18 +13,23 @@ from clauded.config import Config, load_config
 def isolated_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> pytest.MonkeyPatch:
-    """Clear all clauded-relevant env vars and chdir to a clean tmp dir.
+    """Clear all clauded-relevant env vars and neutralise ``load_dotenv``.
 
     ``load_config`` calls ``load_dotenv()``, which scans the cwd and parents
-    for a ``.env`` file. Running the tests from the repo root where a
-    developer might have a real ``.env`` would pollute our assertions, so
-    we move into an empty tmp dir before invoking ``load_config``.
+    for a ``.env`` file. A real ``.env`` in the repo root would pollute our
+    assertions, so we monkeypatch ``load_dotenv`` to a no-op **and** strip
+    every env var that ``.env`` might set.
     """
-    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
-    monkeypatch.delenv("CLAUDE_MODEL", raising=False)
-    monkeypatch.delenv("CLAUDE_PERMISSION_MODE", raising=False)
-    monkeypatch.delenv("CLAUDED_PROJECTS_ROOT", raising=False)
-    monkeypatch.chdir(tmp_path)
+    for key in (
+        "DISCORD_BOT_TOKEN",
+        "CLAUDE_MODEL",
+        "CLAUDE_PERMISSION_MODE",
+        "CLAUDED_PROJECTS_ROOT",
+        "CLAUDE_CLI_PATH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    # Prevent load_dotenv from reading .env file
+    monkeypatch.setattr("clauded.config.load_dotenv", lambda *a, **kw: None)
     return monkeypatch
 
 

@@ -21,7 +21,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .config import Config, load_config
-from .discord_renderer import DiscordRenderer
+from .discord_renderer import DiscordRenderer, COLOR_INFO, COLOR_TOOL_FAILURE
 from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
@@ -184,7 +184,12 @@ class ClaudedBot(commands.Bot):
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
                 try:
-                    await thread.send(f"❌ Failed to start Claude session: `{exc}`")
+                    err_embed = discord.Embed(
+                        title="❌ Error",
+                        description=f"```\n{str(exc)[:500]}\n```",
+                        color=COLOR_TOOL_FAILURE,
+                    )
+                    await thread.send(embed=err_embed)
                 except discord.HTTPException:
                     log.debug("Could not post session-start error to thread")
                 return
@@ -253,9 +258,12 @@ class ClaudedBot(commands.Bot):
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
                     try:
-                        await message.channel.send(
-                            f"❌ Failed to start Claude session: `{exc}`"
+                        err_embed = discord.Embed(
+                            title="❌ Error",
+                            description=f"```\n{str(exc)[:500]}\n```",
+                            color=COLOR_TOOL_FAILURE,
                         )
+                        await message.channel.send(embed=err_embed)
                     except discord.HTTPException:
                         log.debug("Could not post session-start error to thread")
                     return
@@ -370,9 +378,12 @@ class ClaudedBot(commands.Bot):
                     except Exception as start_exc:
                         log.exception("Retry: failed to restart ClaudeBridge")
                         try:
-                            await thread.send(
-                                f"❌ Retry failed to start session: `{start_exc}`"
+                            err_embed = discord.Embed(
+                                title="❌ Error",
+                                description=f"```\n{str(start_exc)[:500]}\n```",
+                                color=COLOR_TOOL_FAILURE,
                             )
+                            await thread.send(embed=err_embed)
                         except discord.HTTPException:
                             log.debug("Retry: could not surface restart error")
                         return
@@ -409,9 +420,12 @@ async def cost_show(interaction: discord.Interaction) -> None:
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
     total, calls = bot.cost_tracker.get_channel_cost(parent_id)
-    await interaction.response.send_message(
-        f"\U0001f4b0 Channel cost: ${total:.4f} ({calls} API calls)", ephemeral=True
+    embed = discord.Embed(
+        title="💰 Channel Cost",
+        description=f"**${total:.4f}** across {calls} API call(s)",
+        color=COLOR_INFO,
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @cost_group.command(name="total", description="Show total cost across all channels")
@@ -421,9 +435,12 @@ async def cost_total(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
     total = bot.cost_tracker.get_total_cost()
-    await interaction.response.send_message(
-        f"\U0001f4b0 Total cost: ${total:.4f}", ephemeral=True
+    embed = discord.Embed(
+        title="💰 Total Cost",
+        description=f"**${total:.4f}**",
+        color=COLOR_INFO,
     )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @cost_group.command(name="reset", description="Reset cost for this channel")
@@ -751,7 +768,7 @@ async def health_check(interaction: discord.Interaction) -> None:
     except Exception:
         claude_version = "unavailable"
 
-    embed = discord.Embed(title="🏥 Bot Health", color=discord.Color.green())
+    embed = discord.Embed(title="🏥 Bot Health", color=COLOR_INFO)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Sessions", value=str(active_sessions), inline=True)
     embed.add_field(name="Bound Projects", value=str(bound_projects), inline=True)
