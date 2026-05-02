@@ -29,6 +29,8 @@ class SessionConfig:
     settings: str | None = None
     env: dict[str, str] | None = None
     user: str | None = None
+    bare: bool = False
+    session_name: str | None = None
     on_ask_user: Any = None  # callback
     on_pre_tool_use: Any = None  # callback
     on_post_tool_use: Any = None  # callback

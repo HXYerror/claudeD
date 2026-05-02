@@ -315,3 +315,88 @@ async def test_session_manager_passes_on_pre_tool_use(
     assert len(captured_kwargs) == 1
     assert captured_kwargs[0]["session_config"] is sc
     assert sc.on_pre_tool_use is cb
+
+
+# ---------------------------------------------------------------------------
+# Feature #92: User passed to ClaudeCodeOptions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_passes_user_to_options(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When user is set in SessionConfig, start() passes it to ClaudeCodeOptions."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(user="alice#1234")
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert opts.user == "alice#1234"
+
+
+# ---------------------------------------------------------------------------
+# Feature #94: Bare mode sets extra_args
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_bare_mode_extra_args(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When bare=True in SessionConfig, start() adds 'bare' to extra_args."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(bare=True)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert "bare" in opts.extra_args
+    assert opts.extra_args["bare"] is None
+
+
+# ---------------------------------------------------------------------------
+# Feature #95: Session name sets extra_args
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_session_name_extra_args(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When session_name is set in SessionConfig, start() adds 'name' to extra_args."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(session_name="my-session")
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert opts.extra_args.get("name") == "my-session"

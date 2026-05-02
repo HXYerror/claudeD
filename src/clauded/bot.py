@@ -82,6 +82,7 @@ class ClaudedBot(commands.Bot):
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
         self._pre_tool_notifications: bool = True
+        self._notify_enabled: dict[int, bool] = {}
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -116,6 +117,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(pin_message)
         self.tree.add_command(debug_toggle)
         self.tree.add_command(notify_toggle)
+        self.tree.add_command(ratelimit_info)
+        self.tree.add_command(toggle_bare)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -241,10 +244,11 @@ class ClaudedBot(commands.Bot):
                     log.info("Session stopped: %s", reason)
 
                 env_vars = self.project_manager.get_env(channel.id)
+                _notify = self._notify_enabled.get(thread.id, self._pre_tool_notifications)
                 sc = SessionConfig(
                     system_prompt=system_prompt,
                     on_ask_user=handler.handle_ask_user_question,
-                    on_pre_tool_use=_pre_tool_notify if self._pre_tool_notifications else None,
+                    on_pre_tool_use=_pre_tool_notify if _notify else None,
                     on_post_tool_use=_post_tool_notify,
                     on_stop=_stop_notify,
                     add_dirs=extra_dirs or None,
@@ -364,12 +368,13 @@ class ClaudedBot(commands.Bot):
                         log.info("Session stopped: %s", reason)
 
                     env_vars = self.project_manager.get_env(parent_id)
+                    _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
                     sc = SessionConfig(
                         system_prompt=stored_prompt or system_prompt,
                         model_override=stored_model,
                         resume_session_id=resume_id,
                         on_ask_user=handler.handle_ask_user_question,
-                        on_pre_tool_use=_pre_tool_notify_thread if self._pre_tool_notifications else None,
+                        on_pre_tool_use=_pre_tool_notify_thread if _notify else None,
                         on_post_tool_use=_post_tool_notify_thread,
                         on_stop=_stop_notify_thread,
                         add_dirs=extra_dirs or None,
@@ -518,7 +523,8 @@ class ClaudedBot(commands.Bot):
         # Build pre-tool callback if notifications are enabled
         _target = interaction.channel
         pre_tool_cb = None
-        if self._pre_tool_notifications:
+        _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
+        if _notify:
             async def _pre_tool_notify(tool_name: str, input_data: dict) -> None:
                 try:
                     await _target.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
@@ -603,12 +609,26 @@ class ClaudedBot(commands.Bot):
                         if _retry_sc is not None:
                             retry_sc = SessionConfig(
                                 system_prompt=_retry_sc.system_prompt,
-                                add_dirs=_retry_sc.add_dirs,
-                                mcp_servers=_retry_sc.mcp_servers,
-                                env=_retry_sc.env,
                                 model_override=_retry_sc.model_override,
                                 effort=_retry_sc.effort,
+                                allowed_tools=list(_retry_sc.allowed_tools) if _retry_sc.allowed_tools else [],
+                                disallowed_tools=list(_retry_sc.disallowed_tools) if _retry_sc.disallowed_tools else [],
                                 max_budget_usd=_retry_sc.max_budget_usd,
+                                fork_session=_retry_sc.fork_session,
+                                add_dirs=_retry_sc.add_dirs,
+                                from_pr=_retry_sc.from_pr,
+                                worktree=_retry_sc.worktree,
+                                agent_name=_retry_sc.agent_name,
+                                custom_agents=_retry_sc.custom_agents,
+                                mcp_servers=_retry_sc.mcp_servers,
+                                max_turns=_retry_sc.max_turns,
+                                fallback_model=_retry_sc.fallback_model,
+                                plugin_dirs=list(_retry_sc.plugin_dirs) if _retry_sc.plugin_dirs else None,
+                                settings=_retry_sc.settings,
+                                env=_retry_sc.env,
+                                user=_retry_sc.user,
+                                bare=_retry_sc.bare,
+                                session_name=_retry_sc.session_name,
                                 on_ask_user=new_handler.handle_ask_user_question,
                                 on_pre_tool_use=_retry_sc.on_pre_tool_use,
                                 on_post_tool_use=_retry_sc.on_post_tool_use,
@@ -1127,6 +1147,38 @@ async def session_worktree(interaction: discord.Interaction, name: str) -> None:
         embed = discord.Embed(
             title="🌲 Worktree Created",
             description=f"Session started with worktree **{name}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
+
+
+
+@session_group.command(name="pin", description="Pin the last Claude reply")
+async def session_pin(interaction: discord.Interaction) -> None:
+    channel = interaction.channel
+    try:
+        async for msg in channel.history(limit=10):
+            if msg.author.bot and msg.content:
+                await msg.pin()
+                await interaction.response.send_message("📌 Pinned.", ephemeral=True)
+                return
+    except discord.HTTPException:
+        pass
+    await interaction.response.send_message("No reply to pin.", ephemeral=True)
+
+
+@session_group.command(name="name", description="Set session display name")
+@app_commands.describe(name="Display name for the session")
+async def session_name(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bridge = await bot._recreate_session(interaction, session_name=name)
+    if bridge:
+        embed = discord.Embed(
+            title=f"📛 Session named: {name}",
+            description="⚠️ Conversation context was reset.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -1886,7 +1938,9 @@ async def env_list(interaction: discord.Interaction) -> None:
     if not env:
         await interaction.response.send_message("No environment variables configured.", ephemeral=True)
         return
-    listing = "\n".join(f"• `{k}` = `{v[:50]}{'…' if len(v) > 50 else ''}`" for k, v in env.items())
+    def _mask(v: str) -> str:
+        return v[:2] + "****" if len(v) > 4 else "****"
+    listing = "\n".join(f"• `{k}` = `{_mask(v)}`" for k, v in env.items())
     embed = discord.Embed(
         title="🔐 Environment Variables",
         description=listing,
@@ -2014,6 +2068,45 @@ async def debug_toggle(interaction: discord.Interaction) -> None:
     )
 
 
+
+# ---------------------------------------------------------------------------
+# /bare mode (#94)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="bare", description="Toggle bare/minimal Claude mode")
+async def toggle_bare(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bridge = await bot._recreate_session(interaction, bare=True)
+    if bridge:
+        embed = discord.Embed(
+            title="🔧 Bare Mode Enabled",
+            description="Session restarted in bare/minimal mode.\n⚠️ Conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
+
+
+
+# ---------------------------------------------------------------------------
+# /ratelimit dashboard (#90)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="ratelimit", description="Show API usage stats")
+async def ratelimit_info(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    total = bot.cost_tracker.get_total_cost()
+    embed = discord.Embed(title="📊 API Usage", color=COLOR_INFO)
+    embed.add_field(name="Total Spent", value=f"${total:.4f}")
+    embed.add_field(name="Active Sessions", value=str(len(bot.session_manager.list_sessions())))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # /notify command (#96)
 # ---------------------------------------------------------------------------
@@ -2024,8 +2117,14 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bot._pre_tool_notifications = not bot._pre_tool_notifications
-    state = "ON" if bot._pre_tool_notifications else "OFF"
+    tid = interaction.channel_id
+    if tid is not None:
+        current = bot._notify_enabled.get(tid, True)
+        bot._notify_enabled[tid] = not current
+        state = "ON" if not current else "OFF"
+    else:
+        bot._pre_tool_notifications = not bot._pre_tool_notifications
+        state = "ON" if bot._pre_tool_notifications else "OFF"
     await interaction.response.send_message(
         embed=discord.Embed(
             title=f"🔔 Pre-tool notifications: {state}",

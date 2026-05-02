@@ -117,6 +117,8 @@ class ClaudeBridge:
         self._plugin_dirs = list(sc.plugin_dirs) if sc.plugin_dirs else []
         self._settings = sc.settings
         self._user = sc.user
+        self._bare = sc.bare
+        self._session_name = sc.session_name
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -176,6 +178,10 @@ class ClaudeBridge:
         if self._plugin_dirs:
             # Pass the first plugin dir; CLI supports --plugin-dir
             extra_args["plugin-dir"] = self._plugin_dirs[0]
+        if self._bare:
+            extra_args["bare"] = None
+        if self._session_name:
+            extra_args["name"] = self._session_name
 
         # ------------------------------------------------------------------
         # Feature #60: PreToolUse hook for early notification
@@ -255,6 +261,7 @@ class ClaudeBridge:
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
             settings=self._settings,
+            user=self._user,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
