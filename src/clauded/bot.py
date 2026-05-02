@@ -83,6 +83,9 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
         self.tree.add_command(switch_model)
+        self.tree.add_command(set_effort)
+        self.tree.add_command(tools_group)
+        self.tree.add_command(budget_group)
         self.tree.add_command(health_check)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
@@ -703,6 +706,82 @@ async def session_list(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@session_group.command(name="compact", description="Compact the current session to save tokens")
+async def session_compact(interaction: discord.Interaction) -> None:
+    """Send /compact to the Claude session to compress context."""
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("Use this in a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session in this thread.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        async for _ in bridge.send_message("/compact"):
+            pass  # consume the response stream
+        embed = discord.Embed(
+            title="🗜️ Context Compacted",
+            description="Session context has been compressed to save tokens.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Failed to compact: `{exc}`", ephemeral=True)
+
+
+@session_group.command(name="fork", description="Fork the current session (new branch from same context)")
+async def session_fork(interaction: discord.Interaction) -> None:
+    """Fork the current session — creates a new session branching from the same conversation."""
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if thread_id is None or parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session to fork.", ephemeral=True)
+        return
+    old_session_id = bridge.session_id
+    if not old_session_id:
+        await interaction.response.send_message("Session has no ID yet (send a message first).", ephemeral=True)
+        return
+    await interaction.response.defer()
+    project_path = bridge.project_path
+    system_prompt = bridge.system_prompt
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                resume_session_id=old_session_id,
+                fork_session=True,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to fork: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🍴 Session Forked",
+        description=f"New session branched from `{old_session_id[:12]}…`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
 # ---------------------------------------------------------------------------
 # Top-level slash commands
 # ---------------------------------------------------------------------------
@@ -740,6 +819,292 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
         )
     await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
+
+@app_commands.command(name="effort", description="Set Claude's thinking effort level")
+@app_commands.describe(level="Effort: low, medium, high, xhigh, max")
+@app_commands.choices(level=[
+    app_commands.Choice(name="low", value="low"),
+    app_commands.Choice(name="medium", value="medium"),
+    app_commands.Choice(name="high", value="high"),
+    app_commands.Choice(name="xhigh", value="xhigh"),
+    app_commands.Choice(name="max", value="max"),
+])
+async def set_effort(interaction: discord.Interaction, level: app_commands.Choice[str]) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                effort=level.value,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set effort: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🧠 Effort Level Set",
+        description=f"Thinking effort set to **{level.value}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /tools command group
+# ---------------------------------------------------------------------------
+
+tools_group = app_commands.Group(
+    name="tools",
+    description="Control Claude's available tools.",
+)
+
+
+@tools_group.command(name="allow", description="Only allow specific tools")
+@app_commands.describe(tools="Space-separated tool names: Bash Edit Read Write")
+async def tools_allow(interaction: discord.Interaction, tools: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    tool_list = tools.split()
+    if not tool_list:
+        await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                allowed_tools=tool_list,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔧 Allowed Tools Set",
+        description=f"Only these tools are allowed: `{' '.join(tool_list)}`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tools_group.command(name="deny", description="Deny specific tools")
+@app_commands.describe(tools="Space-separated tool names: WebSearch Bash")
+async def tools_deny(interaction: discord.Interaction, tools: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    tool_list = tools.split()
+    if not tool_list:
+        await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                disallowed_tools=tool_list,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🚫 Denied Tools Set",
+        description=f"These tools are denied: `{' '.join(tool_list)}`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tools_group.command(name="reset", description="Reset to default tools")
+async def tools_reset(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to reset tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔧 Tools Reset",
+        description="All tools restored to defaults.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /budget command group
+# ---------------------------------------------------------------------------
+
+budget_group = app_commands.Group(
+    name="budget",
+    description="Control session spending.",
+)
+
+
+@budget_group.command(name="set", description="Set max budget per session (USD)")
+@app_commands.describe(amount="Maximum USD to spend per session")
+async def budget_set(interaction: discord.Interaction, amount: float) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Budget must be positive.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    # Store the budget in the project binding
+    bot.project_manager.set_budget(parent_id, amount)
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                max_budget_usd=amount,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set budget: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="💵 Budget Set",
+        description=f"Max session budget: **${amount:.2f}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@budget_group.command(name="show", description="Show current budget setting")
+async def budget_show(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
+    budget = bot.project_manager.get_budget(parent_id)
+    if budget is not None:
+        embed = discord.Embed(
+            title="💵 Current Budget",
+            description=f"Max session budget: **${budget:.2f}**",
+            color=COLOR_INFO,
+        )
+    else:
+        embed = discord.Embed(
+            title="💵 Current Budget",
+            description="No budget limit set.",
+            color=COLOR_INFO,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@budget_group.command(name="clear", description="Remove budget limit")
+async def budget_clear(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
+    bot.project_manager.clear_budget(parent_id)
+    embed = discord.Embed(
+        title="💵 Budget Cleared",
+        description="Budget limit removed. Sessions are now unlimited.",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /health
+# ---------------------------------------------------------------------------
 
 @app_commands.command(name="health", description="Show bot health and status")
 async def health_check(interaction: discord.Interaction) -> None:

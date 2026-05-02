@@ -42,11 +42,30 @@ class _FakeBridge:
 
     instances: list["_FakeBridge"] = []
 
-    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None, model_override: Any = None, resume_session_id: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_path: str,
+        config: Config,
+        on_ask_user: Any = None,
+        system_prompt: Any = None,
+        model_override: Any = None,
+        resume_session_id: Any = None,
+        effort: Any = None,
+        allowed_tools: Any = None,
+        disallowed_tools: Any = None,
+        max_budget_usd: Any = None,
+        fork_session: Any = False,
+    ) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
         self.resume_session_id = resume_session_id
+        self.effort = effort
+        self.allowed_tools = allowed_tools
+        self.disallowed_tools = disallowed_tools
+        self.max_budget_usd = max_budget_usd
+        self.fork_session = fork_session
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
@@ -169,3 +188,51 @@ async def test_stop_session_keeps_lock_when_held(cfg: Config, tmp_path) -> None:
         assert 13 in sm._locks  # type: ignore[attr-defined]
     finally:
         lock.release()
+
+
+# ---------------------------------------------------------------------------
+# create_session with new params
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_effort(cfg: Config, tmp_path) -> None:
+    """create_session passes effort to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(20, "/tmp/p", cfg, effort="high")
+    assert bridge.effort == "high"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_tools(cfg: Config, tmp_path) -> None:
+    """create_session passes allowed/disallowed tools to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(
+        21, "/tmp/p", cfg,
+        allowed_tools=["Bash", "Read"],
+        disallowed_tools=["WebSearch"],
+    )
+    assert bridge.allowed_tools == ["Bash", "Read"]
+    assert bridge.disallowed_tools == ["WebSearch"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_budget(cfg: Config, tmp_path) -> None:
+    """create_session passes max_budget_usd to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(22, "/tmp/p", cfg, max_budget_usd=5.0)
+    assert bridge.max_budget_usd == 5.0
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_fork(cfg: Config, tmp_path) -> None:
+    """create_session passes fork_session to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(
+        23, "/tmp/p", cfg,
+        resume_session_id="sess-abc",
+        fork_session=True,
+    )
+    assert bridge.fork_session is True
+    assert bridge.resume_session_id == "sess-abc"

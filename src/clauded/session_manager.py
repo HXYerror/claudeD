@@ -45,6 +45,11 @@ class SessionManager:
         system_prompt: str | None = None,
         model_override: str | None = None,
         resume_session_id: str | None = None,
+        effort: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_budget_usd: float | None = None,
+        fork_session: bool = False,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -63,6 +68,11 @@ class SessionManager:
             system_prompt=system_prompt,
             model_override=model_override,
             resume_session_id=resume_session_id,
+            effort=effort,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            max_budget_usd=max_budget_usd,
+            fork_session=fork_session,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge

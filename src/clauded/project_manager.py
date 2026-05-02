@@ -164,3 +164,32 @@ class ProjectManager:
         if entry is not None and "system_prompt" in entry:
             del entry["system_prompt"]
             self._save()
+
+    # ------------------------------------------------------------------
+    # Budget
+    # ------------------------------------------------------------------
+    def set_budget(self, channel_id: int, amount: float) -> None:
+        """Store a max budget (USD) for the given channel binding."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is None:
+            entry = {}
+            self._projects[key] = entry
+        entry["budget"] = amount
+        self._save()
+
+    def get_budget(self, channel_id: int) -> float | None:
+        """Return the budget for ``channel_id``, or None."""
+        entry = self._projects.get(str(channel_id))
+        if entry is None:
+            return None
+        val = entry.get("budget")
+        return float(val) if val is not None else None
+
+    def clear_budget(self, channel_id: int) -> None:
+        """Remove the budget for ``channel_id`` if present."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is not None and "budget" in entry:
+            del entry["budget"]
+            self._save()
