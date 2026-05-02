@@ -95,6 +95,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(max_turns_cmd)
         self.tree.add_command(fallback_model_cmd)
         self.tree.add_command(plugin_group)
+        self.tree.add_command(send_to_claude)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -216,6 +217,12 @@ class ClaudedBot(commands.Bot):
                     log.debug("Could not post session-start error to thread")
                 return
 
+            # Feature #66: Add hourglass reaction
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+
             user_text, tmp_dir = await self._compose_user_text(message)
             # Use mention-stripped content instead of raw message content
             if tmp_dir is not None:
@@ -225,6 +232,7 @@ class ClaudedBot(commands.Bot):
                 user_text = content
             renderer = DiscordRenderer(thread)
             cost_before = bridge.total_cost if bridge else 0.0
+            _render_ok = False
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -233,6 +241,14 @@ class ClaudedBot(commands.Bot):
                     thread=thread,
                     project_path=project_path,
                 )
+                _render_ok = True
+            except Exception:
+                try:
+                    await message.remove_reaction("⏳", self.user)
+                    await message.add_reaction("❌")
+                except discord.HTTPException:
+                    pass
+                raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
@@ -240,6 +256,12 @@ class ClaudedBot(commands.Bot):
                 if response_cost > 0:
                     self.cost_tracker.record(channel.id, response_cost)
                 self.session_manager.save_session_state(thread.id)
+                if _render_ok:
+                    try:
+                        await message.remove_reaction("⏳", self.user)
+                        await message.add_reaction("✅")
+                    except discord.HTTPException:
+                        pass
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -303,9 +325,16 @@ class ClaudedBot(commands.Bot):
                         log.debug("Could not post session-start error to thread")
                     return
 
+            # Feature #66: Add hourglass reaction
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel)
             cost_before = bridge.total_cost if bridge else 0.0
+            _render_ok = False
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -314,6 +343,14 @@ class ClaudedBot(commands.Bot):
                     thread=message.channel,
                     project_path=project_path,
                 )
+                _render_ok = True
+            except Exception:
+                try:
+                    await message.remove_reaction("⏳", self.user)
+                    await message.add_reaction("❌")
+                except discord.HTTPException:
+                    pass
+                raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
@@ -321,6 +358,12 @@ class ClaudedBot(commands.Bot):
                 if response_cost > 0:
                     self.cost_tracker.record(parent_id, response_cost)
                 self.session_manager.save_session_state(thread_id)
+                if _render_ok:
+                    try:
+                        await message.remove_reaction("⏳", self.user)
+                        await message.add_reaction("✅")
+                    except discord.HTTPException:
+                        pass
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -962,6 +1005,18 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
 
+# ---------------------------------------------------------------------------
+# Autocomplete handlers (#64)
+# ---------------------------------------------------------------------------
+
+async def model_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    models = ["sonnet", "opus", "haiku", "claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+    return [app_commands.Choice(name=m, value=m) for m in models if current.lower() in m.lower()][:25]
+
+switch_model.autocomplete("name")(model_autocomplete)
+
+
+
 @app_commands.command(name="effort", description="Set Claude's thinking effort level")
 @app_commands.describe(level="Effort: low, medium, high, xhigh, max")
 @app_commands.choices(level=[
@@ -1481,6 +1536,20 @@ async def agent_delete(interaction: discord.Interaction, name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Autocomplete: agent_use (#64)
+# ---------------------------------------------------------------------------
+
+async def agent_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        return []
+    agents = bot.agent_manager.list_all()
+    return [app_commands.Choice(name=n, value=n) for n in agents if current.lower() in n.lower()][:25]
+
+agent_use.autocomplete("name")(agent_autocomplete)
+
+
+# ---------------------------------------------------------------------------
 # /mcp command group
 # ---------------------------------------------------------------------------
 
@@ -1818,6 +1887,51 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
         color=COLOR_INFO,
     )
     await interaction.followup.send(embed=embed)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Context menu: Send to Claude (#65)
+# ---------------------------------------------------------------------------
+
+@app_commands.context_menu(name="Send to Claude")
+async def send_to_claude(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer()
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.followup.send("❌ Bot not ready.", ephemeral=True)
+        return
+    channel = message.channel
+    channel_id = getattr(channel, "parent_id", channel.id) or channel.id
+    project_path = bot.project_manager.get_path(channel_id)
+    if not project_path:
+        await interaction.followup.send("❌ Channel not bound.", ephemeral=True)
+        return
+    # Create thread from the target message
+    thread_name = f"Claude: {message.content[:80]}" if message.content else "Claude session"
+    try:
+        thread = await message.create_thread(name=thread_name)
+    except discord.HTTPException:
+        await interaction.followup.send("❌ Failed to create thread.", ephemeral=True)
+        return
+    # Create session and send
+    system_prompt = bot.project_manager.get_system_prompt(channel_id)
+    handler = InteractionHandler(thread)
+    lock = bot.session_manager.get_lock(thread.id)
+    async with lock:
+        try:
+            bridge = await bot.session_manager.create_session(
+                thread.id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to start session: `{exc}`", ephemeral=True)
+            return
+    renderer = DiscordRenderer(thread)
+    user_text = message.content or "Hello"
+    await renderer.render_response(bridge, user_text)
+    await interaction.followup.send(f"✅ Sent to Claude in {thread.mention}", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------

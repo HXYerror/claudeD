@@ -105,6 +105,7 @@ class DiscordRenderer:
         # tool_use_id -> discord.Message
         tool_msgs: dict[str, discord.Message] = {}
         tool_names: dict[str, str] = {}
+        task_depth = 0                            # subtask nesting depth (#74)
         # Stats populated from ResultMessage
         stats: dict | None = None
 
@@ -225,14 +226,45 @@ class DiscordRenderer:
                                 await self._safe_send(embed=plan_embed)
                                 continue
 
-                            # --- Special tool display: Task subtask (#55) ---
+                            # --- Special tool display: Task subtask (#55, #74) ---
                             if name == "Task":
-                                desc = block.input.get("description", "")[:200]
+                                task_depth += 1
+                                desc = block.input.get("description", "")[:300]
+                                prompt = block.input.get("prompt", "")[:500]
+                                indent = "│ " * (task_depth - 1) + "├─"
                                 task_embed = discord.Embed(
-                                    title=f"🔀 Subtask: {desc}" if desc else "🔀 Subtask",
+                                    title=f"{indent} 🔀 Subtask #{task_depth}",
+                                    description=desc,
                                     color=COLOR_INFO,
                                 )
+                                if prompt:
+                                    task_embed.add_field(name="Prompt", value=f"```\n{prompt[:500]}\n```", inline=False)
                                 tmsg = await self._safe_send(embed=task_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: TaskOutput (#74) ---
+                            if name == "TaskOutput":
+                                output = block.input.get("output", "")[:500]
+                                task_out_embed = discord.Embed(
+                                    title="📤 Subtask Output",
+                                    description=output,
+                                    color=COLOR_INFO,
+                                )
+                                tmsg = await self._safe_send(embed=task_out_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: TaskStop (#74) ---
+                            if name == "TaskStop":
+                                task_depth = max(0, task_depth - 1)
+                                task_stop_embed = discord.Embed(
+                                    title="⏹️ Subtask Stopped",
+                                    color=COLOR_TOOL_FAILURE,
+                                )
+                                tmsg = await self._safe_send(embed=task_stop_embed)
                                 if tmsg is not None and tool_id:
                                     tool_msgs[tool_id] = tmsg
                                 continue
@@ -258,6 +290,43 @@ class DiscordRenderer:
                                     color=COLOR_INFO,
                                 )
                                 tmsg = await self._safe_send(embed=todo_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: WebSearch (#67) ---
+                            if name == "WebSearch":
+                                query = block.input.get("query", "")[:200]
+                                tool_embed = discord.Embed(title=f"🔍 Searching: {query}", color=COLOR_TOOL_RUNNING)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: WebFetch (#67) ---
+                            if name == "WebFetch":
+                                url = block.input.get("url", "")[:200]
+                                tool_embed = discord.Embed(title="🌐 Fetching", description=f"`{url}`", color=COLOR_TOOL_RUNNING)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: Glob (#67) ---
+                            if name == "Glob":
+                                pattern = block.input.get("pattern", "")[:100]
+                                tool_embed = discord.Embed(title=f"📂 Glob: {pattern}", color=COLOR_TOOL_RUNNING)
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: Grep (#67) ---
+                            if name == "Grep":
+                                pattern = block.input.get("pattern", "")[:100]
+                                grep_path = block.input.get("path", ".")[:100]
+                                tool_embed = discord.Embed(title=f"🔎 Grep: {pattern}", description=f"in `{grep_path}`", color=COLOR_TOOL_RUNNING)
+                                tmsg = await self._safe_send(embed=tool_embed)
                                 if tmsg is not None and tool_id:
                                     tool_msgs[tool_id] = tmsg
                                 continue
@@ -313,19 +382,31 @@ class DiscordRenderer:
 
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
-                            # --- Task result display (#55) ---
+                            # --- Task result display (#55, #74) ---
                             result_name = tool_names.get(tool_id, "") if tool_id else ""
-                            if result_name in ("Task",):
+                            if result_name == "Task":
+                                task_depth = max(0, task_depth - 1)
                                 content_str = str(block.content)[:500] if block.content else ""
-                                task_result_embed = discord.Embed(
-                                    title="✅ Subtask completed",
-                                    description=content_str or "Done",
-                                    color=COLOR_TOOL_SUCCESS,
-                                )
+                                is_err = bool(getattr(block, "is_error", False))
+                                if is_err:
+                                    task_result_embed = discord.Embed(
+                                        title="❌ Subtask failed",
+                                        description=content_str or "Failed",
+                                        color=COLOR_TOOL_FAILURE,
+                                    )
+                                else:
+                                    task_result_embed = discord.Embed(
+                                        title="✅ Subtask completed",
+                                        description=content_str or "Done",
+                                        color=COLOR_TOOL_SUCCESS,
+                                    )
                                 if tool_id and tool_id in tool_msgs:
                                     await self._safe_edit(tool_msgs[tool_id], embed=task_result_embed)
                                 else:
                                     await self._safe_send(embed=task_result_embed)
+                                continue
+
+                            if result_name == "TaskStop":
                                 continue
 
                             if tool_id and tool_id in tool_msgs:
