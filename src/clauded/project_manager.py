@@ -230,3 +230,38 @@ class ProjectManager:
             self._save()
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # MCP servers
+    # ------------------------------------------------------------------
+    def add_mcp_server(self, channel_id: int, name: str, config: dict) -> None:
+        """Add an MCP server configuration for the given channel.
+
+        ``config`` should be a dict matching one of the Claude SDK MCP
+        server config shapes, e.g.
+        ``{"type": "stdio", "command": "npx", "args": [...]}`` or
+        ``{"type": "http", "url": "https://..."}``
+        """
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        mcps = entry.get("mcp_servers", {})
+        mcps[name] = config
+        entry["mcp_servers"] = mcps
+        self._projects[key] = entry
+        self._save()
+
+    def get_mcp_servers(self, channel_id: int) -> dict:
+        """Return all MCP server configs for ``channel_id``."""
+        return self._projects.get(str(channel_id), {}).get("mcp_servers", {})
+
+    def remove_mcp_server(self, channel_id: int, name: str) -> bool:
+        """Remove an MCP server by name. Returns True if it existed."""
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        mcps = entry.get("mcp_servers", {})
+        if name in mcps:
+            del mcps[name]
+            entry["mcp_servers"] = mcps
+            self._save()
+            return True
+        return False

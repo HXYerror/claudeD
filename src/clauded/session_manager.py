@@ -53,6 +53,9 @@ class SessionManager:
         add_dirs: list[str] | None = None,
         from_pr: str | None = None,
         worktree: str | None = None,
+        agent_name: str | None = None,
+        custom_agents: dict | None = None,
+        mcp_servers: dict | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -79,6 +82,9 @@ class SessionManager:
             add_dirs=add_dirs,
             from_pr=from_pr,
             worktree=worktree,
+            agent_name=agent_name,
+            custom_agents=custom_agents,
+            mcp_servers=mcp_servers,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge

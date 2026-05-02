@@ -59,6 +59,9 @@ class _FakeBridge:
         add_dirs: Any = None,
         from_pr: Any = None,
         worktree: Any = None,
+        agent_name: Any = None,
+        custom_agents: Any = None,
+        mcp_servers: Any = None,
     ) -> None:
         self.project_path = project_path
         self.config = config
@@ -72,6 +75,9 @@ class _FakeBridge:
         self.add_dirs = add_dirs
         self.from_pr = from_pr
         self.worktree = worktree
+        self.agent_name = agent_name
+        self.custom_agents = custom_agents
+        self.mcp_servers = mcp_servers
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
@@ -269,4 +275,29 @@ async def test_create_session_with_worktree(cfg: Config, tmp_path) -> None:
     sm = _make_sm(tmp_path)
     bridge = await sm.create_session(32, "/tmp/p", cfg, worktree="feature-branch")
     assert bridge.worktree == "feature-branch"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_agent(cfg: Config, tmp_path) -> None:
+    """create_session passes agent_name and custom_agents to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    agents = {"reviewer": {"description": "Code reviewer", "prompt": "Review code carefully"}}
+    bridge = await sm.create_session(
+        40, "/tmp/p", cfg,
+        agent_name="reviewer",
+        custom_agents=agents,
+    )
+    assert bridge.agent_name == "reviewer"
+    assert bridge.custom_agents == agents
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_mcp_servers(cfg: Config, tmp_path) -> None:
+    """create_session passes mcp_servers to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    mcp = {"myserver": {"type": "stdio", "command": "npx", "args": ["-y", "server"]}}
+    bridge = await sm.create_session(41, "/tmp/p", cfg, mcp_servers=mcp)
+    assert bridge.mcp_servers == mcp
     assert bridge.started

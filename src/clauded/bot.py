@@ -27,6 +27,7 @@ from .project_manager import ProjectManager
 from .session_manager import SessionManager
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
+from .agent_manager import AgentManager
 
 log = logging.getLogger("clauded.bot")
 
@@ -76,6 +77,7 @@ class ClaudedBot(commands.Bot):
         self.project_manager = ProjectManager(projects_root=config.projects_root)
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
+        self.agent_manager = AgentManager()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -88,6 +90,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(budget_group)
         self.tree.add_command(health_check)
         self.tree.add_command(review_pr)
+        self.tree.add_command(agent_group)
+        self.tree.add_command(mcp_group)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -179,6 +183,7 @@ class ClaudedBot(commands.Bot):
                 handler = InteractionHandler(thread)
                 system_prompt = self.project_manager.get_system_prompt(channel.id)
                 extra_dirs = self.project_manager.get_extra_dirs(channel.id)
+                mcp_servers = self.project_manager.get_mcp_servers(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
@@ -186,6 +191,7 @@ class ClaudedBot(commands.Bot):
                     on_ask_user=handler.handle_ask_user_question,
                     system_prompt=system_prompt,
                     add_dirs=extra_dirs or None,
+                    mcp_servers=mcp_servers or None,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -253,6 +259,7 @@ class ClaudedBot(commands.Bot):
                     stored_model = stored.get("model") if stored else None
                     stored_prompt = stored.get("system_prompt") if stored else None
                     extra_dirs = self.project_manager.get_extra_dirs(parent_id)
+                    mcp_servers = self.project_manager.get_mcp_servers(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
@@ -262,6 +269,7 @@ class ClaudedBot(commands.Bot):
                         model_override=stored_model,
                         resume_session_id=resume_id,
                         add_dirs=extra_dirs or None,
+                        mcp_servers=mcp_servers or None,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -1313,6 +1321,226 @@ async def review_pr(interaction: discord.Interaction, pr: str) -> None:
     await interaction.followup.send(embed=embed)
 
 
+
+# ---------------------------------------------------------------------------
+# /agent command group
+# ---------------------------------------------------------------------------
+
+agent_group = app_commands.Group(
+    name="agent",
+    description="Manage custom Claude agents.",
+)
+
+
+@agent_group.command(name="create", description="Create a custom agent")
+@app_commands.describe(name="Agent name", prompt="Agent system prompt", description="Optional description")
+async def agent_create(
+    interaction: discord.Interaction, name: str, prompt: str, description: str = ""
+) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bot.agent_manager.create(name, prompt, description)
+    embed = discord.Embed(
+        title=f"\u2705 Agent `{name}` created",
+        description=f"Prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@agent_group.command(name="list", description="List available agents")
+async def agent_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    agents = bot.agent_manager.list_all()
+    if not agents:
+        await interaction.response.send_message("No custom agents defined. Use `/agent create`.", ephemeral=True)
+        return
+    embed = discord.Embed(title="\U0001f916 Custom Agents", color=COLOR_INFO)
+    for aname, ainfo in agents.items():
+        desc = ainfo.get("description", "")
+        prompt_preview = ainfo.get("prompt", "")[:100]
+        embed.add_field(
+            name=aname,
+            value=f"{desc}\n`{prompt_preview}{'…' if len(ainfo.get('prompt', '')) > 100 else ''}`",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@agent_group.command(name="use", description="Use a custom agent in this thread")
+@app_commands.describe(name="Agent name")
+async def agent_use(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    agent = bot.agent_manager.get(name)
+    if not agent:
+        await interaction.response.send_message(f"\u274c Agent `{name}` not found.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    agents_json = {name: {"description": agent["description"], "prompt": agent["prompt"]}}
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    mcp_servers = bot.project_manager.get_mcp_servers(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                agent_name=name,
+                custom_agents=agents_json,
+                add_dirs=extra_dirs or None,
+                mcp_servers=mcp_servers or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to use agent: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title=f"\U0001f916 Agent `{name}` activated",
+        description=f"{agent['description']}\nNew session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@agent_group.command(name="delete", description="Delete a custom agent")
+@app_commands.describe(name="Agent name")
+async def agent_delete(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if bot.agent_manager.delete(name):
+        embed = discord.Embed(
+            title=f"\U0001f5d1\ufe0f Agent `{name}` deleted",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"\u274c Agent `{name}` not found.", ephemeral=True
+        )
+
+
+# ---------------------------------------------------------------------------
+# /mcp command group
+# ---------------------------------------------------------------------------
+
+mcp_group = app_commands.Group(
+    name="mcp",
+    description="Manage MCP servers for Claude.",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@mcp_group.command(name="add", description="Add a stdio MCP server")
+@app_commands.describe(name="Server name", command="Command to run", args="Space-separated arguments")
+async def mcp_add(
+    interaction: discord.Interaction, name: str, command: str, args: str = ""
+) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    config: dict = {"type": "stdio", "command": command}
+    if args:
+        config["args"] = args.split()
+    bot.project_manager.add_mcp_server(parent_id, name, config)
+    embed = discord.Embed(
+        title=f"\u2705 MCP server `{name}` added",
+        description=f"Type: stdio\nCommand: `{command}`" + (f"\nArgs: `{args}`" if args else ""),
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="add-url", description="Add an HTTP MCP server")
+@app_commands.describe(name="Server name", url="Server URL")
+async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    config: dict = {"type": "http", "url": url}
+    bot.project_manager.add_mcp_server(parent_id, name, config)
+    embed = discord.Embed(
+        title=f"\u2705 MCP server `{name}` added",
+        description=f"Type: http\nURL: `{url}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="list", description="List configured MCP servers")
+async def mcp_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    servers = bot.project_manager.get_mcp_servers(parent_id)
+    if not servers:
+        await interaction.response.send_message("No MCP servers configured.", ephemeral=True)
+        return
+    embed = discord.Embed(title="\U0001f50c MCP Servers", color=COLOR_INFO)
+    for sname, sconfig in servers.items():
+        stype = sconfig.get("type", "stdio")
+        if stype == "http":
+            detail = f"URL: `{sconfig.get('url', 'N/A')}`"
+        else:
+            cmd = sconfig.get("command", "?")
+            sargs = " ".join(sconfig.get("args", []))
+            detail = f"Command: `{cmd}`" + (f"\nArgs: `{sargs}`" if sargs else "")
+        embed.add_field(name=f"{sname} ({stype})", value=detail, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="remove", description="Remove an MCP server")
+@app_commands.describe(name="Server name")
+async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if bot.project_manager.remove_mcp_server(parent_id, name):
+        embed = discord.Embed(
+            title=f"\u2705 MCP server `{name}` removed",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"\u274c MCP server `{name}` not found.", ephemeral=True
+        )
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -1370,6 +1598,7 @@ def main() -> None:
         bot2.project_manager = bot.project_manager
         bot2.session_manager = bot.session_manager
         bot2.cost_tracker = bot.cost_tracker
+        bot2.agent_manager = bot.agent_manager
         bot2._start_time = bot._start_time
         bot2.run(config.discord_bot_token, log_handler=None)
 
