@@ -256,6 +256,7 @@ class ClaudeBridge:
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
+            env=self._env or {},
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
             can_use_tool=self._can_use_tool if self.on_ask_user else None,

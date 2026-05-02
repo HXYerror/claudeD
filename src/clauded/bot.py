@@ -2102,9 +2102,18 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to start session: `{exc}`", ephemeral=True)
             return
-    renderer = DiscordRenderer(thread)
-    user_text = message.content or "Hello"
-    await renderer.render_response(bridge, user_text)
+    try:
+        renderer = DiscordRenderer(thread)
+        user_text = message.content or "Hello"
+        await renderer.render_response(bridge, user_text)
+    except Exception:
+        log.exception("send_to_claude render failed")
+        await bot.session_manager.stop_session(thread.id)
+        try:
+            from clauded.discord_renderer import DiscordRenderer as DR
+            await DR.send_error_with_retry(thread, Exception("Claude session failed"), None, None, None)
+        except Exception:
+            await thread.send(embed=discord.Embed(title="❌ Error", description="Claude session failed", color=0xEF4444))
     await interaction.followup.send(f"✅ Sent to Claude in {thread.mention}", ephemeral=True)
 
 
