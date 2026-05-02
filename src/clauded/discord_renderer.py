@@ -25,6 +25,7 @@ import asyncio
 import io
 import logging
 import time
+import uuid
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
@@ -199,7 +200,7 @@ class DiscordRenderer:
                                 file_content = block.input.get("content", "")
                                 ext = file_path.rsplit(".", 1)[-1] if "." in file_path else ""
                                 lang = ext if ext in ("py", "js", "ts", "go", "rs", "java", "c", "cpp", "h", "md", "yaml", "yml", "json", "toml", "sh", "bash", "sql", "html", "css") else ""
-                                preview = file_content[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
+                                preview = file_content.replace("```", "` ` `")[:1500]  # SEC2: escape before truncate
                                 if len(file_content) > 1500:
                                     preview += "\n... (truncated)"
                                 try:
@@ -216,7 +217,7 @@ class DiscordRenderer:
                                     diff_lines.append(f"- {line}")
                                 for line in new_text.splitlines():
                                     diff_lines.append(f"+ {line}")
-                                diff_str = "\n".join(diff_lines)[:1500].replace("```", "` ` `")  # SEC2: break triple backtick
+                                diff_str = "\n".join(diff_lines).replace("```", "` ` `")[:1500]  # SEC2: escape before truncate
                                 if len("\n".join(diff_lines)) > 1500:
                                     diff_str += "\n... (truncated)"
                                 try:
@@ -495,7 +496,11 @@ class DiscordRenderer:
             log.warning("Discord send rate-limited; sleeping %.2fs", retry)
             await asyncio.sleep(retry)
             try:
-                # Rebuild file if needed (stream may have been consumed)
+                # Reset file stream if it was consumed by the first attempt
+                if "file" in kwargs:
+                    f = kwargs["file"]
+                    if hasattr(f, 'fp') and hasattr(f.fp, 'seek'):
+                        f.fp.seek(0)
                 msg = await self.target.send(**kwargs)
                 if content:
                     self._last_msg = msg
@@ -507,6 +512,11 @@ class DiscordRenderer:
             log.warning("Discord send failed; backing off and retrying once")
             await asyncio.sleep(HTTP_BACKOFF_SECONDS)
             try:
+                # Reset file stream if it was consumed by the first attempt
+                if "file" in kwargs:
+                    f = kwargs["file"]
+                    if hasattr(f, 'fp') and hasattr(f.fp, 'seek'):
+                        f.fp.seek(0)
                 msg = await self.target.send(**kwargs)
                 if content:
                     self._last_msg = msg
@@ -704,6 +714,10 @@ class RetryView(discord.ui.View):
         super().__init__(timeout=timeout)
         self._on_retry = on_retry
         self._fired = False
+        # Override the button's custom_id to be unique per instance
+        for item in self.children:
+            if hasattr(item, 'custom_id') and item.custom_id == 'clauded_retry_btn':
+                item.custom_id = f"clauded_retry_{uuid.uuid4().hex[:8]}"
 
     @discord.ui.button(
         label="Retry",
