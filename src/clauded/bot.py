@@ -18,7 +18,7 @@ from pathlib import Path
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from .config import Config, load_config
 from .discord_renderer import DiscordRenderer, COLOR_INFO, COLOR_TOOL_FAILURE
@@ -81,6 +81,7 @@ class ClaudedBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
+        self._cleanup_task.start()
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
@@ -95,8 +96,29 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(max_turns_cmd)
         self.tree.add_command(fallback_model_cmd)
         self.tree.add_command(plugin_group)
+        self.tree.add_command(send_to_claude)
+        self.tree.add_command(env_group)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
+
+    @tasks.loop(minutes=5)
+    async def _cleanup_task(self) -> None:
+        """Clean up sessions idle for > 1 hour."""
+        timeout = int(os.environ.get("CLAUDED_SESSION_TIMEOUT", "3600"))
+        now = time.time()
+        to_remove = []
+        for thread_id, bridge in list(self.session_manager.list_sessions().items()):
+            last = getattr(bridge, '_last_activity', getattr(bridge, '_start_time', now))
+            if now - last > timeout:
+                to_remove.append(thread_id)
+        for tid in to_remove:
+            self.session_manager.save_session_state(tid)
+            await self.session_manager.stop_session(tid)
+            log.info("Auto-expired session for thread %s", tid)
+
+    @_cleanup_task.before_loop
+    async def _before_cleanup(self) -> None:
+        await self.wait_until_ready()
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -193,6 +215,7 @@ class ClaudedBot(commands.Bot):
                     except Exception:
                         pass  # best-effort; don't break the stream
 
+                env_vars = self.project_manager.get_env(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
@@ -202,6 +225,7 @@ class ClaudedBot(commands.Bot):
                     system_prompt=system_prompt,
                     add_dirs=extra_dirs or None,
                     mcp_servers=mcp_servers or None,
+                    env=env_vars or None,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -216,6 +240,12 @@ class ClaudedBot(commands.Bot):
                     log.debug("Could not post session-start error to thread")
                 return
 
+            # Feature #66: Add hourglass reaction
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+
             user_text, tmp_dir = await self._compose_user_text(message)
             # Use mention-stripped content instead of raw message content
             if tmp_dir is not None:
@@ -225,6 +255,7 @@ class ClaudedBot(commands.Bot):
                 user_text = content
             renderer = DiscordRenderer(thread)
             cost_before = bridge.total_cost if bridge else 0.0
+            _render_ok = False
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -233,6 +264,14 @@ class ClaudedBot(commands.Bot):
                     thread=thread,
                     project_path=project_path,
                 )
+                _render_ok = True
+            except Exception:
+                try:
+                    await message.remove_reaction("⏳", self.user)
+                    await message.add_reaction("❌")
+                except discord.HTTPException:
+                    pass
+                raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
@@ -240,6 +279,12 @@ class ClaudedBot(commands.Bot):
                 if response_cost > 0:
                     self.cost_tracker.record(channel.id, response_cost)
                 self.session_manager.save_session_state(thread.id)
+                if _render_ok:
+                    try:
+                        await message.remove_reaction("⏳", self.user)
+                        await message.add_reaction("✅")
+                    except discord.HTTPException:
+                        pass
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -278,6 +323,7 @@ class ClaudedBot(commands.Bot):
                         except Exception:
                             pass  # best-effort; don't break the stream
 
+                    env_vars = self.project_manager.get_env(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
@@ -289,6 +335,7 @@ class ClaudedBot(commands.Bot):
                         resume_session_id=resume_id,
                         add_dirs=extra_dirs or None,
                         mcp_servers=mcp_servers or None,
+                        env=env_vars or None,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -303,9 +350,16 @@ class ClaudedBot(commands.Bot):
                         log.debug("Could not post session-start error to thread")
                     return
 
+            # Feature #66: Add hourglass reaction
+            try:
+                await message.add_reaction("⏳")
+            except discord.HTTPException:
+                pass
+
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel)
             cost_before = bridge.total_cost if bridge else 0.0
+            _render_ok = False
             try:
                 await self._render_with_retry(
                     renderer=renderer,
@@ -314,6 +368,14 @@ class ClaudedBot(commands.Bot):
                     thread=message.channel,
                     project_path=project_path,
                 )
+                _render_ok = True
+            except Exception:
+                try:
+                    await message.remove_reaction("⏳", self.user)
+                    await message.add_reaction("❌")
+                except discord.HTTPException:
+                    pass
+                raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
@@ -321,6 +383,12 @@ class ClaudedBot(commands.Bot):
                 if response_cost > 0:
                     self.cost_tracker.record(parent_id, response_cost)
                 self.session_manager.save_session_state(thread_id)
+                if _render_ok:
+                    try:
+                        await message.remove_reaction("⏳", self.user)
+                        await message.add_reaction("✅")
+                    except discord.HTTPException:
+                        pass
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -573,9 +641,44 @@ async def project_unbind(interaction: discord.Interaction) -> None:
         )
 
 
-@project_group.command(name="system-prompt", description="Set a system prompt for this project")
-@app_commands.describe(text="System prompt text, or 'clear' to remove")
-async def project_system_prompt(interaction: discord.Interaction, text: str) -> None:
+class SystemPromptModal(discord.ui.Modal, title="Set System Prompt"):
+    """Modal dialog for editing the channel's system prompt."""
+
+    prompt_input = discord.ui.TextInput(
+        label="System Prompt",
+        style=discord.TextStyle.paragraph,
+        placeholder="Describe the project context, coding style, etc.",
+        max_length=4000,
+        required=False,
+    )
+
+    def __init__(self, channel_id: int, project_manager: ProjectManager) -> None:
+        super().__init__()
+        self._channel_id = channel_id
+        self._pm = project_manager
+        existing = project_manager.get_system_prompt(channel_id)
+        if existing:
+            self.prompt_input.default = existing
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.prompt_input.value.strip()
+        if text:
+            self._pm.set_system_prompt(self._channel_id, text)
+            await interaction.response.send_message(
+                embed=discord.Embed(
+                    title="✅ System prompt updated",
+                    description=f"```\n{text[:200]}\n```",
+                    color=COLOR_INFO,
+                ),
+                ephemeral=True,
+            )
+        else:
+            self._pm.clear_system_prompt(self._channel_id)
+            await interaction.response.send_message("✅ System prompt cleared.", ephemeral=True)
+
+
+@project_group.command(name="system-prompt", description="Set system prompt for this project")
+async def project_system_prompt(interaction: discord.Interaction) -> None:
     log.info("/project system-prompt channel=%s", interaction.channel_id)
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
     channel_id = interaction.channel_id
@@ -587,12 +690,8 @@ async def project_system_prompt(interaction: discord.Interaction, text: str) -> 
         await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
         return
 
-    if text.lower() == "clear":
-        bot.project_manager.clear_system_prompt(channel_id)
-        await interaction.response.send_message("✅ System prompt cleared", ephemeral=True)
-    else:
-        bot.project_manager.set_system_prompt(channel_id, text)
-        await interaction.response.send_message("✅ System prompt set", ephemeral=True)
+    modal = SystemPromptModal(channel_id, bot.project_manager)
+    await interaction.response.send_modal(modal)
 
 
 @project_group.command(name="add-dir", description="Add extra directory access for Claude")
@@ -960,6 +1059,18 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
             on_ask_user=handler.handle_ask_user_question,
         )
     await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
+
+
+# ---------------------------------------------------------------------------
+# Autocomplete handlers (#64)
+# ---------------------------------------------------------------------------
+
+async def model_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    models = ["sonnet", "opus", "haiku", "claude-sonnet-4-20250514", "claude-opus-4-20250514"]
+    return [app_commands.Choice(name=m, value=m) for m in models if current.lower() in m.lower()][:25]
+
+switch_model.autocomplete("name")(model_autocomplete)
+
 
 
 @app_commands.command(name="effort", description="Set Claude's thinking effort level")
@@ -1481,6 +1592,20 @@ async def agent_delete(interaction: discord.Interaction, name: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Autocomplete: agent_use (#64)
+# ---------------------------------------------------------------------------
+
+async def agent_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        return []
+    agents = bot.agent_manager.list_all()
+    return [app_commands.Choice(name=n, value=n) for n in agents if current.lower() in n.lower()][:25]
+
+agent_use.autocomplete("name")(agent_autocomplete)
+
+
+# ---------------------------------------------------------------------------
 # /mcp command group
 # ---------------------------------------------------------------------------
 
@@ -1818,6 +1943,178 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
         color=COLOR_INFO,
     )
     await interaction.followup.send(embed=embed)
+
+
+
+
+@session_group.command(name="export", description="Export conversation history as markdown")
+async def session_export(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.followup.send("Bot not ready.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel_id
+    channel = interaction.channel
+
+    if thread_id is None or not hasattr(channel, 'history'):
+        await interaction.followup.send("Use this in a thread.", ephemeral=True)
+        return
+
+    # Collect all messages from the thread
+    messages = []
+    async for msg in channel.history(limit=500, oldest_first=True):
+        role = "🤖 Claude" if msg.author.bot else f"👤 {msg.author.display_name}"
+        content = msg.content or ""
+        # Include embed descriptions
+        for embed in msg.embeds:
+            if embed.description:
+                content += "\n" + embed.description
+            if embed.title:
+                content = "**" + embed.title + "**\n" + content
+        if content.strip():
+            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            messages.append(f"### {role} \u2014 {timestamp}\n\n{content}\n")
+
+    if not messages:
+        await interaction.followup.send("No messages to export.", ephemeral=True)
+        return
+
+    # Build markdown
+    thread_name = getattr(channel, 'name', 'session')
+    md = f"# {thread_name}\n\nExported {len(messages)} messages.\n\n---\n\n"
+    md += "\n---\n\n".join(messages)
+
+    # Upload as file
+    import io
+    file = discord.File(io.BytesIO(md.encode()), filename=f"{thread_name[:50]}.md")
+    await interaction.followup.send("📄 Session exported:", file=file, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /env command group (#71)
+# ---------------------------------------------------------------------------
+
+env_group = app_commands.Group(
+    name="env",
+    description="Manage environment variables for Claude sessions.",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@env_group.command(name="set", description="Set environment variable")
+@app_commands.describe(key="Variable name", value="Variable value")
+async def env_set(interaction: discord.Interaction, key: str, value: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if not bot.project_manager.is_bound(parent_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+    bot.project_manager.set_env(parent_id, key, value)
+    embed = discord.Embed(
+        title="✅ Environment Variable Set",
+        description=f"`{key}` = `{value[:100]}{'…' if len(value) > 100 else ''}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@env_group.command(name="list", description="List environment variables")
+async def env_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    env = bot.project_manager.get_env(parent_id)
+    if not env:
+        await interaction.response.send_message("No environment variables configured.", ephemeral=True)
+        return
+    listing = "\n".join(f"• `{k}` = `{v[:50]}{'…' if len(v) > 50 else ''}`" for k, v in env.items())
+    embed = discord.Embed(
+        title="🔐 Environment Variables",
+        description=listing,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@env_group.command(name="remove", description="Remove environment variable")
+@app_commands.describe(key="Variable name")
+async def env_remove(interaction: discord.Interaction, key: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if bot.project_manager.remove_env(parent_id, key):
+        embed = discord.Embed(
+            title="✅ Environment Variable Removed",
+            description=f"Removed `{key}`",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(f"Variable `{key}` not found.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Context menu: Send to Claude (#65)
+# ---------------------------------------------------------------------------
+
+@app_commands.context_menu(name="Send to Claude")
+async def send_to_claude(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer()
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.followup.send("❌ Bot not ready.", ephemeral=True)
+        return
+    channel = message.channel
+    channel_id = getattr(channel, "parent_id", channel.id) or channel.id
+    project_path = bot.project_manager.get_path(channel_id)
+    if not project_path:
+        await interaction.followup.send("❌ Channel not bound.", ephemeral=True)
+        return
+    # Create thread from the target message
+    thread_name = f"Claude: {message.content[:80]}" if message.content else "Claude session"
+    try:
+        thread = await message.create_thread(name=thread_name)
+    except discord.HTTPException:
+        await interaction.followup.send("❌ Failed to create thread.", ephemeral=True)
+        return
+    # Create session and send
+    system_prompt = bot.project_manager.get_system_prompt(channel_id)
+    handler = InteractionHandler(thread)
+    lock = bot.session_manager.get_lock(thread.id)
+    async with lock:
+        try:
+            bridge = await bot.session_manager.create_session(
+                thread.id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to start session: `{exc}`", ephemeral=True)
+            return
+    try:
+        renderer = DiscordRenderer(thread)
+        user_text = message.content or "Hello"
+        await renderer.render_response(bridge, user_text)
+    except Exception:
+        log.exception("send_to_claude render failed")
+        await bot.session_manager.stop_session(thread.id)
+        try:
+            from clauded.discord_renderer import DiscordRenderer as DR
+            await DR.send_error_with_retry(thread, Exception("Claude session failed"), None, None, None)
+        except Exception:
+            await thread.send(embed=discord.Embed(title="❌ Error", description="Claude session failed", color=0xEF4444))
+    await interaction.followup.send(f"✅ Sent to Claude in {thread.mention}", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------

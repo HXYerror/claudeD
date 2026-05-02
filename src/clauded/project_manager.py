@@ -274,3 +274,33 @@ class ProjectManager:
             self._save()
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Environment variables
+    # ------------------------------------------------------------------
+    def set_env(self, channel_id: int, key: str, value: str) -> None:
+        """Store an environment variable for the given channel binding."""
+        k = str(channel_id)
+        entry = self._projects.get(k, {})
+        env = entry.get("env", {})
+        env[key] = value
+        entry["env"] = env
+        self._projects[k] = entry
+        self._save()
+
+    def get_env(self, channel_id: int) -> dict[str, str]:
+        """Return all environment variables for ``channel_id``."""
+        entry = self._projects.get(str(channel_id), {})
+        return dict(entry.get("env", {}))
+
+    def remove_env(self, channel_id: int, key: str) -> bool:
+        """Remove an environment variable. Returns True if removed."""
+        k = str(channel_id)
+        entry = self._projects.get(k, {})
+        env = entry.get("env", {})
+        if key in env:
+            del env[key]
+            entry["env"] = env
+            self._save()
+            return True
+        return False

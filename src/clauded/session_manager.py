@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .claude_bridge import ClaudeBridge, OnAskUser, OnPreToolUse
+from .claude_bridge import ClaudeBridge, OnAskUser, OnPreToolUse, OnPostToolUse, OnStop
 from .config import Config
 from .session_store import SessionStore
 
@@ -43,7 +43,10 @@ class SessionManager:
         config: Config,
         on_ask_user: OnAskUser | None = None,
         on_pre_tool_use: OnPreToolUse | None = None,
+        on_post_tool_use: OnPostToolUse | None = None,
+        on_stop: OnStop | None = None,
         system_prompt: str | None = None,
+        env: dict[str, str] | None = None,
         model_override: str | None = None,
         resume_session_id: str | None = None,
         effort: str | None = None,
@@ -77,7 +80,10 @@ class SessionManager:
             config=config,
             on_ask_user=on_ask_user,
             on_pre_tool_use=on_pre_tool_use,
+            on_post_tool_use=on_post_tool_use,
+            on_stop=on_stop,
             system_prompt=system_prompt,
+            env=env,
             model_override=model_override,
             resume_session_id=resume_session_id,
             effort=effort,
