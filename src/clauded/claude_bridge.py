@@ -157,7 +157,8 @@ class ClaudeBridge:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT
         if self._user:
-            full_system_prompt += "\nThe Discord user talking to you is: " + self._user
+            safe_user = self._user.replace("\n", " ").replace("\r", " ")
+            full_system_prompt += "\nThe Discord user talking to you is: " + safe_user
 
         # Build extra_args for CLI-level flags
         extra_args: dict[str, str | None] = {}
