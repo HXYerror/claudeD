@@ -1947,6 +1947,51 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
 
 
 
+@session_group.command(name="export", description="Export conversation history as markdown")
+async def session_export(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.followup.send("Bot not ready.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel_id
+    channel = interaction.channel
+
+    if thread_id is None or not hasattr(channel, 'history'):
+        await interaction.followup.send("Use this in a thread.", ephemeral=True)
+        return
+
+    # Collect all messages from the thread
+    messages = []
+    async for msg in channel.history(limit=500, oldest_first=True):
+        role = "🤖 Claude" if msg.author.bot else f"👤 {msg.author.display_name}"
+        content = msg.content or ""
+        # Include embed descriptions
+        for embed in msg.embeds:
+            if embed.description:
+                content += "\n" + embed.description
+            if embed.title:
+                content = "**" + embed.title + "**\n" + content
+        if content.strip():
+            timestamp = msg.created_at.strftime("%Y-%m-%d %H:%M:%S")
+            messages.append(f"### {role} \u2014 {timestamp}\n\n{content}\n")
+
+    if not messages:
+        await interaction.followup.send("No messages to export.", ephemeral=True)
+        return
+
+    # Build markdown
+    thread_name = getattr(channel, 'name', 'session')
+    md = f"# {thread_name}\n\nExported {len(messages)} messages.\n\n---\n\n"
+    md += "\n---\n\n".join(messages)
+
+    # Upload as file
+    import io
+    file = discord.File(io.BytesIO(md.encode()), filename=f"{thread_name[:50]}.md")
+    await interaction.followup.send("📄 Session exported:", file=file, ephemeral=True)
+
+
 # ---------------------------------------------------------------------------
 # /env command group (#71)
 # ---------------------------------------------------------------------------
