@@ -346,7 +346,7 @@ async def test_bridge_passes_user_to_options(
     await bridge.start()
 
     opts = captured_options[0]
-    assert opts.user == "alice#1234"
+    assert "alice#1234" in (opts.append_system_prompt or "")
 
 
 # ---------------------------------------------------------------------------
