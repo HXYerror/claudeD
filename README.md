@@ -1,226 +1,360 @@
 # claudeD — Discord-Claude Bridge
 
-Expose [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) through
-a Discord bot. A Discord channel becomes a project (bound to a local directory),
-and each thread inside it becomes its own Claude Code session — message Claude
-in Discord, watch it stream code, tool calls, and answers back into the thread.
+**Use Claude Code from anywhere — your phone, your tablet, your team's Discord server.**
 
-## How it works
+claudeD bridges the full power of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) to Discord. Each Discord channel maps to a project directory; each thread is an isolated Claude session. Mention the bot, get a thread, and interact with Claude exactly as you would from the CLI — streaming responses, tool execution, interactive prompts, and all. Full CLI parity.
 
-```
-+------------------+      +----------------+      +------------------+
-| Discord channel  | ---> | claudeD bot    | ---> | Claude Code SDK  |
-| (bound to dir)   |      | (this project) |      | (per-thread     )|
-+------------------+      +----------------+      +------------------+
-        |                       |                          |
-        | new message creates   | persists channel→path    | streams assistant
-        | a thread + session    | bindings to JSON         | messages + tool
-        v                       v                          | results
-+------------------+      +----------------+               v
-| Discord thread   | <----+ DiscordRenderer + <----- AssistantMessage,
-| (typewriter UX)  |      |                |          ToolUseBlock, etc.
-+------------------+      +----------------+
-```
+---
 
-Each Discord channel can be **bound** to a local project directory with
-`/project bind`. Once bound, any top-level message in the channel opens a new
-thread, and the thread becomes a Claude session whose `cwd` is the bound
-directory. Subsequent messages in the thread continue that conversation. All
-of Claude's text and tool activity is streamed back into the thread.
+## Features
+
+### 🔗 Core — Message Bridging
+- **Bidirectional message bridge** — Discord messages forwarded to Claude; Claude responses streamed back
+- **Streaming output** — fast responses (<3s) sent in one shot; longer responses use a live typewriter effect with a `▌` cursor, edited every ~1.2s
+- **Smart message splitting** — long responses split at paragraph/line/space boundaries, never mid–code-block
+- **Code fence protection** — unclosed ` ``` ` blocks are closed-and-reopened across chunk boundaries
+- **File attachments** — upload files in Discord and Claude can read them (images, code, docs)
+- **Thread auto-creation** — mention the bot in a bound channel → thread created automatically, named after your message
+
+### 📁 Project Management
+- **`/project bind`** — bind a Discord channel to a local project directory
+- **`/project system-prompt`** — set a persistent system prompt per project
+- **`/project add-dir`** — grant Claude access to additional directories
+- **`/mcp add` / `add-url`** — attach MCP (Model Context Protocol) servers (stdio or HTTP)
+- **`/plugin add`** — load Claude Code plugins from a directory
+- **Path security** — all paths validated against a configurable root; `..` traversal and symlink escapes rejected
+
+### 🧵 Session Management
+- **`/session resume`** — resume a previous session with full conversation context
+- **`/session fork`** — branch a new session from the current conversation
+- **`/session compact`** — compress context to save tokens (maps to Claude's `/compact`)
+- **`/session worktree`** — create a git worktree for isolated work on a branch
+- **`/session interrupt`** — interrupt Claude mid-operation
+- **`/session stop`** — terminate the current session
+- **`/session list`** — see all active sessions across the server
+- **`/session info`** — view model, turns, and cost for the current session
+- **`/session security-review`** — run Claude's built-in security review
+- **`/session settings`** — apply custom settings JSON to the session
+- **Auto-resume** — returning to a thread automatically resumes the previous session
+
+### 🤖 Model Control
+- **`/model`** — switch Claude model (sonnet, opus, haiku, or full model ID); starts a new session
+- **`/effort`** — set thinking effort level (low / medium / high / xhigh / max)
+- **`/fallback-model`** — set a fallback model for when the primary is overloaded
+- **`/max-turns`** — cap the number of tool-use turns per response to prevent runaway loops
+
+### 🔧 Tool Control
+- **`/tools allow`** — whitelist specific tools (e.g. `Bash Edit Read`)
+- **`/tools deny`** — blacklist specific tools (e.g. `WebSearch`)
+- **`/tools reset`** — restore default tool permissions
+- **`/budget set`** — set a per-session spending cap (USD)
+
+### 🎨 Display & Rich UI
+- **Colored embeds** — purple for Claude, yellow for running tools, green for success, red for errors, blue for info, gray for thinking
+- **Diff preview** — `Edit` / `Write` tool calls show a formatted preview in Discord
+- **File upload** — large code blocks (>3000 chars) automatically uploaded as file attachments
+- **Thinking spoiler** — Claude's `ThinkingBlock` output rendered as a spoiler-tagged embed
+- **Plan mode** — `EnterPlanMode` / `ExitPlanMode` shown as status embeds
+- **Subtask display** — `Task` tool calls rendered with description
+- **Todo list** — `TodoWrite` renders a checkbox-style todo list embed
+- **PreToolUse hooks** — "🔮 Preparing: ToolName…" notification appears *before* tool execution
+- **Interactive prompts** — `AskUserQuestion` → Discord buttons (≤4 options) or select menus (5–25 options) with 5-minute timeout
+- **Crash recovery** — error embed with a 🔄 Retry button to restart the session
+- **Cost footer** — every response shows cost, tokens, turns, model, and duration
+
+### 🤖 Custom Agents
+- **`/agent create`** — define a named agent with a custom system prompt and description
+- **`/agent use`** — activate an agent in the current thread
+- **`/agent list`** — list all defined agents
+- **`/agent delete`** — remove an agent definition
+- Agents persist across bot restarts (JSON storage)
+
+### 💰 Cost Tracking
+- **`/cost show`** — per-channel cumulative cost and call count
+- **`/cost total`** — global cost across all channels
+- **`/cost reset`** — reset a channel's cost counter
+- Per-response cost shown in the response footer
+- Costs persisted to disk (survives restarts)
+
+### 🏥 Health & Operations
+- **`/health`** — uptime, active sessions, bound projects, Claude CLI version, Python version
+- **`/review`** — start a PR review session (creates a thread with `--from-pr`)
+- Graceful fallback if Message Content Intent is not enabled (slash commands still work)
+
+---
 
 ## Prerequisites
 
 - **Python 3.13+**
-- The **Claude Code CLI** installed and authenticated locally — the
-  `claude-code-sdk` package shells out to it.
-  See <https://docs.anthropic.com/claude/docs/claude-code> for install
-  instructions, then run `claude` once to authenticate.
-- A **Discord application + bot user** — create one at
-  <https://discord.com/developers/applications> and copy the bot token.
+- **Claude Code CLI** installed and authenticated — verify with `claude --version`
+- **Discord bot token** from the [Discord Developer Portal](https://discord.com/developers/applications)
+- **Discord bot permissions:**
+  - Send Messages
+  - Create Public Threads
+  - Manage Channels
+  - Read Message History
+  - Embed Links
+  - Attach Files
+  - Use Slash Commands
+- **Message Content Intent** enabled in the bot's Developer Portal settings (Bot → Privileged Gateway Intents → Message Content Intent)
+
+---
 
 ## Installation
 
 ```bash
-git clone <this-repo> discord-claude-bridge
-cd discord-claude-bridge
-python3 -m venv .venv
+git clone https://github.com/HXYerror/claudeD.git
+cd claudeD
+python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-This installs the `clauded` console script.
+---
 
 ## Configuration
 
-Copy the example env file and fill in your values:
+Copy the example environment file and fill in your values:
 
 ```bash
 cp .env.example .env
-# edit .env, set DISCORD_BOT_TOKEN
 ```
 
-Available environment variables:
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_BOT_TOKEN` | **Yes** | — | Your Discord bot token |
+| `CLAUDE_MODEL` | No | `sonnet` | Default Claude model (`sonnet`, `opus`, `haiku`, or full model ID) |
+| `CLAUDE_PERMISSION_MODE` | No | `default` | Permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` |
+| `CLAUDED_PROJECTS_ROOT` | No | `~` (home dir) | Root directory for project bindings — paths outside this are rejected |
 
-| Variable                  | Default              | Notes                                                        |
-|---------------------------|----------------------|--------------------------------------------------------------|
-| `DISCORD_BOT_TOKEN`       | (required)           | Bot token from the Discord developer portal.                 |
-| `CLAUDE_MODEL`            | `sonnet`             | Default Claude model (`sonnet`, `opus`, `haiku`, or full id).|
-| `CLAUDE_PERMISSION_MODE`  | `bypassPermissions`  | Claude Code permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`). |
+> ⚠️ **Security warning:** Setting `CLAUDE_PERMISSION_MODE=bypassPermissions` disables all tool-permission prompts. Claude will execute shell commands and file edits without confirmation. Only use this if every Discord user with channel access is trusted with shell access on the host machine.
 
-### Discord bot setup
+---
 
-In the Discord developer portal:
+## Quick Start
 
-1. **Bot tab** — enable the **Message Content Intent** (privileged). Without
-   it, the bot cannot read user messages and bridging will silently no-op.
-2. **OAuth2 → URL Generator** — pick the `bot` and `applications.commands`
-   scopes.
-3. **Bot permissions** — at minimum:
-   - View Channels
-   - Send Messages
-   - Send Messages in Threads
-   - Create Public Threads
-   - Read Message History
-   - Embed Links
-   - Use Application Commands
-4. Open the generated URL and invite the bot to your server.
-
-The bot itself requests these intents (see `bot.py`):
-
-- `message_content` — to read message text
-- `messages`        — to receive `MESSAGE_CREATE`
-- `guilds`          — for slash command sync
-
-## Running
-
-```bash
-clauded
-# or, equivalently:
-python -m clauded.bot
-```
-
-You should see something like:
-
-```
-INFO clauded.bot: Synced N application command(s)
-INFO clauded.bot: Bot online as <name> (id=...)
-```
-
-State (channel→path bindings) is persisted to `./data/projects.json` in the
-working directory the bot is launched from.
-
-## Usage
-
-1. **Bind a channel** to a local directory (one-time):
-
-   ```
-   /project bind path:/Users/me/code/my-project
+1. **Start the bot:**
+   ```bash
+   clauded
    ```
 
-   The path must already exist on the host running the bot.
+2. **Invite the bot** to your Discord server using the OAuth2 URL from the Developer Portal (with the permissions listed above).
 
-2. **Start a Claude session** by sending a normal message in that channel.
-   The bot opens a thread named after your message and connects a Claude
-   session whose working directory is the bound path.
+3. **Bind a channel** to a project directory:
+   ```
+   /project bind /path/to/your/project
+   ```
 
-3. **Continue the conversation** by replying inside the thread. Each thread
-   keeps its own independent Claude session.
+4. **Mention the bot** with your request:
+   ```
+   @ClaudeBot refactor the auth module to use JWT tokens
+   ```
 
-4. **Inspect or stop** the session with `/session info` and `/session stop`
-   inside the thread.
+5. The bot creates a thread, starts a Claude session, and streams the response. Continue the conversation in the thread — context is preserved across messages.
 
-### Streaming UX
+---
 
-- Short replies (≲ 3 s) are sent as a single message.
-- Longer replies are written into a "typewriter" message that's edited in
-  place (~once per second) until it would exceed Discord's 2 000-character
-  limit, at which point the current message is finalized and a new one is
-  started. Code fences are auto-closed and reopened across splits.
-- Tool calls render as `⚙️ Running: <name>…` status messages that update to
-  `✅ <name>` or `❌ <name> failed` when the tool finishes.
-- If Claude calls the **AskUserQuestion** tool, the bot renders the
-  question(s) as Discord buttons (≤ 4 single-select options) or a select
-  menu (multi-select / > 4 options) and waits up to 5 minutes for a click
-  before timing out and denying the tool call.
+## Commands Reference
 
-## Commands reference
+### Project Management
 
-| Command            | Where     | What it does                                                  |
-|--------------------|-----------|---------------------------------------------------------------|
-| `/project bind`    | Channel   | Bind this channel to an absolute filesystem path. Validates that the directory exists. |
-| `/project info`    | Channel   | Show the directory currently bound to this channel.           |
-| `/project unbind`  | Channel   | Remove this channel's binding. Existing thread sessions stay running until stopped. |
-| `/session info`    | Thread    | Show whether a Claude session is active in this thread, and its `cwd`. |
-| `/session stop`    | Thread    | Disconnect the Claude session for this thread. The next message in the thread starts a fresh one. |
+| Command | Description | Example |
+|---|---|---|
+| `/project bind <path>` | Bind this channel to a local directory | `/project bind /home/user/myapp` |
+| `/project info` | Show current binding, system prompt, and extra dirs | `/project info` |
+| `/project unbind` | Remove this channel's project binding | `/project unbind` |
+| `/project system-prompt <text>` | Set a system prompt (use `clear` to remove) | `/project system-prompt You are a Go expert` |
+| `/project add-dir <path>` | Add extra directory access for Claude | `/project add-dir /home/user/shared-libs` |
+| `/project dirs` | List all extra directories | `/project dirs` |
+| `/project remove-dir <path>` | Remove an extra directory | `/project remove-dir /home/user/shared-libs` |
 
-All command responses are ephemeral (only the invoker sees them).
+### Session Management
 
-## Architecture overview
+| Command | Description | Example |
+|---|---|---|
+| `/session info` | Show model, turns, cost for current session | `/session info` |
+| `/session stop` | Stop the Claude session in this thread | `/session stop` |
+| `/session interrupt` | Interrupt Claude mid-operation | `/session interrupt` |
+| `/session resume` | Resume a previous session with full context | `/session resume` |
+| `/session fork` | Fork a new session from current conversation | `/session fork` |
+| `/session compact` | Compress context to save tokens | `/session compact` |
+| `/session worktree <name>` | Create a git worktree for isolated work | `/session worktree feature/auth` |
+| `/session list` | List all active sessions | `/session list` |
+| `/session security-review` | Run Claude's built-in security review | `/session security-review` |
+| `/session settings <json>` | Apply custom settings JSON | `/session settings {"key": "value"}` |
 
-Source layout (`src/clauded/`):
+### Model & Effort
 
-| Module                  | Responsibility                                                        |
-|-------------------------|------------------------------------------------------------------------|
-| `bot.py`                | Discord client; wires events and slash commands; owns the managers.    |
-| `config.py`             | `.env` / environment loading into a frozen `Config` dataclass.         |
-| `project_manager.py`    | Persisted channel-id → directory bindings (`data/projects.json`).      |
-| `session_manager.py`    | In-memory map of thread-id → live `ClaudeBridge`.                      |
-| `claude_bridge.py`      | Wraps a single `ClaudeSDKClient` connection (one per thread).          |
-| `discord_renderer.py`   | Streams Claude's messages into Discord with smart-split + typewriter.  |
-| `interaction_handler.py`| Renders `AskUserQuestion` tool calls as Discord buttons / selects.     |
+| Command | Description | Example |
+|---|---|---|
+| `/model <name>` | Switch Claude model (restarts session) | `/model opus` |
+| `/effort <level>` | Set thinking effort: low, medium, high, xhigh, max | `/effort max` |
+| `/max-turns <number>` | Cap tool-use turns per response | `/max-turns 10` |
+| `/fallback-model <model>` | Set fallback model for overload | `/fallback-model haiku` |
 
-Message flow on a top-level channel message:
+### Tool Control
 
-1. `bot.on_message` checks the channel binding via `ProjectManager`.
-2. A new thread is created with `message.create_thread(...)`.
-3. `SessionManager.create_session(...)` constructs and starts a
-   `ClaudeBridge` (one `ClaudeSDKClient`) for that thread, with an
-   `InteractionHandler` wired in as the `on_ask_user` callback.
-4. `DiscordRenderer.render_response(...)` consumes the SDK message stream
-   and writes it to the thread.
+| Command | Description | Example |
+|---|---|---|
+| `/tools allow <tools>` | Only allow listed tools (space-separated) | `/tools allow Bash Edit Read` |
+| `/tools deny <tools>` | Deny listed tools (space-separated) | `/tools deny WebSearch WebFetch` |
+| `/tools reset` | Reset to default tool permissions | `/tools reset` |
 
-Thread messages reuse the existing `ClaudeBridge` for that thread; if the
-bridge has gone inactive (e.g. the SDK errored on a previous turn), a fresh
-session is started transparently.
+### Budget
+
+| Command | Description | Example |
+|---|---|---|
+| `/budget set <amount>` | Set max session budget in USD | `/budget set 5.00` |
+| `/budget show` | Show current budget setting | `/budget show` |
+| `/budget clear` | Remove budget limit | `/budget clear` |
+
+### Cost Tracking
+
+| Command | Description | Example |
+|---|---|---|
+| `/cost show` | Show cost for this channel | `/cost show` |
+| `/cost total` | Show total cost across all channels | `/cost total` |
+| `/cost reset` | Reset this channel's cost counter | `/cost reset` |
+
+### Custom Agents
+
+| Command | Description | Example |
+|---|---|---|
+| `/agent create <name> <prompt> [desc]` | Create a custom agent | `/agent create reviewer "Review code for bugs" "Code reviewer agent"` |
+| `/agent list` | List all defined agents | `/agent list` |
+| `/agent use <name>` | Activate an agent in this thread | `/agent use reviewer` |
+| `/agent delete <name>` | Delete an agent definition | `/agent delete reviewer` |
+
+### MCP Servers
+
+| Command | Description | Example |
+|---|---|---|
+| `/mcp add <name> <command> [args]` | Add a stdio MCP server | `/mcp add myserver npx my-mcp-server` |
+| `/mcp add-url <name> <url>` | Add an HTTP MCP server | `/mcp add-url remote https://mcp.example.com` |
+| `/mcp list` | List configured MCP servers | `/mcp list` |
+| `/mcp remove <name>` | Remove an MCP server | `/mcp remove myserver` |
+
+### Plugins
+
+| Command | Description | Example |
+|---|---|---|
+| `/plugin add <path>` | Add a plugin directory | `/plugin add /home/user/my-plugin` |
+
+### Other
+
+| Command | Description | Example |
+|---|---|---|
+| `/health` | Show bot health, uptime, and versions | `/health` |
+| `/review <pr>` | Start a PR review session in a new thread | `/review 42` or `/review https://github.com/org/repo/pull/42` |
+
+---
+
+## Architecture
+
+```
+Discord ←→ ClaudedBot (discord.py)
+              │
+              ├── ProjectManager      channel ↔ directory binding, system prompts,
+              │                       extra dirs, MCP servers, budgets (JSON persistence)
+              │
+              ├── SessionManager      thread ↔ ClaudeBridge lifecycle, per-thread locks,
+              │                       session persistence & resume
+              │
+              ├── ClaudeBridge        SDK wrapper: ClaudeSDKClient connection, message
+              │                       streaming, tool permission callbacks, interrupt
+              │
+              ├── DiscordRenderer     streaming output: typewriter mode, smart splitting,
+              │                       code fence protection, tool embeds, diff previews,
+              │                       file uploads, thinking spoilers, plan/task/todo
+              │
+              ├── InteractionHandler  AskUserQuestion → Discord buttons / select menus
+              │                       with timeout and multi-select support
+              │
+              ├── CostTracker        per-channel and global cost tracking (JSON persistence)
+              │
+              ├── SessionStore       session ID persistence for resume across restarts
+              │
+              └── AgentManager       custom agent CRUD with JSON persistence
+```
+
+### Data Flow
+
+```
+User @mentions bot in #my-project channel
+  → Bot creates thread "refactor the auth module..."
+    → SessionManager creates ClaudeBridge(cwd=/path/to/project)
+      → ClaudeSDKClient connects to Claude Code CLI
+        → User messages streamed to Claude
+        → Claude responses streamed back through DiscordRenderer
+          → Text → typewriter messages
+          → ToolUse → colored status embeds
+          → AskUserQuestion → InteractionHandler → buttons/menus
+          → ResultMessage → cost footer
+```
+
+---
+
+## Color Scheme
+
+| Color | Hex | Usage |
+|---|---|---|
+| 🟣 Purple | `#7C3AED` | Claude's text replies |
+| 🟡 Yellow | `#F59E0B` | Tool currently executing |
+| 🟢 Green | `#10B981` | Tool completed successfully |
+| 🔴 Red | `#EF4444` | Tool failed / error |
+| 🔵 Blue | `#3B82F6` | Info messages, commands, plan mode |
+| ⚪ Gray | `#6B7280` | Thinking blocks (spoiler-tagged) |
+
+---
 
 ## Troubleshooting
 
-**The bot ignores my messages in a channel.**
-The channel isn't bound. Run `/project bind path:/abs/path` first. Bindings
-are per-channel and survive bot restarts (`data/projects.json`).
+| Problem | Solution |
+|---|---|
+| **Bot doesn't respond to messages** | Enable **Message Content Intent** in Discord Developer Portal → Bot → Privileged Gateway Intents |
+| **"DISCORD_BOT_TOKEN is not set"** | Copy `.env.example` to `.env` and add your bot token |
+| **"claude not found" on session start** | Install Claude Code CLI: `npm install -g @anthropic-ai/claude-code` and verify with `claude --version` |
+| **Bot can't create threads** | Ensure the bot has **Create Public Threads** and **Send Messages** permissions in the channel |
+| **"Path is outside the allowed projects root"** | The path must be under `CLAUDED_PROJECTS_ROOT` (defaults to `~`). Adjust the env var or use an allowed path |
+| **Rate limit errors / edits failing** | This is normal under heavy load — the renderer auto-backs-off. Discord limits message edits to ~5/s |
+| **Session crashes with retry button** | Click 🔄 Retry — a fresh session is created automatically. Check logs for the root cause |
+| **Slash commands not appearing** | Commands sync on startup. Wait ~1 minute, or restart the bot. Guild-level sync can take up to an hour |
+| **Bot starts but slash commands fail** | Make sure the bot was invited with the **Use Slash Commands** (applications.commands) scope |
+| **Permission mode warnings** | If using `bypassPermissions`, ensure only trusted users can post in bound channels |
 
-**`/project bind` returns "Not a directory".**
-The path must exist on the machine running the bot, not on your client.
-Use an absolute path; `~` is expanded automatically.
-
-**The bot replies but no message content appears.**
-You probably haven't enabled the **Message Content Intent** in the Discord
-developer portal. Enable it on the Bot tab and restart the bot.
-
-**Claude session fails to start.**
-Check the bot logs — usually means `claude` isn't on `PATH`, isn't
-authenticated, or the bound directory isn't readable. Run `claude`
-manually in that directory to verify. The thread will receive an
-`❌ Failed to start Claude session: ...` message.
-
-**Slash commands don't appear in Discord.**
-Wait a minute — global command sync can take up to an hour the first time.
-Re-invite the bot with the `applications.commands` scope if needed.
-
-**Replies stop midway / "typewriter" message stops updating.**
-Discord rate-limited us. The renderer backs off and retries automatically;
-in the worst case a single edit is dropped but the stream continues. Check
-the logs for `Discord edit rate-limited` warnings.
-
-**Claude's process crashed mid-reply.**
-The renderer surfaces `Error talking to Claude: …` in the thread, the
-bridge is dropped, and the next message in the thread starts a fresh
-session.
+---
 
 ## Development
 
-The full design lives in [`docs/prd/discord-claude-bridge.md`](docs/prd/discord-claude-bridge.md).
+Install with development dependencies:
+
+```bash
+pip install -e ".[dev]"
+```
+
+Run the test suite:
+
+```bash
+python -m pytest tests/ -v
+```
+
+The project includes **138 tests** covering:
+- Smart message splitting and code fence protection
+- Diff display rendering
+- Project manager bindings and path security
+- Session manager lifecycle and locking
+- Session store persistence
+- Cost tracker arithmetic and persistence
+- Agent manager CRUD
+- Claude bridge configuration and callbacks
+- SDK hooks and partial message streaming
+- Channel markers detection
+- Bot mention stripping
+- Image attachment handling
+- Startup smoke tests and config loading
+
+---
 
 ## License
 
-MIT.
+[MIT](LICENSE)
