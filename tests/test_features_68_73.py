@@ -346,7 +346,11 @@ class TestPostToolUseHook:
         await bridge.start()
 
         opts = captured_options[0]
-        assert opts.hooks is None
+        assert opts.hooks is not None
+        # PreCompact, UserPromptSubmit, SubagentStop are always registered
+        assert "PreCompact" in opts.hooks
+        assert "UserPromptSubmit" in opts.hooks
+        assert "SubagentStop" in opts.hooks
 
 
 # ---------------------------------------------------------------------------

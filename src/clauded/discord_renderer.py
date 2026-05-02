@@ -372,6 +372,49 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
+
+                            # --- Special tool display: NotebookEdit ---
+                            if name == "NotebookEdit":
+                                cell_type = block.input.get("cell_type", "code")
+                                cell_idx = block.input.get("cell_index", "?")
+                                content_preview = str(block.input.get("new_source", block.input.get("source", "")))[:500]
+                                lang = "python" if cell_type == "code" else ""
+                                tool_embed = discord.Embed(
+                                    title=f"📓 Notebook Cell [{cell_idx}] ({cell_type})",
+                                    description=f"```{lang}\n{content_preview.replace(chr(96)*3, chr(96)+' '+chr(96)+' '+chr(96))}\n```" if content_preview else "Empty cell",
+                                    color=COLOR_TOOL_RUNNING,
+                                )
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: ScheduleWakeup ---
+                            if name == "ScheduleWakeup":
+                                delay = block.input.get("delay_seconds", block.input.get("seconds", "?"))
+                                reason = block.input.get("message", block.input.get("reason", ""))[:200]
+                                tool_embed = discord.Embed(
+                                    title=f"⏰ Scheduled Wakeup: {delay}s",
+                                    description=reason or "Waiting...",
+                                    color=COLOR_TOOL_RUNNING,
+                                )
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: Skill ---
+                            if name == "Skill":
+                                skill_name = block.input.get("name", block.input.get("skill", ""))[:100]
+                                tool_embed = discord.Embed(
+                                    title=f"🎯 Skill: {skill_name}",
+                                    color=COLOR_TOOL_RUNNING,
+                                )
+                                tmsg = await self._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
                             # Build a colored embed for the tool execution
                             tool_embed = discord.Embed(
                                 title=f"🔄 {name}",
