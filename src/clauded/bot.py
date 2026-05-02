@@ -190,8 +190,12 @@ class ClaudedBot(commands.Bot):
             log.warning("Channel %s reports bound but has no path", channel.id)
             return
 
-        if not isinstance(channel, discord.TextChannel):
-            log.warning("Bound channel %s is not a TextChannel; skipping", channel.id)
+        # #87: support forum channel mode
+        channel_mode = self.project_manager.get_channel_mode(channel.id)
+        is_forum = channel_mode == "forum" and isinstance(channel, discord.ForumChannel)
+
+        if not is_forum and not isinstance(channel, discord.TextChannel):
+            log.warning("Bound channel %s is not a TextChannel or ForumChannel; skipping", channel.id)
             return
 
         # Strip the bot mention from the message content
@@ -203,20 +207,30 @@ class ClaudedBot(commands.Bot):
 
         thread_name = (content or "claude session")[:100] or "claude session"
         try:
-            thread = await message.create_thread(name=thread_name)
+            if is_forum:
+                # ForumChannel.create_thread returns (Thread, Message)
+                thread_with_msg = await channel.create_thread(
+                    name=thread_name, content=content
+                )
+                thread = thread_with_msg.thread
+                message = thread_with_msg.message  # the initial forum post message
+            else:
+                thread = await message.create_thread(name=thread_name)
         except discord.Forbidden:
             log.exception("Missing permission to create threads in channel=%s", channel.id)
             try:
-                await channel.send(
-                    "❌ I don't have permission to create threads in this channel."
-                )
+                if not is_forum:
+                    await channel.send(
+                        "❌ I don't have permission to create threads in this channel."
+                    )
             except discord.HTTPException:
                 log.debug("Could not surface thread-permission error to channel")
             return
         except discord.HTTPException:
             log.exception("Failed to create thread for channel=%s", channel.id)
             try:
-                await channel.send("❌ Failed to create a thread for this message.")
+                if not is_forum:
+                    await channel.send("❌ Failed to create a thread for this message.")
             except discord.HTTPException:
                 log.debug("Could not surface thread-creation error to channel")
             return
@@ -755,7 +769,7 @@ async def project_bind(interaction: discord.Interaction, path: str) -> None:
         return
 
     try:
-        stored = bot.project_manager.bind(channel_id, path)
+        stored = bot.project_manager.bind(channel_id, path, guild_id=interaction.guild_id)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
@@ -786,6 +800,12 @@ async def project_info(interaction: discord.Interaction) -> None:
     sp = bot.project_manager.get_system_prompt(channel_id)
     if sp:
         lines.append(f"📝 System prompt: {sp}")
+    mode = bot.project_manager.get_channel_mode(channel_id)
+    if mode != "thread":
+        lines.append(f"🔀 Channel mode: `{mode}`")
+    guild_root = bot.project_manager.get_guild_root(interaction.guild_id)
+    if interaction.guild_id and str(interaction.guild_id) in bot.project_manager._guild_roots:
+        lines.append(f"🏠 Guild root: `{guild_root}`")
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
@@ -926,6 +946,70 @@ async def project_remove_dir(interaction: discord.Interaction, path: str) -> Non
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
         await interaction.response.send_message("Directory not found in extra dirs.", ephemeral=True)
+
+
+# -- #87: Forum channel mode ------------------------------------------------
+
+@project_group.command(name="set-mode", description="Set channel mode (thread or forum)")
+@app_commands.describe(mode="thread (default) or forum")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="thread", value="thread"),
+    app_commands.Choice(name="forum", value="forum"),
+])
+async def project_set_mode(interaction: discord.Interaction, mode: app_commands.Choice[str]) -> None:
+    log.info("/project set-mode mode=%s channel=%s", mode.value, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    bot.project_manager.set_channel_mode(channel_id, mode.value)
+    await interaction.response.send_message(
+        f"✅ Channel mode set to `{mode.value}`", ephemeral=True
+    )
+
+
+# -- #91: Per-guild project root --------------------------------------------
+
+@project_group.command(name="set-root", description="Set per-guild projects root directory")
+@app_commands.describe(path="Absolute path to the guild's projects root directory")
+async def project_set_root(interaction: discord.Interaction, path: str) -> None:
+    log.info("/project set-root path=%s guild=%s", path, interaction.guild_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.response.send_message(
+            "This command can only be used in a guild.", ephemeral=True
+        )
+        return
+    try:
+        resolved = bot.project_manager.set_guild_root(guild_id, path)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    await interaction.response.send_message(
+        f"✅ Guild projects root set to `{resolved}`", ephemeral=True
+    )
+
+
+@project_group.command(name="clear-root", description="Remove per-guild projects root override")
+async def project_clear_root(interaction: discord.Interaction) -> None:
+    log.info("/project clear-root guild=%s", interaction.guild_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    guild_id = interaction.guild_id
+    if guild_id is None:
+        await interaction.response.send_message(
+            "This command can only be used in a guild.", ephemeral=True
+        )
+        return
+    if bot.project_manager.clear_guild_root(guild_id):
+        await interaction.response.send_message(
+            "✅ Guild projects root override removed. Using default.", ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            "No guild-specific root was set.", ephemeral=True
+        )
 
 
 session_group = app_commands.Group(
