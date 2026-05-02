@@ -10,8 +10,8 @@ writes it to a Discord channel/thread with three behaviors:
    :data:`EDIT_INTERVAL_SECONDS` until the buffer exceeds Discord's per-
    message limit, at which point the current message is finalized and a
    new one is started.
-3. **Tool status**: ``ToolUseBlock`` events render a ``⚙️ Running …``
-   status message which is updated to ``✅`` / ``❌`` when the matching
+3. **Tool status**: ``ToolUseBlock`` events render a colored embed status
+   message which is updated to ``✅`` / ``❌`` when the matching
    ``ToolResultBlock`` arrives.
 
 The renderer also smart-splits text on paragraph → line → space boundaries
@@ -22,6 +22,7 @@ chunk boundaries.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
 from typing import TYPE_CHECKING, Awaitable, Callable
@@ -43,6 +44,15 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("clauded.discord_renderer")
 
+# ---------------------------------------------------------------------------
+# Color scheme for embeds
+# ---------------------------------------------------------------------------
+COLOR_CLAUDE = 0x7C3AED        # Purple — Claude replies
+COLOR_TOOL_RUNNING = 0xF59E0B  # Yellow — tool executing
+COLOR_TOOL_SUCCESS = 0x10B981  # Green — tool completed
+COLOR_TOOL_FAILURE = 0xEF4444  # Red — tool failed / error
+COLOR_INFO = 0x3B82F6          # Blue — info / commands
+COLOR_THINKING = 0x6B7280      # Gray — thinking
 
 # Discord caps message content at 2000 characters; we leave a small margin so
 # we can append a cursor or close-and-reopen a code fence safely.
@@ -62,6 +72,9 @@ EDIT_INTERVAL_SECONDS = 1.2
 # Sleep used when an edit/send fails (likely rate-limited) before continuing.
 HTTP_BACKOFF_SECONDS = 0.5
 
+# Threshold above which a code block is uploaded as a file attachment.
+CODE_FILE_UPLOAD_THRESHOLD = 3000
+
 # Regex patterns for Claude channel/thread management markers.
 _THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
 _CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
@@ -72,6 +85,7 @@ class DiscordRenderer:
 
     def __init__(self, target: discord.abc.Messageable) -> None:
         self.target = target
+        self._last_msg: discord.Message | None = None
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -82,12 +96,15 @@ class DiscordRenderer:
         buffer = ""                               # text not yet finalized into a sent msg
         live_msg: discord.Message | None = None   # the in-flight typewriter message
         start_time: float | None = None
+        stream_start: float = time.time()
         last_edit = 0.0
         typewriter = False                        # have we entered typewriter mode?
         saw_text = False                          # any TextBlock seen?
-        # tool_use_id -> (discord.Message, tool_name)
-        tool_msgs: dict[str, tuple[discord.Message, str]] = {}
+        # tool_use_id -> discord.Message
+        tool_msgs: dict[str, discord.Message] = {}
         tool_names: dict[str, str] = {}
+        # Stats populated from ResultMessage
+        stats: dict | None = None
 
         try:
             async for event in bridge.send_message(user_text):
@@ -95,16 +112,27 @@ class DiscordRenderer:
                 # message that exposes a ``content`` list of blocks.
                 content = getattr(event, "content", None)
                 if isinstance(event, ResultMessage):
+                    # Capture stats from the result
+                    stats = {
+                        'cost': float(getattr(event, 'total_cost_usd', 0) or 0),
+                        'input_tokens': int(getattr(event, 'input_tokens', 0) or 0),
+                        'output_tokens': int(getattr(event, 'output_tokens', 0) or 0),
+                        'duration_ms': (time.time() - stream_start) * 1000,
+                        'num_turns': int(getattr(event, 'num_turns', 0) or 0),
+                        'model': getattr(event, 'model', '') or '',
+                    }
                     break
 
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, ThinkingBlock):
-                            thinking_text = block.thinking[:1900].replace("||", "\\|\\|")
-                            try:
-                                await self.target.send(f"💭 ||{thinking_text}||")
-                            except discord.HTTPException:
-                                pass
+                            thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
+                            embed = discord.Embed(
+                                title="💭 Thinking...",
+                                description=f"||{thinking_text}||",
+                                color=COLOR_THINKING,
+                            )
+                            await self._safe_send(embed=embed)
                             continue
 
                         if isinstance(block, TextBlock):
@@ -146,9 +174,24 @@ class DiscordRenderer:
                             tool_id = getattr(block, "id", None)
                             if tool_id:
                                 tool_names[tool_id] = name
-                            tmsg = await self._safe_send(f"⚙️ Running: `{name}`…")
+
+                            # Build a colored embed for the tool execution
+                            tool_embed = discord.Embed(
+                                title=f"🔄 {name}",
+                                color=COLOR_TOOL_RUNNING,
+                            )
+                            if name == "Bash":
+                                cmd = block.input.get("command", "")[:500]
+                                tool_embed.description = f"```bash\n{cmd}\n```"
+                            elif name in ("Write", "Edit", "Read"):
+                                path = block.input.get("file_path", block.input.get("file", ""))
+                                tool_embed.description = f"📄 `{path}`"
+                            else:
+                                tool_embed.description = "Executing..."
+
+                            tmsg = await self._safe_send(embed=tool_embed)
                             if tmsg is not None and tool_id:
-                                tool_msgs[tool_id] = (tmsg, name)
+                                tool_msgs[tool_id] = tmsg
 
                             # Show file content preview for Write/Edit tools
                             if block.name == "Write":
@@ -184,14 +227,22 @@ class DiscordRenderer:
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
                             if tool_id and tool_id in tool_msgs:
-                                tmsg, name = tool_msgs[tool_id]
+                                orig_msg = tool_msgs[tool_id]
+                                name = tool_names.get(tool_id, "tool")
                                 is_err = bool(getattr(block, "is_error", False))
                                 if is_err:
-                                    await self._safe_edit(
-                                        tmsg, f"❌ `{name}` failed"
+                                    result_embed = discord.Embed(
+                                        title=f"❌ {name}",
+                                        color=COLOR_TOOL_FAILURE,
                                     )
+                                    error_text = str(block.content)[:500] if block.content else "Failed"
+                                    result_embed.description = f"```\n{error_text}\n```"
                                 else:
-                                    await self._safe_edit(tmsg, f"✅ `{name}`")
+                                    result_embed = discord.Embed(
+                                        title=f"✅ {name}",
+                                        color=COLOR_TOOL_SUCCESS,
+                                    )
+                                await self._safe_edit(orig_msg, embed=result_embed)
         except Exception:
             log.exception("ClaudeBridge stream failed")
             # Best-effort: clean up the live cursor. Don't try to surface a
@@ -199,11 +250,26 @@ class DiscordRenderer:
             # in the crash-notification flow which posts a richer embed
             # with a retry button. Re-raise so they can do so.
             if live_msg is not None:
-                await self._safe_edit(live_msg, buffer[:DISCORD_MAX_LEN] or "…")
+                await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN] or "…")
             raise
 
         # Stream finished cleanly. Flush whatever is left.
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
+
+        # Append cost/stats footer to the last sent message
+        if self._last_msg and stats and stats.get('cost', 0) > 0:
+            try:
+                current = self._last_msg.content or ""
+                duration_s = stats['duration_ms'] / 1000
+                footer = (
+                    f"\n\n-# 💰 ${stats['cost']:.4f}"
+                    f" │ 📥 {stats['input_tokens']}"
+                    f" │ 📤 {stats['output_tokens']}"
+                    f" │ ⏱️ {duration_s:.1f}s"
+                )
+                await self._safe_edit(self._last_msg, content=current + footer)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Streaming helpers
@@ -281,9 +347,9 @@ class DiscordRenderer:
         if len(buffer) <= soft_limit:
             content = buffer + CURSOR
             if live_msg is None:
-                live_msg = await self._safe_send(content)
+                live_msg = await self._safe_send(content=content)
             else:
-                await self._safe_edit(live_msg, content)
+                await self._safe_edit(live_msg, content=content)
             return live_msg, buffer
 
         # Buffer too big for one message — split it.
@@ -294,17 +360,17 @@ class DiscordRenderer:
         first, *middle_and_last = chunks
         # Finalize the current live message with the first chunk (no cursor).
         if live_msg is None:
-            live_msg = await self._safe_send(first)
+            live_msg = await self._safe_send(content=first)
         else:
-            await self._safe_edit(live_msg, first)
+            await self._safe_edit(live_msg, content=first)
 
         # Any middle chunks are sent as their own messages with no cursor.
         for mid in middle_and_last[:-1]:
-            await self._safe_send(mid)
+            await self._safe_send(content=mid)
 
         # The last chunk becomes the new live buffer with a fresh cursor message.
         tail = middle_and_last[-1] if middle_and_last else ""
-        new_live = await self._safe_send(tail + CURSOR) if tail else None
+        new_live = await self._safe_send(content=tail + CURSOR) if tail else None
         return new_live, tail
 
     async def _finalize_typewriter(
@@ -314,17 +380,21 @@ class DiscordRenderer:
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
         if len(buffer) <= DISCORD_MAX_LEN:
-            await self._safe_edit(live_msg, buffer)
+            await self._safe_edit(live_msg, content=buffer)
+            self._last_msg = live_msg
             return
 
         chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN)
         if not chunks:  # pragma: no cover - defensive
-            await self._safe_edit(live_msg, buffer[:DISCORD_MAX_LEN])
+            await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN])
+            self._last_msg = live_msg
             return
 
-        await self._safe_edit(live_msg, chunks[0])
+        await self._safe_edit(live_msg, content=chunks[0])
         for chunk in chunks[1:]:
-            await self._safe_send(chunk)
+            sent = await self._safe_send(content=chunk)
+            if sent is not None:
+                self._last_msg = sent
 
     async def _flush(
         self,
@@ -332,7 +402,7 @@ class DiscordRenderer:
         buffer: str,
         typewriter: bool,
         saw_text: bool,
-        tool_msgs: dict[str, tuple[discord.Message, str]],
+        tool_msgs: dict[str, discord.Message],
     ) -> None:
         """Send any remaining text once the stream completes."""
         # Process channel/thread management markers before sending.
@@ -345,30 +415,91 @@ class DiscordRenderer:
 
         if buffer:
             for chunk in self._smart_split(buffer, limit=DISCORD_MAX_LEN):
-                await self._safe_send(chunk)
+                if self._should_upload_as_file(chunk):
+                    ext, code = self._extract_code_info(chunk)
+                    f = discord.File(io.BytesIO(code.encode()), filename=f"output.{ext}")
+                    sent = await self._safe_send(file=f)
+                else:
+                    sent = await self._safe_send(content=chunk)
+                if sent is not None:
+                    self._last_msg = sent
             return
 
         # No text buffered. If we never showed *anything* (no text, no tools),
         # leave a placeholder so the user knows the round-trip finished.
         if not saw_text and not tool_msgs:
-            await self._safe_send("(Claude returned no text response)")
+            sent = await self._safe_send(content="(Claude returned no text response)")
+            if sent is not None:
+                self._last_msg = sent
+
+    # ------------------------------------------------------------------
+    # Long code block → file upload helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _should_upload_as_file(text: str) -> bool:
+        """Check if text is a long code block that should be uploaded as a file."""
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return False
+        return len(stripped) > CODE_FILE_UPLOAD_THRESHOLD
+
+    @staticmethod
+    def _extract_code_info(text: str) -> tuple[str, str]:
+        """Extract language extension and code body from a fenced code block."""
+        stripped = text.strip()
+        first_line = stripped.split("\n", 1)[0]
+        lang = first_line.replace("```", "").strip() or "txt"
+        # Remove opening ``` line
+        code = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+        # Remove closing ```
+        if code.endswith("```"):
+            code = code[:-3]
+        ext_map = {
+            "python": "py", "javascript": "js", "typescript": "ts",
+            "bash": "sh", "shell": "sh",
+        }
+        ext = ext_map.get(lang, lang)
+        return ext, code
 
     # ------------------------------------------------------------------
     # Discord I/O wrappers
     # ------------------------------------------------------------------
 
-    async def _safe_send(self, content: str) -> discord.Message | None:
+    async def _safe_send(
+        self,
+        content: str | None = None,
+        *,
+        embed: discord.Embed | None = None,
+        file: discord.File | None = None,
+    ) -> discord.Message | None:
         """Send a message, swallowing transient HTTP errors with a short backoff."""
-        if not content:
+        if not content and embed is None and file is None:
             return None
+
+        kwargs: dict = {}
+        if content:
+            kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
+        if file is not None:
+            kwargs["file"] = file
+
         try:
-            return await self.target.send(content)
+            msg = await self.target.send(**kwargs)
+            if content:
+                self._last_msg = msg
+            return msg
         except discord.RateLimited as exc:
             retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
             log.warning("Discord send rate-limited; sleeping %.2fs", retry)
             await asyncio.sleep(retry)
             try:
-                return await self.target.send(content)
+                # Rebuild file if needed (stream may have been consumed)
+                msg = await self.target.send(**kwargs)
+                if content:
+                    self._last_msg = msg
+                return msg
             except discord.HTTPException:
                 log.exception("Discord send failed after rate-limit backoff; dropping")
                 return None
@@ -376,29 +507,47 @@ class DiscordRenderer:
             log.warning("Discord send failed; backing off and retrying once")
             await asyncio.sleep(HTTP_BACKOFF_SECONDS)
             try:
-                return await self.target.send(content)
+                msg = await self.target.send(**kwargs)
+                if content:
+                    self._last_msg = msg
+                return msg
             except discord.HTTPException:
                 log.exception("Discord send failed after retry; dropping content")
                 return None
 
-    async def _safe_edit(self, msg: discord.Message, content: str) -> None:
+    async def _safe_edit(
+        self,
+        msg: discord.Message,
+        content: str | None = None,
+        *,
+        embed: discord.Embed | None = None,
+    ) -> None:
         """Edit a message, swallowing transient HTTP errors with a short backoff."""
+        kwargs: dict = {}
+        if content is not None:
+            kwargs["content"] = content
+        if embed is not None:
+            kwargs["embed"] = embed
+
+        if not kwargs:
+            return
+
         try:
-            await msg.edit(content=content)
+            await msg.edit(**kwargs)
             return
         except discord.RateLimited as exc:
             retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
             log.debug("Discord edit rate-limited; sleeping %.2fs", retry)
             await asyncio.sleep(retry)
             try:
-                await msg.edit(content=content)
+                await msg.edit(**kwargs)
             except discord.HTTPException:
                 log.warning("Discord edit failed after rate-limit backoff; dropping")
         except discord.HTTPException:
             log.debug("Discord edit failed; backing off and retrying once")
             await asyncio.sleep(HTTP_BACKOFF_SECONDS)
             try:
-                await msg.edit(content=content)
+                await msg.edit(**kwargs)
             except discord.HTTPException:
                 log.warning("Discord edit failed after retry; dropping update")
 
@@ -525,7 +674,7 @@ class DiscordRenderer:
                 "last message — a fresh session will be started for it.\n\n"
                 f"Error: `{exc}`"
             )[:_RETRY_EMBED_DESC_MAX],
-            color=discord.Color.red(),
+            color=COLOR_TOOL_FAILURE,
         )
         view = RetryView(on_retry=on_retry)
         try:
@@ -592,4 +741,13 @@ class RetryView(discord.ui.View):
             self.stop()
 
 
-__all__ = ["DiscordRenderer", "RetryView"]
+__all__ = [
+    "DiscordRenderer",
+    "RetryView",
+    "COLOR_CLAUDE",
+    "COLOR_TOOL_RUNNING",
+    "COLOR_TOOL_SUCCESS",
+    "COLOR_TOOL_FAILURE",
+    "COLOR_INFO",
+    "COLOR_THINKING",
+]
