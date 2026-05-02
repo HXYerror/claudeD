@@ -1287,9 +1287,28 @@ async def review_pr(interaction: discord.Interaction, pr: str) -> None:
         )
         return
     # Create thread for the review
-    thread = await channel.create_thread(
-        name=f"PR Review: {pr}"[:100], type=discord.ChannelType.public_thread
-    )
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Use this in a text channel", color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
+    try:
+        thread = await channel.create_thread(
+            name=f"PR Review: {pr}"[:100], type=discord.ChannelType.public_thread
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Missing permission to create threads", color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Failed to create thread", description=str(exc)[:500], color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
     # Create session with from-pr flag
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
     extra_dirs = bot.project_manager.get_extra_dirs(parent_id)

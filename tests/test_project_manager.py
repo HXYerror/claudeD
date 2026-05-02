@@ -441,3 +441,14 @@ def test_mcp_multiple_servers(
     assert len(servers) == 2
     assert "a" in servers
     assert "b" in servers
+
+
+def test_add_extra_dir_outside_root_raises(tmp_path):
+    root = tmp_path / "allowed"
+    root.mkdir()
+    outside = tmp_path / "forbidden"
+    outside.mkdir()
+    pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root=str(root))
+    pm.bind(1, str(root))  # need a binding first
+    with pytest.raises(ValueError, match="outside"):
+        pm.add_extra_dir(1, str(outside))

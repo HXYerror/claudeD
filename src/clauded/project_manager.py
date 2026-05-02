@@ -199,9 +199,18 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def add_extra_dir(self, channel_id: int, path: str) -> str:
         """Add an extra directory. Validates and stores. Returns resolved path."""
-        resolved = Path(path).expanduser().resolve()
+        raw_parts = Path(path).expanduser().parts
+        if any(part == ".." for part in raw_parts):
+            raise ValueError("Path may not contain '..' segments.")
+        resolved = Path(path).expanduser().resolve(strict=True)
         if not resolved.is_dir():
             raise ValueError(f"Not a directory: {path}")
+        try:
+            resolved.relative_to(self.projects_root)
+        except ValueError:
+            raise ValueError(
+                f"Path {resolved} is outside the allowed projects root {self.projects_root}."
+            ) from None
         key = str(channel_id)
         entry = self._projects.get(key, {})
         dirs = entry.get("extra_dirs", [])
