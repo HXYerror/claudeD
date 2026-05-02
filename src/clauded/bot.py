@@ -25,6 +25,7 @@ from .discord_renderer import DiscordRenderer, COLOR_INFO, COLOR_TOOL_FAILURE
 from .interaction_handler import InteractionHandler
 from .project_manager import ProjectManager
 from .session_manager import SessionManager
+from .session_config import SessionConfig
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
@@ -78,9 +79,23 @@ class ClaudedBot(commands.Bot):
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
         self.agent_manager = AgentManager()
+        self._claude_version: str = "unknown"
+        self._debug_logging: bool = False
+        self._pre_tool_notifications: bool = True
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
+        # Cache claude version (#86)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            self._claude_version = stdout.decode().strip() or "unknown"
+        except Exception:
+            self._claude_version = "unknown"
         self._cleanup_task.start()
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
@@ -98,6 +113,9 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(plugin_group)
         self.tree.add_command(send_to_claude)
         self.tree.add_command(env_group)
+        self.tree.add_command(pin_message)
+        self.tree.add_command(debug_toggle)
+        self.tree.add_command(notify_toggle)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -215,17 +233,30 @@ class ClaudedBot(commands.Bot):
                     except Exception:
                         pass  # best-effort; don't break the stream
 
+                async def _post_tool_notify(tool_name: str, input_data: dict) -> None:
+                    pass  # logged by bridge already
+
+                async def _stop_notify(input_data: dict) -> None:
+                    reason = input_data.get("stop_reason", "unknown")
+                    log.info("Session stopped: %s", reason)
+
                 env_vars = self.project_manager.get_env(channel.id)
+                sc = SessionConfig(
+                    system_prompt=system_prompt,
+                    on_ask_user=handler.handle_ask_user_question,
+                    on_pre_tool_use=_pre_tool_notify if self._pre_tool_notifications else None,
+                    on_post_tool_use=_post_tool_notify,
+                    on_stop=_stop_notify,
+                    add_dirs=extra_dirs or None,
+                    mcp_servers=mcp_servers or None,
+                    env=env_vars or None,
+                    user=str(message.author),
+                )
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
-                    on_ask_user=handler.handle_ask_user_question,
-                    on_pre_tool_use=_pre_tool_notify,
-                    system_prompt=system_prompt,
-                    add_dirs=extra_dirs or None,
-                    mcp_servers=mcp_servers or None,
-                    env=env_vars or None,
+                    sc,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -263,6 +294,7 @@ class ClaudedBot(commands.Bot):
                     user_text=user_text,
                     thread=thread,
                     project_path=project_path,
+                    session_config=sc,
                 )
                 _render_ok = True
             except Exception:
@@ -304,6 +336,7 @@ class ClaudedBot(commands.Bot):
         # rather than racing each other into the SDK.
         async with self.session_manager.get_lock(thread_id):
             bridge = self.session_manager.get_session(thread_id)
+            sc = None  # Will be set if we create a new session
             if bridge is None or not bridge.is_active:
                 try:
                     handler = InteractionHandler(message.channel)
@@ -323,19 +356,32 @@ class ClaudedBot(commands.Bot):
                         except Exception:
                             pass  # best-effort; don't break the stream
 
+                    async def _post_tool_notify_thread(tool_name: str, input_data: dict) -> None:
+                        pass  # logged by bridge already
+
+                    async def _stop_notify_thread(input_data: dict) -> None:
+                        reason = input_data.get("stop_reason", "unknown")
+                        log.info("Session stopped: %s", reason)
+
                     env_vars = self.project_manager.get_env(parent_id)
+                    sc = SessionConfig(
+                        system_prompt=stored_prompt or system_prompt,
+                        model_override=stored_model,
+                        resume_session_id=resume_id,
+                        on_ask_user=handler.handle_ask_user_question,
+                        on_pre_tool_use=_pre_tool_notify_thread if self._pre_tool_notifications else None,
+                        on_post_tool_use=_post_tool_notify_thread,
+                        on_stop=_stop_notify_thread,
+                        add_dirs=extra_dirs or None,
+                        mcp_servers=mcp_servers or None,
+                        env=env_vars or None,
+                        user=str(message.author),
+                    )
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
-                        on_ask_user=handler.handle_ask_user_question,
-                        on_pre_tool_use=_pre_tool_notify_thread,
-                        system_prompt=stored_prompt or system_prompt,
-                        model_override=stored_model,
-                        resume_session_id=resume_id,
-                        add_dirs=extra_dirs or None,
-                        mcp_servers=mcp_servers or None,
-                        env=env_vars or None,
+                        sc,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -367,6 +413,7 @@ class ClaudedBot(commands.Bot):
                     user_text=user_text,
                     thread=message.channel,
                     project_path=project_path,
+                    session_config=sc,
                 )
                 _render_ok = True
             except Exception:
@@ -441,6 +488,82 @@ class ClaudedBot(commands.Bot):
         composed = f"{prefix}\n\n{text}" if text else prefix
         return composed, tmp_dir
 
+    async def _recreate_session(
+        self,
+        interaction: discord.Interaction,
+        **overrides,
+    ) -> "ClaudeBridge | None":
+        """Stop current session and create a new one with overrides.
+
+        Used by /model, /effort, /tools, /budget, etc. to avoid repeating
+        the lock-stop-create pattern. Returns the new bridge or None on error.
+        """
+        await interaction.response.defer()
+        thread_id = interaction.channel_id
+        parent_id = getattr(interaction.channel, "parent_id", None)
+        if parent_id is None:
+            await interaction.followup.send(
+                embed=discord.Embed(title="❌ Use in a thread", color=COLOR_TOOL_FAILURE),
+                ephemeral=True,
+            )
+            return None
+        project_path = self.project_manager.get_path(parent_id)
+        if not project_path:
+            await interaction.followup.send(
+                embed=discord.Embed(title="❌ Not bound", color=COLOR_TOOL_FAILURE),
+                ephemeral=True,
+            )
+            return None
+
+        # Build pre-tool callback if notifications are enabled
+        _target = interaction.channel
+        pre_tool_cb = None
+        if self._pre_tool_notifications:
+            async def _pre_tool_notify(tool_name: str, input_data: dict) -> None:
+                try:
+                    await _target.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
+                except Exception:
+                    pass
+            pre_tool_cb = _pre_tool_notify
+
+        async def _post_tool_notify(tool_name: str, input_data: dict) -> None:
+            pass  # logged by bridge already
+
+        async def _stop_notify(input_data: dict) -> None:
+            reason = input_data.get("stop_reason", "unknown")
+            log.info("Session stopped: %s", reason)
+
+        sc = SessionConfig(
+            system_prompt=self.project_manager.get_system_prompt(parent_id),
+            add_dirs=self.project_manager.get_extra_dirs(parent_id) or None,
+            mcp_servers=self.project_manager.get_mcp_servers(parent_id) or None,
+            env=self.project_manager.get_env(parent_id) or None,
+            on_ask_user=InteractionHandler(interaction.channel).handle_ask_user_question,
+            on_pre_tool_use=pre_tool_cb,
+            on_post_tool_use=_post_tool_notify,
+            on_stop=_stop_notify,
+            **overrides,
+        )
+
+        lock = self.session_manager.get_lock(thread_id)
+        async with lock:
+            await self.session_manager.stop_session(thread_id)
+            try:
+                bridge = await self.session_manager.create_session(
+                    thread_id, project_path, self.config, sc,
+                )
+            except Exception as exc:
+                await interaction.followup.send(
+                    embed=discord.Embed(
+                        title="❌ Error",
+                        description=f"```\n{str(exc)[:500]}\n```",
+                        color=COLOR_TOOL_FAILURE,
+                    ),
+                    ephemeral=True,
+                )
+                return None
+        return bridge
+
     async def _render_with_retry(
         self,
         *,
@@ -449,6 +572,7 @@ class ClaudedBot(commands.Bot):
         user_text: str,
         thread: discord.abc.Messageable,
         project_path: str,
+        session_config: SessionConfig | None = None,
     ) -> None:
         """Run ``renderer.render_response`` and surface a retry button on crash.
 
@@ -464,6 +588,9 @@ class ClaudedBot(commands.Bot):
             if thread_id is not None:
                 await self.session_manager.stop_session(thread_id)
 
+            # Capture session_config for retry (#80)
+            _retry_sc = session_config
+
             async def _on_retry() -> None:
                 # Re-acquire the lock so a manual click can't race with a
                 # follow-up message the user just typed.
@@ -472,11 +599,30 @@ class ClaudedBot(commands.Bot):
                 async with self.session_manager.get_lock(thread_id):
                     try:
                         new_handler = InteractionHandler(thread)
+                        # Reuse the same SessionConfig (minus resume, plus fresh on_ask_user)
+                        if _retry_sc is not None:
+                            retry_sc = SessionConfig(
+                                system_prompt=_retry_sc.system_prompt,
+                                add_dirs=_retry_sc.add_dirs,
+                                mcp_servers=_retry_sc.mcp_servers,
+                                env=_retry_sc.env,
+                                model_override=_retry_sc.model_override,
+                                effort=_retry_sc.effort,
+                                max_budget_usd=_retry_sc.max_budget_usd,
+                                on_ask_user=new_handler.handle_ask_user_question,
+                                on_pre_tool_use=_retry_sc.on_pre_tool_use,
+                                on_post_tool_use=_retry_sc.on_post_tool_use,
+                                on_stop=_retry_sc.on_stop,
+                            )
+                        else:
+                            retry_sc = SessionConfig(
+                                on_ask_user=new_handler.handle_ask_user_question,
+                            )
                         new_bridge = await self.session_manager.create_session(
                             thread_id,
                             project_path,
                             self.config,
-                            on_ask_user=new_handler.handle_ask_user_question,
+                            retry_sc,
                         )
                     except Exception as start_exc:
                         log.exception("Retry: failed to restart ClaudeBridge")
@@ -497,6 +643,7 @@ class ClaudedBot(commands.Bot):
                         user_text=user_text,
                         thread=thread,
                         project_path=project_path,
+                        session_config=retry_sc,
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
@@ -867,13 +1014,15 @@ async def session_resume(interaction: discord.Interaction) -> None:
     async with lock:
         await bot.session_manager.stop_session(thread_id)
         handler = InteractionHandler(interaction.channel)
+        sc = SessionConfig(
+            system_prompt=stored.get("system_prompt"),
+            model_override=stored.get("model"),
+            on_ask_user=handler.handle_ask_user_question,
+            resume_session_id=stored["session_id"],
+        )
         try:
             await bot.session_manager.create_session(
-                thread_id, stored["project_path"], bot.config,
-                system_prompt=stored.get("system_prompt"),
-                model_override=stored.get("model"),
-                on_ask_user=handler.handle_ask_user_question,
-                resume_session_id=stored["session_id"],
+                thread_id, stored["project_path"], bot.config, sc,
             )
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to resume: `{exc}`", ephemeral=True)
@@ -941,8 +1090,7 @@ async def session_fork(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
     thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if thread_id is None or parent_id is None:
+    if thread_id is None:
         await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
         return
     bridge = bot.session_manager.get_session(thread_id)
@@ -953,31 +1101,18 @@ async def session_fork(interaction: discord.Interaction) -> None:
     if not old_session_id:
         await interaction.response.send_message("Session has no ID yet (send a message first).", ephemeral=True)
         return
-    await interaction.response.defer()
-    project_path = bridge.project_path
-    system_prompt = bridge.system_prompt
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                resume_session_id=old_session_id,
-                fork_session=True,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to fork: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🍴 Session Forked",
-        description=f"New session branched from `{old_session_id[:12]}…`",
-        color=COLOR_INFO,
+    new_bridge = await bot._recreate_session(
+        interaction,
+        resume_session_id=old_session_id,
+        fork_session=True,
     )
-    await interaction.followup.send(embed=embed)
+    if new_bridge:
+        embed = discord.Embed(
+            title="🍴 Session Forked",
+            description=f"New session branched from `{old_session_id[:12]}…`\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 @session_group.command(name="worktree", description="Create a git worktree for isolated work")
@@ -987,40 +1122,14 @@ async def session_worktree(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                worktree=name,
-                add_dirs=extra_dirs or None,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to create worktree: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🌲 Worktree Created",
-        description=f"Session started with worktree **{name}**.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, worktree=name)
+    if bridge:
+        embed = discord.Embed(
+            title="🌲 Worktree Created",
+            description=f"Session started with worktree **{name}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1034,31 +1143,15 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    # Get project path and system prompt
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    # Find the thread/channel for InteractionHandler
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        await bot.session_manager.create_session(
-            thread_id, project_path, bot.config,
-            system_prompt=system_prompt,
-            model_override=name,
-            on_ask_user=handler.handle_ask_user_question,
+    bridge = await bot._recreate_session(interaction, model_override=name)
+    if bridge:
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"🔄 Switched to `{name}`",
+                description="⚠️ Previous conversation context was reset.",
+                color=COLOR_INFO,
+            )
         )
-    await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
 
 # ---------------------------------------------------------------------------
@@ -1087,38 +1180,14 @@ async def set_effort(interaction: discord.Interaction, level: app_commands.Choic
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                effort=level.value,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to set effort: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🧠 Effort Level Set",
-        description=f"Thinking effort set to **{level.value}**. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, effort=level.value)
+    if bridge:
+        embed = discord.Embed(
+            title="🧠 Effort Level Set",
+            description=f"Thinking effort set to **{level.value}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1138,42 +1207,18 @@ async def tools_allow(interaction: discord.Interaction, tools: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
     tool_list = tools.split()
     if not tool_list:
         await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
         return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                allowed_tools=tool_list,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🔧 Allowed Tools Set",
-        description=f"Only these tools are allowed: `{' '.join(tool_list)}`",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, allowed_tools=tool_list)
+    if bridge:
+        embed = discord.Embed(
+            title="🔧 Allowed Tools Set",
+            description=f"Only these tools are allowed: `{' '.join(tool_list)}`\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 @tools_group.command(name="deny", description="Deny specific tools")
@@ -1183,42 +1228,18 @@ async def tools_deny(interaction: discord.Interaction, tools: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
     tool_list = tools.split()
     if not tool_list:
         await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
         return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                disallowed_tools=tool_list,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🚫 Denied Tools Set",
-        description=f"These tools are denied: `{' '.join(tool_list)}`",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, disallowed_tools=tool_list)
+    if bridge:
+        embed = discord.Embed(
+            title="🚫 Denied Tools Set",
+            description=f"These tools are denied: `{' '.join(tool_list)}`\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 @tools_group.command(name="reset", description="Reset to default tools")
@@ -1227,37 +1248,14 @@ async def tools_reset(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to reset tools: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🔧 Tools Reset",
-        description="All tools restored to defaults.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction)
+    if bridge:
+        embed = discord.Embed(
+            title="🔧 Tools Reset",
+            description="All tools restored to defaults.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1277,43 +1275,20 @@ async def budget_set(interaction: discord.Interaction, amount: float) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
     if amount <= 0:
         await interaction.response.send_message("Budget must be positive.", ephemeral=True)
         return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    # Store the budget in the project binding
-    bot.project_manager.set_budget(parent_id, amount)
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                max_budget_usd=amount,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to set budget: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="💵 Budget Set",
-        description=f"Max session budget: **${amount:.2f}**. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is not None:
+        bot.project_manager.set_budget(parent_id, amount)
+    bridge = await bot._recreate_session(interaction, max_budget_usd=amount)
+    if bridge:
+        embed = discord.Embed(
+            title="💵 Budget Set",
+            description=f"Max session budget: **${amount:.2f}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 @budget_group.command(name="show", description="Show current budget setting")
@@ -1374,17 +1349,7 @@ async def health_check(interaction: discord.Interaction) -> None:
     active_sessions = len(bot.session_manager.list_sessions())
     bound_projects = len(bot.project_manager._projects)
 
-    # Get claude version
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "claude", "--version",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        claude_version = stdout.decode().strip() or "unknown"
-    except Exception:
-        claude_version = "unavailable"
+    claude_version = bot._claude_version
 
     embed = discord.Embed(title="🏥 Bot Health", color=COLOR_INFO)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
@@ -1443,15 +1408,17 @@ async def review_pr(interaction: discord.Interaction, pr: str) -> None:
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
     extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
     handler = InteractionHandler(thread)
+    sc = SessionConfig(
+        system_prompt=system_prompt,
+        on_ask_user=handler.handle_ask_user_question,
+        from_pr=pr,
+        add_dirs=extra_dirs or None,
+    )
     lock = bot.session_manager.get_lock(thread.id)
     async with lock:
         try:
             bridge = await bot.session_manager.create_session(
-                thread.id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                from_pr=pr,
-                add_dirs=extra_dirs or None,
+                thread.id, project_path, bot.config, sc,
             )
         except Exception as exc:
             await interaction.followup.send(
@@ -1528,48 +1495,21 @@ async def agent_use(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
     agent = bot.agent_manager.get(name)
     if not agent:
         await interaction.response.send_message(f"\u274c Agent `{name}` not found.", ephemeral=True)
         return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
     agents_json = {name: {"description": agent["description"], "prompt": agent["prompt"]}}
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
-    mcp_servers = bot.project_manager.get_mcp_servers(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                agent_name=name,
-                custom_agents=agents_json,
-                add_dirs=extra_dirs or None,
-                mcp_servers=mcp_servers or None,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"\u274c Failed to use agent: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title=f"\U0001f916 Agent `{name}` activated",
-        description=f"{agent['description']}\nNew session started.",
-        color=COLOR_INFO,
+    bridge = await bot._recreate_session(
+        interaction, agent_name=name, custom_agents=agents_json,
     )
-    await interaction.followup.send(embed=embed)
+    if bridge:
+        embed = discord.Embed(
+            title=f"\U0001f916 Agent `{name}` activated",
+            description=f"{agent['description']}\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 @agent_group.command(name="delete", description="Delete a custom agent")
@@ -1716,41 +1656,17 @@ async def max_turns_cmd(interaction: discord.Interaction, number: int) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
     if number < 1:
         await interaction.response.send_message("Number must be at least 1.", ephemeral=True)
         return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                max_turns=number,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"\u274c Failed to set max turns: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🔄 Max Turns Set",
-        description=f"Max turns set to **{number}**. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, max_turns=number)
+    if bridge:
+        embed = discord.Embed(
+            title="🔄 Max Turns Set",
+            description=f"Max turns set to **{number}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1764,38 +1680,14 @@ async def fallback_model_cmd(interaction: discord.Interaction, model: str) -> No
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                fallback_model=model,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"\u274c Failed to set fallback model: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🔄 Fallback Model Set",
-        description=f"Fallback model set to **{model}**. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, fallback_model=model)
+    if bridge:
+        embed = discord.Embed(
+            title="🔄 Fallback Model Set",
+            description=f"Fallback model set to **{model}**.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1849,55 +1741,37 @@ async def plugin_add(interaction: discord.Interaction, path: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
 
-    # Validate plugin path against projects_root
+    # Validate plugin path against projects_root before deferring
     resolved = Path(path).expanduser().resolve()
     if not resolved.is_dir():
-        await interaction.followup.send(embed=discord.Embed(title="❌ Not a directory", color=COLOR_TOOL_FAILURE), ephemeral=True)
+        await interaction.response.send_message(
+            embed=discord.Embed(title="❌ Not a directory", color=COLOR_TOOL_FAILURE),
+            ephemeral=True,
+        )
         return
 
     try:
         resolved.relative_to(Path(bot.config.projects_root).resolve())
     except ValueError:
-        await interaction.followup.send(embed=discord.Embed(
-            title="❌ Path outside allowed root",
-            description=f"Plugin path must be under `{bot.config.projects_root}`",
-            color=COLOR_TOOL_FAILURE
-        ), ephemeral=True)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="❌ Path outside allowed root",
+                description=f"Plugin path must be under `{bot.config.projects_root}`",
+                color=COLOR_TOOL_FAILURE,
+            ),
+            ephemeral=True,
+        )
         return
 
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                plugin_dirs=[path],
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"\u274c Failed to add plugin: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="🔌 Plugin Added",
-        description=f"Plugin directory `{path}` added. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, plugin_dirs=[path])
+    if bridge:
+        embed = discord.Embed(
+            title="🔌 Plugin Added",
+            description=f"Plugin directory `{path}` added.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
@@ -1911,38 +1785,14 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is None:
-        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
-        return
-    project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    system_prompt = bot.project_manager.get_system_prompt(parent_id)
-    channel = interaction.channel
-    handler = InteractionHandler(channel)
-    lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        await bot.session_manager.stop_session(thread_id)
-        try:
-            await bot.session_manager.create_session(
-                thread_id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question,
-                settings=json_str,
-            )
-        except Exception as exc:
-            await interaction.followup.send(f"\u274c Failed to apply settings: `{exc}`", ephemeral=True)
-            return
-    embed = discord.Embed(
-        title="⚙️ Settings Applied",
-        description="Custom settings applied. New session started.",
-        color=COLOR_INFO,
-    )
-    await interaction.followup.send(embed=embed)
+    bridge = await bot._recreate_session(interaction, settings=json_str)
+    if bridge:
+        embed = discord.Embed(
+            title="⚙️ Settings Applied",
+            description="Custom settings applied.\n⚠️ Previous conversation context was reset.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
 
 
 
@@ -2089,16 +1939,25 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
     except discord.HTTPException:
         await interaction.followup.send("❌ Failed to create thread.", ephemeral=True)
         return
-    # Create session and send
+    # Create session and send — build full SessionConfig from project settings (#83)
     system_prompt = bot.project_manager.get_system_prompt(channel_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(channel_id)
+    mcp_servers = bot.project_manager.get_mcp_servers(channel_id)
+    env_vars = bot.project_manager.get_env(channel_id)
     handler = InteractionHandler(thread)
+    sc = SessionConfig(
+        system_prompt=system_prompt,
+        on_ask_user=handler.handle_ask_user_question,
+        add_dirs=extra_dirs or None,
+        mcp_servers=mcp_servers or None,
+        env=env_vars or None,
+        user=str(message.author),
+    )
     lock = bot.session_manager.get_lock(thread.id)
     async with lock:
         try:
             bridge = await bot.session_manager.create_session(
-                thread.id, project_path, bot.config,
-                system_prompt=system_prompt,
-                on_ask_user=handler.handle_ask_user_question)
+                thread.id, project_path, bot.config, sc)
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to start session: `{exc}`", ephemeral=True)
             return
@@ -2115,6 +1974,65 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
         except Exception:
             await thread.send(embed=discord.Embed(title="❌ Error", description="Claude session failed", color=0xEF4444))
     await interaction.followup.send(f"✅ Sent to Claude in {thread.mention}", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /pin command (#86)
+# ---------------------------------------------------------------------------
+
+@app_commands.context_menu(name="Pin Message")
+async def pin_message(interaction: discord.Interaction, message: discord.Message):
+    try:
+        await message.pin()
+        await interaction.response.send_message("📌 Message pinned.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing permission to pin.", ephemeral=True)
+    except discord.HTTPException as exc:
+        await interaction.response.send_message(f"❌ Failed to pin: `{exc}`", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /debug command (#90)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="debug", description="Toggle debug logging")
+async def debug_toggle(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bot._debug_logging = not bot._debug_logging
+    level = logging.DEBUG if bot._debug_logging else logging.INFO
+    logging.getLogger("clauded").setLevel(level)
+    state = "ON" if bot._debug_logging else "OFF"
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"🔧 Debug logging: {state}",
+            color=COLOR_INFO,
+        ),
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /notify command (#96)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="notify", description="Toggle pre-tool notifications on/off")
+async def notify_toggle(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bot._pre_tool_notifications = not bot._pre_tool_notifications
+    state = "ON" if bot._pre_tool_notifications else "OFF"
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title=f"🔔 Pre-tool notifications: {state}",
+            color=COLOR_INFO,
+        ),
+        ephemeral=True,
+    )
 
 
 # ---------------------------------------------------------------------------

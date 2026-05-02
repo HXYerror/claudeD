@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from .claude_bridge import ClaudeBridge, OnAskUser, OnPreToolUse, OnPostToolUse, OnStop
+from .claude_bridge import ClaudeBridge
 from .config import Config
+from .session_config import SessionConfig
 from .session_store import SessionStore
 
 log = logging.getLogger("clauded.session_manager")
@@ -41,29 +42,7 @@ class SessionManager:
         thread_id: int,
         project_path: str,
         config: Config,
-        on_ask_user: OnAskUser | None = None,
-        on_pre_tool_use: OnPreToolUse | None = None,
-        on_post_tool_use: OnPostToolUse | None = None,
-        on_stop: OnStop | None = None,
-        system_prompt: str | None = None,
-        env: dict[str, str] | None = None,
-        model_override: str | None = None,
-        resume_session_id: str | None = None,
-        effort: str | None = None,
-        allowed_tools: list[str] | None = None,
-        disallowed_tools: list[str] | None = None,
-        max_budget_usd: float | None = None,
-        fork_session: bool = False,
-        add_dirs: list[str] | None = None,
-        from_pr: str | None = None,
-        worktree: str | None = None,
-        agent_name: str | None = None,
-        custom_agents: dict | None = None,
-        mcp_servers: dict | None = None,
-        max_turns: int | None = None,
-        fallback_model: str | None = None,
-        plugin_dirs: list[str] | None = None,
-        settings: str | None = None,
+        session_config: SessionConfig | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -78,35 +57,14 @@ class SessionManager:
         bridge = ClaudeBridge(
             project_path=project_path,
             config=config,
-            on_ask_user=on_ask_user,
-            on_pre_tool_use=on_pre_tool_use,
-            on_post_tool_use=on_post_tool_use,
-            on_stop=on_stop,
-            system_prompt=system_prompt,
-            env=env,
-            model_override=model_override,
-            resume_session_id=resume_session_id,
-            effort=effort,
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            max_budget_usd=max_budget_usd,
-            fork_session=fork_session,
-            add_dirs=add_dirs,
-            from_pr=from_pr,
-            worktree=worktree,
-            agent_name=agent_name,
-            custom_agents=custom_agents,
-            mcp_servers=mcp_servers,
-            max_turns=max_turns,
-            fallback_model=fallback_model,
-            plugin_dirs=plugin_dirs,
-            settings=settings,
+            session_config=session_config,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge
         # Make sure a lock exists for this thread; future callers will reuse it.
         self.get_lock(thread_id)
-        log.info("Created session thread=%s cwd=%s resume=%s", thread_id, project_path, resume_session_id)
+        resume_id = session_config.resume_session_id if session_config else None
+        log.info("Created session thread=%s cwd=%s resume=%s", thread_id, project_path, resume_id)
         return bridge
 
     def get_session(self, thread_id: int) -> ClaudeBridge | None:

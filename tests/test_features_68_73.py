@@ -18,7 +18,9 @@ import pytest
 from claude_code_sdk import ClaudeCodeOptions, HookContext
 
 from clauded.claude_bridge import ClaudeBridge
+from clauded.session_config import SessionConfig
 from clauded.config import Config
+from clauded.session_config import SessionConfig
 from clauded.project_manager import ProjectManager
 
 
@@ -132,14 +134,14 @@ class TestPostToolUseHook:
     async def test_bridge_stores_on_post_tool_use(self, cfg: Config) -> None:
         """ClaudeBridge.__init__ stores the on_post_tool_use callback."""
         cb = AsyncMock()
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_post_tool_use=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_post_tool_use=cb))
         assert bridge._on_post_tool_use is cb
 
     @pytest.mark.asyncio
     async def test_bridge_stores_on_stop(self, cfg: Config) -> None:
         """ClaudeBridge.__init__ stores the on_stop callback."""
         cb = AsyncMock()
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_stop=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_stop=cb))
         assert bridge._on_stop is cb
 
     @pytest.mark.asyncio
@@ -158,7 +160,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_post_tool_use=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_post_tool_use=cb))
         await bridge.start()
 
         opts = captured_options[0]
@@ -182,7 +184,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_stop=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_stop=cb))
         await bridge.start()
 
         opts = captured_options[0]
@@ -206,9 +208,11 @@ class TestPostToolUseHook:
 
         bridge = ClaudeBridge(
             project_path="/tmp/p", config=cfg,
-            on_pre_tool_use=AsyncMock(),
-            on_post_tool_use=AsyncMock(),
-            on_stop=AsyncMock(),
+            session_config=SessionConfig(
+                on_pre_tool_use=AsyncMock(),
+                on_post_tool_use=AsyncMock(),
+                on_stop=AsyncMock(),
+            ),
         )
         await bridge.start()
 
@@ -234,7 +238,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_post_tool_use=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_post_tool_use=cb))
         await bridge.start()
 
         hook_fn = captured_hooks[0]["PostToolUse"][0].hooks[0]
@@ -261,7 +265,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_stop=cb)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_stop=cb))
         await bridge.start()
 
         hook_fn = captured_hooks[0]["Stop"][0].hooks[0]
@@ -290,7 +294,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_post_tool_use=_explode)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_post_tool_use=_explode))
         await bridge.start()
 
         hook_fn = captured_hooks[0]["PostToolUse"][0].hooks[0]
@@ -316,7 +320,7 @@ class TestPostToolUseHook:
 
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture)
 
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_stop=_explode)
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(on_stop=_explode))
         await bridge.start()
 
         hook_fn = captured_hooks[0]["Stop"][0].hooks[0]
@@ -417,8 +421,8 @@ class TestSessionManagerEnv:
         class _SpyBridge:
             instances: list = []
 
-            def __init__(self, **kwargs):
-                captured_kwargs.append(kwargs)
+            def __init__(self, project_path="", config=None, session_config=None, **kwargs):
+                captured_kwargs.append({"project_path": project_path, "config": config, "session_config": session_config, **kwargs})
                 self.started = False
                 _SpyBridge.instances.append(self)
 
@@ -435,10 +439,10 @@ class TestSessionManagerEnv:
         monkeypatch.setattr("clauded.session_manager.ClaudeBridge", _SpyBridge)
 
         sm = SessionManager(session_store=SessionStore(data_dir=str(tmp_path / "store")))
-        await sm.create_session(99, "/tmp/p", cfg, env={"MY_VAR": "hello"})
+        await sm.create_session(99, "/tmp/p", cfg, session_config=SessionConfig(env={"MY_VAR": "hello"}))
 
         assert len(captured_kwargs) == 1
-        assert captured_kwargs[0]["env"] == {"MY_VAR": "hello"}
+        assert captured_kwargs[0]["session_config"].env == {"MY_VAR": "hello"}
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +453,7 @@ class TestSessionManagerEnv:
 class TestClaudeBridgeEnv:
     def test_bridge_stores_env(self, cfg: Config) -> None:
         """ClaudeBridge.__init__ stores env."""
-        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, env={"K": "V"})
+        bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=SessionConfig(env={"K": "V"}))
         assert bridge._env == {"K": "V"}
 
     def test_bridge_env_defaults_none(self, cfg: Config) -> None:
@@ -475,8 +479,8 @@ class TestSessionManagerHookForwarding:
         captured_kwargs: list[dict] = []
 
         class _SpyBridge:
-            def __init__(self, **kwargs):
-                captured_kwargs.append(kwargs)
+            def __init__(self, project_path="", config=None, session_config=None, **kwargs):
+                captured_kwargs.append({"session_config": session_config, **kwargs})
 
             @property
             def session_id(self):
@@ -492,9 +496,9 @@ class TestSessionManagerHookForwarding:
 
         sm = SessionManager(session_store=SessionStore(data_dir=str(tmp_path / "store")))
         cb = AsyncMock()
-        await sm.create_session(77, "/tmp/p", cfg, on_post_tool_use=cb)
+        await sm.create_session(77, "/tmp/p", cfg, session_config=SessionConfig(on_post_tool_use=cb))
 
-        assert captured_kwargs[0]["on_post_tool_use"] is cb
+        assert captured_kwargs[0]["session_config"].on_post_tool_use is cb
 
     @pytest.mark.asyncio
     async def test_passes_on_stop(
@@ -507,8 +511,8 @@ class TestSessionManagerHookForwarding:
         captured_kwargs: list[dict] = []
 
         class _SpyBridge:
-            def __init__(self, **kwargs):
-                captured_kwargs.append(kwargs)
+            def __init__(self, project_path="", config=None, session_config=None, **kwargs):
+                captured_kwargs.append({"session_config": session_config, **kwargs})
 
             @property
             def session_id(self):
@@ -524,6 +528,6 @@ class TestSessionManagerHookForwarding:
 
         sm = SessionManager(session_store=SessionStore(data_dir=str(tmp_path / "store")))
         cb = AsyncMock()
-        await sm.create_session(78, "/tmp/p", cfg, on_stop=cb)
+        await sm.create_session(78, "/tmp/p", cfg, session_config=SessionConfig(on_stop=cb))
 
-        assert captured_kwargs[0]["on_stop"] is cb
+        assert captured_kwargs[0]["session_config"].on_stop is cb
