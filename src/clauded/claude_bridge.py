@@ -10,6 +10,10 @@ whenever Claude calls the ``AskUserQuestion`` tool. The callback returns the
 ``updated_input`` dict (typically with an extra ``answers`` field) — that is
 forwarded to the SDK as a :class:`PermissionResultAllow`. All other tools are
 unconditionally allowed.
+
+The bridge also supports an ``on_pre_tool_use`` callback that fires *before*
+a tool executes (via SDK PreToolUse hooks). This gives callers early
+notification — e.g. to post a "Preparing: ToolName…" message in Discord.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from claude_code_sdk import (
     AssistantMessage,
     ClaudeCodeOptions,
     ClaudeSDKClient,
+    HookContext,
+    HookMatcher,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -31,6 +37,7 @@ from claude_code_sdk import (
 from claude_code_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
+    StreamEvent,
     ToolPermissionContext,
 )
 
@@ -44,6 +51,10 @@ log = logging.getLogger("clauded.claude_bridge")
 # returns either an updated input dict (forwarded to the SDK as
 # ``PermissionResultAllow.updated_input``) or ``None`` to deny the call.
 OnAskUser = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
+
+# Type alias for the PreToolUse notification callback. Receives the tool
+# name and the raw tool input dict before execution begins.
+OnPreToolUse = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 _CHANNEL_MGMT_PROMPT = """
@@ -65,6 +76,7 @@ class ClaudeBridge:
         project_path: str,
         config: Config,
         on_ask_user: OnAskUser | None = None,
+        on_pre_tool_use: OnPreToolUse | None = None,
         system_prompt: str | None = None,
         model_override: str | None = None,
         resume_session_id: str | None = None,
@@ -79,10 +91,15 @@ class ClaudeBridge:
         agent_name: str | None = None,
         custom_agents: dict | None = None,
         mcp_servers: dict | None = None,
+        max_turns: int | None = None,
+        fallback_model: str | None = None,
+        plugin_dirs: list[str] | None = None,
+        settings: str | None = None,
     ) -> None:
         self.project_path = project_path
         self._config = config
         self.on_ask_user = on_ask_user
+        self._on_pre_tool_use = on_pre_tool_use
         self.system_prompt = system_prompt
         self._model_override = model_override
         self._resume_session_id = resume_session_id
@@ -97,6 +114,10 @@ class ClaudeBridge:
         self._agent_name = agent_name
         self._custom_agents = custom_agents
         self._mcp_servers = mcp_servers
+        self._max_turns = max_turns
+        self._fallback_model = fallback_model
+        self._plugin_dirs = plugin_dirs or []
+        self._settings = settings
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -151,6 +172,34 @@ class ClaudeBridge:
             extra_args["agents"] = json.dumps(self._custom_agents)
         if self._agent_name:
             extra_args["agent"] = self._agent_name
+        if self._fallback_model:
+            extra_args["fallback-model"] = self._fallback_model
+        if self._plugin_dirs:
+            # Pass the first plugin dir; CLI supports --plugin-dir
+            extra_args["plugin-dir"] = self._plugin_dirs[0]
+
+        # ------------------------------------------------------------------
+        # Feature #60: PreToolUse hook for early notification
+        # ------------------------------------------------------------------
+        hooks: dict[str, list[HookMatcher]] | None = None
+        if self._on_pre_tool_use is not None:
+            on_pre = self._on_pre_tool_use  # capture for closure
+
+            async def _hook_pre_tool(
+                input_data: dict[str, Any],
+                tool_use_id: str | None,
+                context: HookContext,
+            ) -> dict[str, Any]:
+                tool_name = input_data.get("tool_name", "unknown")
+                try:
+                    await on_pre(tool_name, input_data)
+                except Exception:
+                    log.debug("on_pre_tool_use callback raised; ignoring", exc_info=True)
+                return {}  # empty dict = continue normally
+
+            hooks = {
+                "PreToolUse": [HookMatcher(matcher=None, hooks=[_hook_pre_tool])],
+            }
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
@@ -164,24 +213,33 @@ class ClaudeBridge:
             extra_args=extra_args,
             add_dirs=self._add_dirs,
             mcp_servers=self._mcp_servers or {},
+            max_turns=self._max_turns,
+            # Feature #60: SDK hooks
+            hooks=hooks,
+            # Feature #61: partial message streaming for token-level deltas
+            include_partial_messages=True,
+            settings=self._settings,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s",
+            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s",
             self.project_path,
             bool(self.on_ask_user),
             self._resume_session_id,
             self._effort,
+            bool(hooks),
+            True,
         )
 
     async def send_message(self, text: str) -> AsyncIterator[object]:
         """Send a user message and stream back response messages.
 
         Yields the raw SDK message objects (``AssistantMessage``,
-        ``ResultMessage``, etc.) so callers can decide how to render them.
+        ``ResultMessage``, ``StreamEvent``, etc.) so callers can decide how
+        to render them.
 
         If the underlying SDK raises, the bridge marks itself inactive so
         callers can detect the dead session and recreate it on the next
@@ -298,6 +356,7 @@ class ClaudeBridge:
 __all__ = [
     "ClaudeBridge",
     "OnAskUser",
+    "OnPreToolUse",
     # Re-export for convenience so callers can ``isinstance`` against the
     # message/block types without importing the SDK directly.
     "AssistantMessage",

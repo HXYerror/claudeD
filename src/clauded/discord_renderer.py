@@ -39,6 +39,7 @@ from .claude_bridge import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from claude_code_sdk.types import StreamEvent
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -124,6 +125,38 @@ class DiscordRenderer:
                     }
                     break
 
+                # -------------------------------------------------------
+                # Feature #61: handle StreamEvent for partial messages
+                # -------------------------------------------------------
+                if isinstance(event, StreamEvent):
+                    ev = event.event
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                saw_text = True
+                                buffer += text
+
+                                now = time.time()
+                                if start_time is None:
+                                    start_time = now
+
+                                # Enter typewriter mode once streaming long enough.
+                                if not typewriter and (now - start_time) > FAST_PATH_SECONDS:
+                                    typewriter = True
+                                    live_msg, buffer = await self._typewriter_tick(
+                                        live_msg, buffer
+                                    )
+                                    last_edit = now
+                                elif typewriter and (now - last_edit) >= EDIT_INTERVAL_SECONDS:
+                                    live_msg, buffer = await self._typewriter_tick(
+                                        live_msg, buffer
+                                    )
+                                    last_edit = now
+                    # StreamEvent handled — skip the content-list branch
+                    continue
+
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, ThinkingBlock):
@@ -176,6 +209,59 @@ class DiscordRenderer:
                             if tool_id:
                                 tool_names[tool_id] = name
 
+                            # --- Special tool display: Plan Mode (#54) ---
+                            if name == "EnterPlanMode":
+                                plan_embed = discord.Embed(
+                                    title="📋 Entered plan mode",
+                                    color=COLOR_INFO,
+                                )
+                                await self._safe_send(embed=plan_embed)
+                                continue
+                            if name == "ExitPlanMode":
+                                plan_embed = discord.Embed(
+                                    title="✅ Exited plan mode",
+                                    color=COLOR_INFO,
+                                )
+                                await self._safe_send(embed=plan_embed)
+                                continue
+
+                            # --- Special tool display: Task subtask (#55) ---
+                            if name == "Task":
+                                desc = block.input.get("description", "")[:200]
+                                task_embed = discord.Embed(
+                                    title=f"🔀 Subtask: {desc}" if desc else "🔀 Subtask",
+                                    color=COLOR_INFO,
+                                )
+                                tmsg = await self._safe_send(embed=task_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
+                            # --- Special tool display: TodoWrite (#56) ---
+                            if name == "TodoWrite":
+                                todos = block.input.get("todos", [])
+                                lines = []
+                                for item in todos[:20]:
+                                    if isinstance(item, dict):
+                                        status = item.get("status", "")
+                                        label = item.get("content", item.get("label", item.get("text", "")))
+                                        if status in ("completed", "done"):
+                                            lines.append(f"☑ {label}")
+                                        else:
+                                            lines.append(f"☐ {label}")
+                                    else:
+                                        lines.append(f"☐ {item}")
+                                todo_text = "\n".join(lines) if lines else "No items"
+                                todo_embed = discord.Embed(
+                                    title="📝 Todo List",
+                                    description=todo_text[:4000],
+                                    color=COLOR_INFO,
+                                )
+                                tmsg = await self._safe_send(embed=todo_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
                             # Build a colored embed for the tool execution
                             tool_embed = discord.Embed(
                                 title=f"🔄 {name}",
@@ -227,6 +313,21 @@ class DiscordRenderer:
 
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
+                            # --- Task result display (#55) ---
+                            result_name = tool_names.get(tool_id, "") if tool_id else ""
+                            if result_name in ("Task",):
+                                content_str = str(block.content)[:500] if block.content else ""
+                                task_result_embed = discord.Embed(
+                                    title="✅ Subtask completed",
+                                    description=content_str or "Done",
+                                    color=COLOR_TOOL_SUCCESS,
+                                )
+                                if tool_id and tool_id in tool_msgs:
+                                    await self._safe_edit(tool_msgs[tool_id], embed=task_result_embed)
+                                else:
+                                    await self._safe_send(embed=task_result_embed)
+                                continue
+
                             if tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
                                 name = tool_names.get(tool_id, "tool")

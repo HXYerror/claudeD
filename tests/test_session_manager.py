@@ -48,6 +48,7 @@ class _FakeBridge:
         project_path: str,
         config: Config,
         on_ask_user: Any = None,
+        on_pre_tool_use: Any = None,
         system_prompt: Any = None,
         model_override: Any = None,
         resume_session_id: Any = None,
@@ -62,10 +63,15 @@ class _FakeBridge:
         agent_name: Any = None,
         custom_agents: Any = None,
         mcp_servers: Any = None,
+        max_turns: Any = None,
+        fallback_model: Any = None,
+        plugin_dirs: Any = None,
+        settings: Any = None,
     ) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
+        self.on_pre_tool_use = on_pre_tool_use
         self.resume_session_id = resume_session_id
         self.effort = effort
         self.allowed_tools = allowed_tools
@@ -78,6 +84,10 @@ class _FakeBridge:
         self.agent_name = agent_name
         self.custom_agents = custom_agents
         self.mcp_servers = mcp_servers
+        self.max_turns = max_turns
+        self.fallback_model = fallback_model
+        self.plugin_dirs = plugin_dirs
+        self.settings = settings
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
@@ -300,4 +310,40 @@ async def test_create_session_with_mcp_servers(cfg: Config, tmp_path) -> None:
     mcp = {"myserver": {"type": "stdio", "command": "npx", "args": ["-y", "server"]}}
     bridge = await sm.create_session(41, "/tmp/p", cfg, mcp_servers=mcp)
     assert bridge.mcp_servers == mcp
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_max_turns(cfg: Config, tmp_path) -> None:
+    """create_session passes max_turns to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(50, "/tmp/p", cfg, max_turns=10)
+    assert bridge.max_turns == 10
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_fallback_model(cfg: Config, tmp_path) -> None:
+    """create_session passes fallback_model to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(51, "/tmp/p", cfg, fallback_model="haiku")
+    assert bridge.fallback_model == "haiku"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_plugin_dirs(cfg: Config, tmp_path) -> None:
+    """create_session passes plugin_dirs to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(52, "/tmp/p", cfg, plugin_dirs=["/tmp/plugins"])
+    assert bridge.plugin_dirs == ["/tmp/plugins"]
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_settings(cfg: Config, tmp_path) -> None:
+    """create_session passes settings to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(53, "/tmp/p", cfg, settings='{"key": "value"}')
+    assert bridge.settings == '{"key": "value"}'
     assert bridge.started
