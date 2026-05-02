@@ -239,8 +239,46 @@ class ClaudeBridge:
 
             _hooks_dict["Stop"] = [HookMatcher(matcher=None, hooks=[_hook_stop])]
 
-        if _hooks_dict:
-            hooks = _hooks_dict
+        # --- PreCompact hook: notified before context compression ---
+        async def _hook_pre_compact(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> dict[str, Any]:
+            log.info("Pre-compact triggered")
+            return {}
+
+        _hooks_dict["PreCompact"] = [HookMatcher(matcher=None, hooks=[_hook_pre_compact])]
+
+        # --- UserPromptSubmit hook: log user prompt submissions ---
+        async def _hook_user_prompt(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> dict[str, Any]:
+            log.debug("UserPromptSubmit: %s", str(input_data)[:200])
+            return {}
+
+        _hooks_dict["UserPromptSubmit"] = [HookMatcher(matcher=None, hooks=[_hook_user_prompt])]
+
+        # --- SubagentStop hook: notified when a subagent stops ---
+        async def _hook_subagent_stop(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> dict[str, Any]:
+            log.info("Subagent stopped: %s", str(input_data)[:200])
+            if self._session_config.on_stop:
+                try:
+                    await self._session_config.on_stop(input_data)
+                except Exception:
+                    log.debug("on_stop callback raised in SubagentStop; ignoring", exc_info=True)
+            return {}
+
+        _hooks_dict["SubagentStop"] = [HookMatcher(matcher=None, hooks=[_hook_subagent_stop])]
+
+        # Always assign hooks dict (we now unconditionally register PreCompact etc.)
+        hooks = _hooks_dict
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
