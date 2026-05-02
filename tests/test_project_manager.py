@@ -235,3 +235,99 @@ def test_system_prompt_persists(
 
     pm2 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
     assert pm2.get_system_prompt(30) == "Always respond in JSON."
+
+
+# ---------------------------------------------------------------------------
+# Extra directories
+# ---------------------------------------------------------------------------
+
+
+def test_add_extra_dir(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """add_extra_dir stores a directory and returns its resolved path."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(50, str(proj))
+
+    extra = projects_root / "extra"
+    extra.mkdir()
+    resolved = manager.add_extra_dir(50, str(extra))
+    assert Path(resolved) == extra.resolve()
+    assert manager.get_extra_dirs(50) == [str(extra.resolve())]
+
+
+def test_add_extra_dir_no_duplicates(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """Adding the same directory twice doesn't duplicate it."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(51, str(proj))
+
+    extra = projects_root / "extra"
+    extra.mkdir()
+    manager.add_extra_dir(51, str(extra))
+    manager.add_extra_dir(51, str(extra))
+    assert len(manager.get_extra_dirs(51)) == 1
+
+
+def test_add_extra_dir_not_a_directory(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """add_extra_dir raises ValueError for non-directory paths."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(52, str(proj))
+
+    afile = projects_root / "afile"
+    afile.write_text("hi")
+    with pytest.raises(ValueError, match="Not a directory"):
+        manager.add_extra_dir(52, str(afile))
+
+
+def test_remove_extra_dir(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """remove_extra_dir removes a previously added directory."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(53, str(proj))
+
+    extra = projects_root / "extra"
+    extra.mkdir()
+    manager.add_extra_dir(53, str(extra))
+    assert manager.remove_extra_dir(53, str(extra)) is True
+    assert manager.get_extra_dirs(53) == []
+
+
+def test_remove_extra_dir_not_found(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """remove_extra_dir returns False if the directory wasn't added."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(54, str(proj))
+    assert manager.remove_extra_dir(54, "/nonexistent") is False
+
+
+def test_get_extra_dirs_empty(manager: ProjectManager) -> None:
+    """get_extra_dirs returns empty list for unknown channels."""
+    assert manager.get_extra_dirs(999) == []
+
+
+def test_extra_dirs_persist(
+    data_dir: Path, projects_root: Path
+) -> None:
+    """Extra directories survive a round-trip through save/load."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    extra = projects_root / "extra"
+    extra.mkdir()
+
+    pm1 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+    pm1.bind(60, str(proj))
+    pm1.add_extra_dir(60, str(extra))
+
+    pm2 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+    assert pm2.get_extra_dirs(60) == [str(extra.resolve())]

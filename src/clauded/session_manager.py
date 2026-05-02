@@ -50,6 +50,9 @@ class SessionManager:
         disallowed_tools: list[str] | None = None,
         max_budget_usd: float | None = None,
         fork_session: bool = False,
+        add_dirs: list[str] | None = None,
+        from_pr: str | None = None,
+        worktree: str | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -73,6 +76,9 @@ class SessionManager:
             disallowed_tools=disallowed_tools,
             max_budget_usd=max_budget_usd,
             fork_session=fork_session,
+            add_dirs=add_dirs,
+            from_pr=from_pr,
+            worktree=worktree,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge

@@ -193,3 +193,40 @@ class ProjectManager:
         if entry is not None and "budget" in entry:
             del entry["budget"]
             self._save()
+
+    # ------------------------------------------------------------------
+    # Extra directories
+    # ------------------------------------------------------------------
+    def add_extra_dir(self, channel_id: int, path: str) -> str:
+        """Add an extra directory. Validates and stores. Returns resolved path."""
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory: {path}")
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        dirs = entry.get("extra_dirs", [])
+        resolved_str = str(resolved)
+        if resolved_str not in dirs:
+            dirs.append(resolved_str)
+        entry["extra_dirs"] = dirs
+        self._projects[key] = entry
+        self._save()
+        return resolved_str
+
+    def get_extra_dirs(self, channel_id: int) -> list[str]:
+        """Return extra directories for ``channel_id``."""
+        entry = self._projects.get(str(channel_id), {})
+        return entry.get("extra_dirs", [])
+
+    def remove_extra_dir(self, channel_id: int, path: str) -> bool:
+        """Remove an extra directory. Returns True if removed."""
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        dirs = entry.get("extra_dirs", [])
+        resolved = str(Path(path).expanduser().resolve())
+        if resolved in dirs:
+            dirs.remove(resolved)
+            entry["extra_dirs"] = dirs
+            self._save()
+            return True
+        return False

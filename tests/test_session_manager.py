@@ -56,6 +56,9 @@ class _FakeBridge:
         disallowed_tools: Any = None,
         max_budget_usd: Any = None,
         fork_session: Any = False,
+        add_dirs: Any = None,
+        from_pr: Any = None,
+        worktree: Any = None,
     ) -> None:
         self.project_path = project_path
         self.config = config
@@ -66,6 +69,9 @@ class _FakeBridge:
         self.disallowed_tools = disallowed_tools
         self.max_budget_usd = max_budget_usd
         self.fork_session = fork_session
+        self.add_dirs = add_dirs
+        self.from_pr = from_pr
+        self.worktree = worktree
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
@@ -236,3 +242,31 @@ async def test_create_session_with_fork(cfg: Config, tmp_path) -> None:
     )
     assert bridge.fork_session is True
     assert bridge.resume_session_id == "sess-abc"
+
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_add_dirs(cfg: Config, tmp_path) -> None:
+    """create_session passes add_dirs to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(30, "/tmp/p", cfg, add_dirs=["/tmp/extra"])
+    assert bridge.add_dirs == ["/tmp/extra"]
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_from_pr(cfg: Config, tmp_path) -> None:
+    """create_session passes from_pr to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(31, "/tmp/p", cfg, from_pr="123")
+    assert bridge.from_pr == "123"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_worktree(cfg: Config, tmp_path) -> None:
+    """create_session passes worktree to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(32, "/tmp/p", cfg, worktree="feature-branch")
+    assert bridge.worktree == "feature-branch"
+    assert bridge.started

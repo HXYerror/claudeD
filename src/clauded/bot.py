@@ -87,6 +87,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(tools_group)
         self.tree.add_command(budget_group)
         self.tree.add_command(health_check)
+        self.tree.add_command(review_pr)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -177,12 +178,14 @@ class ClaudedBot(commands.Bot):
             try:
                 handler = InteractionHandler(thread)
                 system_prompt = self.project_manager.get_system_prompt(channel.id)
+                extra_dirs = self.project_manager.get_extra_dirs(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
                     on_ask_user=handler.handle_ask_user_question,
                     system_prompt=system_prompt,
+                    add_dirs=extra_dirs or None,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -249,6 +252,7 @@ class ClaudedBot(commands.Bot):
                     resume_id = stored.get("session_id") if stored else None
                     stored_model = stored.get("model") if stored else None
                     stored_prompt = stored.get("system_prompt") if stored else None
+                    extra_dirs = self.project_manager.get_extra_dirs(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
@@ -257,6 +261,7 @@ class ClaudedBot(commands.Bot):
                         system_prompt=stored_prompt or system_prompt,
                         model_override=stored_model,
                         resume_session_id=resume_id,
+                        add_dirs=extra_dirs or None,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -563,6 +568,73 @@ async def project_system_prompt(interaction: discord.Interaction, text: str) -> 
         await interaction.response.send_message("✅ System prompt set", ephemeral=True)
 
 
+@project_group.command(name="add-dir", description="Add extra directory access for Claude")
+@app_commands.describe(path="Path to directory")
+async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
+    log.info("/project add-dir path=%s channel=%s", path, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    if not bot.project_manager.is_bound(channel_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+    try:
+        resolved = bot.project_manager.add_extra_dir(channel_id, path)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="📂 Extra Directory Added",
+        description=f"Added `{resolved}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@project_group.command(name="dirs", description="List extra directories")
+async def project_dirs(interaction: discord.Interaction) -> None:
+    log.info("/project dirs channel=%s", interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    dirs = bot.project_manager.get_extra_dirs(channel_id)
+    if not dirs:
+        await interaction.response.send_message("No extra directories configured.", ephemeral=True)
+        return
+    listing = "\n".join(f"• `{d}`" for d in dirs)
+    embed = discord.Embed(
+        title="📂 Extra Directories",
+        description=listing,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@project_group.command(name="remove-dir", description="Remove extra directory")
+@app_commands.describe(path="Path to remove")
+async def project_remove_dir(interaction: discord.Interaction, path: str) -> None:
+    log.info("/project remove-dir path=%s channel=%s", path, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    removed = bot.project_manager.remove_extra_dir(channel_id, path)
+    if removed:
+        embed = discord.Embed(
+            title="📂 Extra Directory Removed",
+            description=f"Removed `{path}`",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message("Directory not found in extra dirs.", ephemeral=True)
+
+
 session_group = app_commands.Group(
     name="session",
     description="Manage Claude sessions inside threads.",
@@ -777,6 +849,49 @@ async def session_fork(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="🍴 Session Forked",
         description=f"New session branched from `{old_session_id[:12]}…`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@session_group.command(name="worktree", description="Create a git worktree for isolated work")
+@app_commands.describe(name="Worktree name (branch name)")
+async def session_worktree(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                worktree=name,
+                add_dirs=extra_dirs or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to create worktree: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🌲 Worktree Created",
+        description=f"Session started with worktree **{name}**.",
         color=COLOR_INFO,
     )
     await interaction.followup.send(embed=embed)
@@ -1141,6 +1256,62 @@ async def health_check(interaction: discord.Interaction) -> None:
     embed.add_field(name="Python", value=sys.version.split()[0], inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# /review command
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="review", description="Start a PR review session")
+@app_commands.describe(pr="PR number or URL")
+async def review_pr(interaction: discord.Interaction, pr: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    channel = interaction.channel
+    # Must be in a bound channel (or its thread)
+    parent_id = getattr(channel, "parent_id", None) or channel.id
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Channel not bound", color=COLOR_TOOL_FAILURE)
+        )
+        return
+    # Create thread for the review
+    thread = await channel.create_thread(
+        name=f"PR Review: {pr}"[:100], type=discord.ChannelType.public_thread
+    )
+    # Create session with from-pr flag
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    handler = InteractionHandler(thread)
+    lock = bot.session_manager.get_lock(thread.id)
+    async with lock:
+        try:
+            bridge = await bot.session_manager.create_session(
+                thread.id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                from_pr=pr,
+                add_dirs=extra_dirs or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description=f"```\n{str(exc)[:500]}\n```",
+                    color=COLOR_TOOL_FAILURE,
+                )
+            )
+            return
+    embed = discord.Embed(
+        title="📋 PR Review started",
+        description=f"See thread: {thread.mention}",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint

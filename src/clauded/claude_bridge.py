@@ -72,6 +72,9 @@ class ClaudeBridge:
         disallowed_tools: list[str] | None = None,
         max_budget_usd: float | None = None,
         fork_session: bool = False,
+        add_dirs: list[str] | None = None,
+        from_pr: str | None = None,
+        worktree: str | None = None,
     ) -> None:
         self.project_path = project_path
         self._config = config
@@ -84,6 +87,9 @@ class ClaudeBridge:
         self._disallowed_tools = disallowed_tools or []
         self._max_budget_usd = max_budget_usd
         self._fork_session = fork_session
+        self._add_dirs = add_dirs
+        self._from_pr = from_pr
+        self._worktree = worktree
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -130,6 +136,10 @@ class ClaudeBridge:
             extra_args["max-budget-usd"] = str(self._max_budget_usd)
         if self._fork_session:
             extra_args["fork-session"] = None
+        if self._from_pr:
+            extra_args["from-pr"] = self._from_pr
+        if self._worktree:
+            extra_args["worktree"] = self._worktree
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
@@ -141,6 +151,7 @@ class ClaudeBridge:
             allowed_tools=self._allowed_tools,
             disallowed_tools=self._disallowed_tools,
             extra_args=extra_args,
+            add_dirs=self._add_dirs,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
