@@ -1734,6 +1734,23 @@ async def plugin_add(interaction: discord.Interaction, path: str) -> None:
         await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
         return
     await interaction.response.defer()
+
+    # Validate plugin path against projects_root
+    resolved = Path(path).expanduser().resolve()
+    if not resolved.is_dir():
+        await interaction.followup.send(embed=discord.Embed(title="❌ Not a directory", color=COLOR_TOOL_FAILURE), ephemeral=True)
+        return
+
+    try:
+        resolved.relative_to(Path(bot.config.projects_root).resolve())
+    except ValueError:
+        await interaction.followup.send(embed=discord.Embed(
+            title="❌ Path outside allowed root",
+            description=f"Plugin path must be under `{bot.config.projects_root}`",
+            color=COLOR_TOOL_FAILURE
+        ), ephemeral=True)
+        return
+
     system_prompt = bot.project_manager.get_system_prompt(parent_id)
     channel = interaction.channel
     handler = InteractionHandler(channel)

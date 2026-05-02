@@ -218,6 +218,7 @@ class ClaudeBridge:
             hooks=hooks,
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
+            settings=self._settings,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
