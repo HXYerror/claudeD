@@ -79,6 +79,10 @@ class ClaudeBridge:
         agent_name: str | None = None,
         custom_agents: dict | None = None,
         mcp_servers: dict | None = None,
+        max_turns: int | None = None,
+        fallback_model: str | None = None,
+        plugin_dirs: list[str] | None = None,
+        settings: str | None = None,
     ) -> None:
         self.project_path = project_path
         self._config = config
@@ -97,6 +101,10 @@ class ClaudeBridge:
         self._agent_name = agent_name
         self._custom_agents = custom_agents
         self._mcp_servers = mcp_servers
+        self._max_turns = max_turns
+        self._fallback_model = fallback_model
+        self._plugin_dirs = plugin_dirs or []
+        self._settings = settings
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -151,6 +159,11 @@ class ClaudeBridge:
             extra_args["agents"] = json.dumps(self._custom_agents)
         if self._agent_name:
             extra_args["agent"] = self._agent_name
+        if self._fallback_model:
+            extra_args["fallback-model"] = self._fallback_model
+        if self._plugin_dirs:
+            # Pass the first plugin dir; CLI supports --plugin-dir
+            extra_args["plugin-dir"] = self._plugin_dirs[0]
 
         options = ClaudeCodeOptions(
             cwd=self.project_path,
@@ -164,6 +177,7 @@ class ClaudeBridge:
             extra_args=extra_args,
             add_dirs=self._add_dirs,
             mcp_servers=self._mcp_servers or {},
+            max_turns=self._max_turns,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()

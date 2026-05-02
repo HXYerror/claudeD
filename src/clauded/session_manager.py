@@ -56,6 +56,10 @@ class SessionManager:
         agent_name: str | None = None,
         custom_agents: dict | None = None,
         mcp_servers: dict | None = None,
+        max_turns: int | None = None,
+        fallback_model: str | None = None,
+        plugin_dirs: list[str] | None = None,
+        settings: str | None = None,
     ) -> ClaudeBridge:
         """Create, start, and register a new session for ``thread_id``.
 
@@ -85,6 +89,10 @@ class SessionManager:
             agent_name=agent_name,
             custom_agents=custom_agents,
             mcp_servers=mcp_servers,
+            max_turns=max_turns,
+            fallback_model=fallback_model,
+            plugin_dirs=plugin_dirs,
+            settings=settings,
         )
         await bridge.start()
         self._sessions[thread_id] = bridge

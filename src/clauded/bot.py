@@ -92,6 +92,9 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(review_pr)
         self.tree.add_command(agent_group)
         self.tree.add_command(mcp_group)
+        self.tree.add_command(max_turns_cmd)
+        self.tree.add_command(fallback_model_cmd)
+        self.tree.add_command(plugin_group)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -1558,6 +1561,230 @@ async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
         await interaction.response.send_message(
             f"\u274c MCP server `{name}` not found.", ephemeral=True
         )
+
+
+
+# ---------------------------------------------------------------------------
+# /max-turns command (#52)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="max-turns", description="Set maximum turns for Claude session")
+@app_commands.describe(number="Maximum number of turns")
+async def max_turns_cmd(interaction: discord.Interaction, number: int) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    if number < 1:
+        await interaction.response.send_message("Number must be at least 1.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                max_turns=number,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to set max turns: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔄 Max Turns Set",
+        description=f"Max turns set to **{number}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /fallback-model command (#53)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="fallback-model", description="Set fallback model for Claude session")
+@app_commands.describe(model="Fallback model name or ID")
+async def fallback_model_cmd(interaction: discord.Interaction, model: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                fallback_model=model,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to set fallback model: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔄 Fallback Model Set",
+        description=f"Fallback model set to **{model}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /session security-review command (#57)
+# ---------------------------------------------------------------------------
+
+@session_group.command(name="security-review", description="Run a security review on the current project")
+async def session_security_review(interaction: discord.Interaction) -> None:
+    """Send /security-review to the Claude session."""
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("Use this in a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session in this thread.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        async for _ in bridge.send_message("/security-review"):
+            pass  # consume the response stream
+        embed = discord.Embed(
+            title="🔒 Security Review",
+            description="Security review completed.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"\u274c Failed to run security review: `{exc}`", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /plugin command group (#58)
+# ---------------------------------------------------------------------------
+
+plugin_group = app_commands.Group(
+    name="plugin",
+    description="Manage Claude plugins",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@plugin_group.command(name="add", description="Add plugin directory and restart session")
+@app_commands.describe(path="Path to plugin directory")
+async def plugin_add(interaction: discord.Interaction, path: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                plugin_dirs=[path],
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to add plugin: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔌 Plugin Added",
+        description=f"Plugin directory `{path}` added. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /session settings command (#59)
+# ---------------------------------------------------------------------------
+
+@session_group.command(name="settings", description="Apply custom settings JSON to session")
+@app_commands.describe(json_str="Settings JSON string")
+async def session_settings(interaction: discord.Interaction, json_str: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                settings=json_str,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to apply settings: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="⚙️ Settings Applied",
+        description="Custom settings applied. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
 
 
 # ---------------------------------------------------------------------------
