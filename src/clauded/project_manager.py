@@ -164,3 +164,113 @@ class ProjectManager:
         if entry is not None and "system_prompt" in entry:
             del entry["system_prompt"]
             self._save()
+
+    # ------------------------------------------------------------------
+    # Budget
+    # ------------------------------------------------------------------
+    def set_budget(self, channel_id: int, amount: float) -> None:
+        """Store a max budget (USD) for the given channel binding."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is None:
+            entry = {}
+            self._projects[key] = entry
+        entry["budget"] = amount
+        self._save()
+
+    def get_budget(self, channel_id: int) -> float | None:
+        """Return the budget for ``channel_id``, or None."""
+        entry = self._projects.get(str(channel_id))
+        if entry is None:
+            return None
+        val = entry.get("budget")
+        return float(val) if val is not None else None
+
+    def clear_budget(self, channel_id: int) -> None:
+        """Remove the budget for ``channel_id`` if present."""
+        key = str(channel_id)
+        entry = self._projects.get(key)
+        if entry is not None and "budget" in entry:
+            del entry["budget"]
+            self._save()
+
+    # ------------------------------------------------------------------
+    # Extra directories
+    # ------------------------------------------------------------------
+    def add_extra_dir(self, channel_id: int, path: str) -> str:
+        """Add an extra directory. Validates and stores. Returns resolved path."""
+        raw_parts = Path(path).expanduser().parts
+        if any(part == ".." for part in raw_parts):
+            raise ValueError("Path may not contain '..' segments.")
+        resolved = Path(path).expanduser().resolve(strict=True)
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory: {path}")
+        try:
+            resolved.relative_to(self.projects_root)
+        except ValueError:
+            raise ValueError(
+                f"Path {resolved} is outside the allowed projects root {self.projects_root}."
+            ) from None
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        dirs = entry.get("extra_dirs", [])
+        resolved_str = str(resolved)
+        if resolved_str not in dirs:
+            dirs.append(resolved_str)
+        entry["extra_dirs"] = dirs
+        self._projects[key] = entry
+        self._save()
+        return resolved_str
+
+    def get_extra_dirs(self, channel_id: int) -> list[str]:
+        """Return extra directories for ``channel_id``."""
+        entry = self._projects.get(str(channel_id), {})
+        return entry.get("extra_dirs", [])
+
+    def remove_extra_dir(self, channel_id: int, path: str) -> bool:
+        """Remove an extra directory. Returns True if removed."""
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        dirs = entry.get("extra_dirs", [])
+        resolved = str(Path(path).expanduser().resolve())
+        if resolved in dirs:
+            dirs.remove(resolved)
+            entry["extra_dirs"] = dirs
+            self._save()
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # MCP servers
+    # ------------------------------------------------------------------
+    def add_mcp_server(self, channel_id: int, name: str, config: dict) -> None:
+        """Add an MCP server configuration for the given channel.
+
+        ``config`` should be a dict matching one of the Claude SDK MCP
+        server config shapes, e.g.
+        ``{"type": "stdio", "command": "npx", "args": [...]}`` or
+        ``{"type": "http", "url": "https://..."}``
+        """
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        mcps = entry.get("mcp_servers", {})
+        mcps[name] = config
+        entry["mcp_servers"] = mcps
+        self._projects[key] = entry
+        self._save()
+
+    def get_mcp_servers(self, channel_id: int) -> dict:
+        """Return all MCP server configs for ``channel_id``."""
+        return self._projects.get(str(channel_id), {}).get("mcp_servers", {})
+
+    def remove_mcp_server(self, channel_id: int, name: str) -> bool:
+        """Remove an MCP server by name. Returns True if it existed."""
+        key = str(channel_id)
+        entry = self._projects.get(key, {})
+        mcps = entry.get("mcp_servers", {})
+        if name in mcps:
+            del mcps[name]
+            entry["mcp_servers"] = mcps
+            self._save()
+            return True
+        return False

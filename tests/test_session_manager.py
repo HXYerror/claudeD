@@ -42,11 +42,42 @@ class _FakeBridge:
 
     instances: list["_FakeBridge"] = []
 
-    def __init__(self, *, project_path: str, config: Config, on_ask_user: Any = None, system_prompt: Any = None, model_override: Any = None, resume_session_id: Any = None) -> None:
+    def __init__(
+        self,
+        *,
+        project_path: str,
+        config: Config,
+        on_ask_user: Any = None,
+        system_prompt: Any = None,
+        model_override: Any = None,
+        resume_session_id: Any = None,
+        effort: Any = None,
+        allowed_tools: Any = None,
+        disallowed_tools: Any = None,
+        max_budget_usd: Any = None,
+        fork_session: Any = False,
+        add_dirs: Any = None,
+        from_pr: Any = None,
+        worktree: Any = None,
+        agent_name: Any = None,
+        custom_agents: Any = None,
+        mcp_servers: Any = None,
+    ) -> None:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
         self.resume_session_id = resume_session_id
+        self.effort = effort
+        self.allowed_tools = allowed_tools
+        self.disallowed_tools = disallowed_tools
+        self.max_budget_usd = max_budget_usd
+        self.fork_session = fork_session
+        self.add_dirs = add_dirs
+        self.from_pr = from_pr
+        self.worktree = worktree
+        self.agent_name = agent_name
+        self.custom_agents = custom_agents
+        self.mcp_servers = mcp_servers
         self.started = False
         self.stopped = False
         _FakeBridge.instances.append(self)
@@ -169,3 +200,104 @@ async def test_stop_session_keeps_lock_when_held(cfg: Config, tmp_path) -> None:
         assert 13 in sm._locks  # type: ignore[attr-defined]
     finally:
         lock.release()
+
+
+# ---------------------------------------------------------------------------
+# create_session with new params
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_effort(cfg: Config, tmp_path) -> None:
+    """create_session passes effort to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(20, "/tmp/p", cfg, effort="high")
+    assert bridge.effort == "high"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_tools(cfg: Config, tmp_path) -> None:
+    """create_session passes allowed/disallowed tools to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(
+        21, "/tmp/p", cfg,
+        allowed_tools=["Bash", "Read"],
+        disallowed_tools=["WebSearch"],
+    )
+    assert bridge.allowed_tools == ["Bash", "Read"]
+    assert bridge.disallowed_tools == ["WebSearch"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_budget(cfg: Config, tmp_path) -> None:
+    """create_session passes max_budget_usd to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(22, "/tmp/p", cfg, max_budget_usd=5.0)
+    assert bridge.max_budget_usd == 5.0
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_fork(cfg: Config, tmp_path) -> None:
+    """create_session passes fork_session to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(
+        23, "/tmp/p", cfg,
+        resume_session_id="sess-abc",
+        fork_session=True,
+    )
+    assert bridge.fork_session is True
+    assert bridge.resume_session_id == "sess-abc"
+
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_add_dirs(cfg: Config, tmp_path) -> None:
+    """create_session passes add_dirs to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(30, "/tmp/p", cfg, add_dirs=["/tmp/extra"])
+    assert bridge.add_dirs == ["/tmp/extra"]
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_from_pr(cfg: Config, tmp_path) -> None:
+    """create_session passes from_pr to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(31, "/tmp/p", cfg, from_pr="123")
+    assert bridge.from_pr == "123"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_worktree(cfg: Config, tmp_path) -> None:
+    """create_session passes worktree to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    bridge = await sm.create_session(32, "/tmp/p", cfg, worktree="feature-branch")
+    assert bridge.worktree == "feature-branch"
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_agent(cfg: Config, tmp_path) -> None:
+    """create_session passes agent_name and custom_agents to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    agents = {"reviewer": {"description": "Code reviewer", "prompt": "Review code carefully"}}
+    bridge = await sm.create_session(
+        40, "/tmp/p", cfg,
+        agent_name="reviewer",
+        custom_agents=agents,
+    )
+    assert bridge.agent_name == "reviewer"
+    assert bridge.custom_agents == agents
+    assert bridge.started
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_mcp_servers(cfg: Config, tmp_path) -> None:
+    """create_session passes mcp_servers to ClaudeBridge."""
+    sm = _make_sm(tmp_path)
+    mcp = {"myserver": {"type": "stdio", "command": "npx", "args": ["-y", "server"]}}
+    bridge = await sm.create_session(41, "/tmp/p", cfg, mcp_servers=mcp)
+    assert bridge.mcp_servers == mcp
+    assert bridge.started

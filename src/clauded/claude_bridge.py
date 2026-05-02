@@ -14,6 +14,7 @@ unconditionally allowed.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -67,6 +68,17 @@ class ClaudeBridge:
         system_prompt: str | None = None,
         model_override: str | None = None,
         resume_session_id: str | None = None,
+        effort: str | None = None,
+        allowed_tools: list[str] | None = None,
+        disallowed_tools: list[str] | None = None,
+        max_budget_usd: float | None = None,
+        fork_session: bool = False,
+        add_dirs: list[str] | None = None,
+        from_pr: str | None = None,
+        worktree: str | None = None,
+        agent_name: str | None = None,
+        custom_agents: dict | None = None,
+        mcp_servers: dict | None = None,
     ) -> None:
         self.project_path = project_path
         self._config = config
@@ -74,6 +86,17 @@ class ClaudeBridge:
         self.system_prompt = system_prompt
         self._model_override = model_override
         self._resume_session_id = resume_session_id
+        self._effort = effort
+        self._allowed_tools = allowed_tools or []
+        self._disallowed_tools = disallowed_tools or []
+        self._max_budget_usd = max_budget_usd
+        self._fork_session = fork_session
+        self._add_dirs = add_dirs
+        self._from_pr = from_pr
+        self._worktree = worktree
+        self._agent_name = agent_name
+        self._custom_agents = custom_agents
+        self._mcp_servers = mcp_servers
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -111,6 +134,24 @@ class ClaudeBridge:
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT
+
+        # Build extra_args for CLI-level flags
+        extra_args: dict[str, str | None] = {}
+        if self._effort:
+            extra_args["effort"] = self._effort
+        if self._max_budget_usd is not None:
+            extra_args["max-budget-usd"] = str(self._max_budget_usd)
+        if self._fork_session:
+            extra_args["fork-session"] = None
+        if self._from_pr:
+            extra_args["from-pr"] = self._from_pr
+        if self._worktree:
+            extra_args["worktree"] = self._worktree
+        if self._custom_agents:
+            extra_args["agents"] = json.dumps(self._custom_agents)
+        if self._agent_name:
+            extra_args["agent"] = self._agent_name
+
         options = ClaudeCodeOptions(
             cwd=self.project_path,
             permission_mode=self._config.claude_permission_mode,
@@ -118,16 +159,22 @@ class ClaudeBridge:
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
             resume=self._resume_session_id,
             append_system_prompt=full_system_prompt,
+            allowed_tools=self._allowed_tools,
+            disallowed_tools=self._disallowed_tools,
+            extra_args=extra_args,
+            add_dirs=self._add_dirs,
+            mcp_servers=self._mcp_servers or {},
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s",
+            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s",
             self.project_path,
             bool(self.on_ask_user),
             self._resume_session_id,
+            self._effort,
         )
 
     async def send_message(self, text: str) -> AsyncIterator[object]:

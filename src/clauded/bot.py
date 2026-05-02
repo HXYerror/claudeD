@@ -27,6 +27,7 @@ from .project_manager import ProjectManager
 from .session_manager import SessionManager
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
+from .agent_manager import AgentManager
 
 log = logging.getLogger("clauded.bot")
 
@@ -76,6 +77,7 @@ class ClaudedBot(commands.Bot):
         self.project_manager = ProjectManager(projects_root=config.projects_root)
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
+        self.agent_manager = AgentManager()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -83,7 +85,13 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
         self.tree.add_command(switch_model)
+        self.tree.add_command(set_effort)
+        self.tree.add_command(tools_group)
+        self.tree.add_command(budget_group)
         self.tree.add_command(health_check)
+        self.tree.add_command(review_pr)
+        self.tree.add_command(agent_group)
+        self.tree.add_command(mcp_group)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -174,12 +182,16 @@ class ClaudedBot(commands.Bot):
             try:
                 handler = InteractionHandler(thread)
                 system_prompt = self.project_manager.get_system_prompt(channel.id)
+                extra_dirs = self.project_manager.get_extra_dirs(channel.id)
+                mcp_servers = self.project_manager.get_mcp_servers(channel.id)
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
                     on_ask_user=handler.handle_ask_user_question,
                     system_prompt=system_prompt,
+                    add_dirs=extra_dirs or None,
+                    mcp_servers=mcp_servers or None,
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
@@ -246,6 +258,8 @@ class ClaudedBot(commands.Bot):
                     resume_id = stored.get("session_id") if stored else None
                     stored_model = stored.get("model") if stored else None
                     stored_prompt = stored.get("system_prompt") if stored else None
+                    extra_dirs = self.project_manager.get_extra_dirs(parent_id)
+                    mcp_servers = self.project_manager.get_mcp_servers(parent_id)
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
@@ -254,6 +268,8 @@ class ClaudedBot(commands.Bot):
                         system_prompt=stored_prompt or system_prompt,
                         model_override=stored_model,
                         resume_session_id=resume_id,
+                        add_dirs=extra_dirs or None,
+                        mcp_servers=mcp_servers or None,
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
@@ -560,6 +576,73 @@ async def project_system_prompt(interaction: discord.Interaction, text: str) -> 
         await interaction.response.send_message("✅ System prompt set", ephemeral=True)
 
 
+@project_group.command(name="add-dir", description="Add extra directory access for Claude")
+@app_commands.describe(path="Path to directory")
+async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
+    log.info("/project add-dir path=%s channel=%s", path, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    if not bot.project_manager.is_bound(channel_id):
+        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+        return
+    try:
+        resolved = bot.project_manager.add_extra_dir(channel_id, path)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title="📂 Extra Directory Added",
+        description=f"Added `{resolved}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@project_group.command(name="dirs", description="List extra directories")
+async def project_dirs(interaction: discord.Interaction) -> None:
+    log.info("/project dirs channel=%s", interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    dirs = bot.project_manager.get_extra_dirs(channel_id)
+    if not dirs:
+        await interaction.response.send_message("No extra directories configured.", ephemeral=True)
+        return
+    listing = "\n".join(f"• `{d}`" for d in dirs)
+    embed = discord.Embed(
+        title="📂 Extra Directories",
+        description=listing,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@project_group.command(name="remove-dir", description="Remove extra directory")
+@app_commands.describe(path="Path to remove")
+async def project_remove_dir(interaction: discord.Interaction, path: str) -> None:
+    log.info("/project remove-dir path=%s channel=%s", path, interaction.channel_id)
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    removed = bot.project_manager.remove_extra_dir(channel_id, path)
+    if removed:
+        embed = discord.Embed(
+            title="📂 Extra Directory Removed",
+            description=f"Removed `{path}`",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message("Directory not found in extra dirs.", ephemeral=True)
+
+
 session_group = app_commands.Group(
     name="session",
     description="Manage Claude sessions inside threads.",
@@ -703,6 +786,125 @@ async def session_list(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@session_group.command(name="compact", description="Compact the current session to save tokens")
+async def session_compact(interaction: discord.Interaction) -> None:
+    """Send /compact to the Claude session to compress context."""
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message("Use this in a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session in this thread.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    try:
+        async for _ in bridge.send_message("/compact"):
+            pass  # consume the response stream
+        embed = discord.Embed(
+            title="🗜️ Context Compacted",
+            description="Session context has been compressed to save tokens.",
+            color=COLOR_INFO,
+        )
+        await interaction.followup.send(embed=embed)
+    except Exception as exc:
+        await interaction.followup.send(f"❌ Failed to compact: `{exc}`", ephemeral=True)
+
+
+@session_group.command(name="fork", description="Fork the current session (new branch from same context)")
+async def session_fork(interaction: discord.Interaction) -> None:
+    """Fork the current session — creates a new session branching from the same conversation."""
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if thread_id is None or parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message("No active session to fork.", ephemeral=True)
+        return
+    old_session_id = bridge.session_id
+    if not old_session_id:
+        await interaction.response.send_message("Session has no ID yet (send a message first).", ephemeral=True)
+        return
+    await interaction.response.defer()
+    project_path = bridge.project_path
+    system_prompt = bridge.system_prompt
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                resume_session_id=old_session_id,
+                fork_session=True,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to fork: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🍴 Session Forked",
+        description=f"New session branched from `{old_session_id[:12]}…`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@session_group.command(name="worktree", description="Create a git worktree for isolated work")
+@app_commands.describe(name="Worktree name (branch name)")
+async def session_worktree(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                worktree=name,
+                add_dirs=extra_dirs or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to create worktree: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🌲 Worktree Created",
+        description=f"Session started with worktree **{name}**.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
 # ---------------------------------------------------------------------------
 # Top-level slash commands
 # ---------------------------------------------------------------------------
@@ -741,6 +943,292 @@ async def switch_model(interaction: discord.Interaction, name: str) -> None:
     await interaction.followup.send(f"🔄 Switched to `{name}`. New session started.")
 
 
+@app_commands.command(name="effort", description="Set Claude's thinking effort level")
+@app_commands.describe(level="Effort: low, medium, high, xhigh, max")
+@app_commands.choices(level=[
+    app_commands.Choice(name="low", value="low"),
+    app_commands.Choice(name="medium", value="medium"),
+    app_commands.Choice(name="high", value="high"),
+    app_commands.Choice(name="xhigh", value="xhigh"),
+    app_commands.Choice(name="max", value="max"),
+])
+async def set_effort(interaction: discord.Interaction, level: app_commands.Choice[str]) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                effort=level.value,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set effort: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🧠 Effort Level Set",
+        description=f"Thinking effort set to **{level.value}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /tools command group
+# ---------------------------------------------------------------------------
+
+tools_group = app_commands.Group(
+    name="tools",
+    description="Control Claude's available tools.",
+)
+
+
+@tools_group.command(name="allow", description="Only allow specific tools")
+@app_commands.describe(tools="Space-separated tool names: Bash Edit Read Write")
+async def tools_allow(interaction: discord.Interaction, tools: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    tool_list = tools.split()
+    if not tool_list:
+        await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                allowed_tools=tool_list,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔧 Allowed Tools Set",
+        description=f"Only these tools are allowed: `{' '.join(tool_list)}`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tools_group.command(name="deny", description="Deny specific tools")
+@app_commands.describe(tools="Space-separated tool names: WebSearch Bash")
+async def tools_deny(interaction: discord.Interaction, tools: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    tool_list = tools.split()
+    if not tool_list:
+        await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                disallowed_tools=tool_list,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🚫 Denied Tools Set",
+        description=f"These tools are denied: `{' '.join(tool_list)}`",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@tools_group.command(name="reset", description="Reset to default tools")
+async def tools_reset(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to reset tools: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="🔧 Tools Reset",
+        description="All tools restored to defaults.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# /budget command group
+# ---------------------------------------------------------------------------
+
+budget_group = app_commands.Group(
+    name="budget",
+    description="Control session spending.",
+)
+
+
+@budget_group.command(name="set", description="Set max budget per session (USD)")
+@app_commands.describe(amount="Maximum USD to spend per session")
+async def budget_set(interaction: discord.Interaction, amount: float) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message("Budget must be positive.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    # Store the budget in the project binding
+    bot.project_manager.set_budget(parent_id, amount)
+    await interaction.response.defer()
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                max_budget_usd=amount,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Failed to set budget: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title="💵 Budget Set",
+        description=f"Max session budget: **${amount:.2f}**. New session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@budget_group.command(name="show", description="Show current budget setting")
+async def budget_show(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
+    budget = bot.project_manager.get_budget(parent_id)
+    if budget is not None:
+        embed = discord.Embed(
+            title="💵 Current Budget",
+            description=f"Max session budget: **${budget:.2f}**",
+            color=COLOR_INFO,
+        )
+    else:
+        embed = discord.Embed(
+            title="💵 Current Budget",
+            description="No budget limit set.",
+            color=COLOR_INFO,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@budget_group.command(name="clear", description="Remove budget limit")
+async def budget_clear(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
+    bot.project_manager.clear_budget(parent_id)
+    embed = discord.Embed(
+        title="💵 Budget Cleared",
+        description="Budget limit removed. Sessions are now unlimited.",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /health
+# ---------------------------------------------------------------------------
+
 @app_commands.command(name="health", description="Show bot health and status")
 async def health_check(interaction: discord.Interaction) -> None:
     bot = interaction.client
@@ -776,6 +1264,301 @@ async def health_check(interaction: discord.Interaction) -> None:
     embed.add_field(name="Python", value=sys.version.split()[0], inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# /review command
+# ---------------------------------------------------------------------------
+
+@app_commands.command(name="review", description="Start a PR review session")
+@app_commands.describe(pr="PR number or URL")
+async def review_pr(interaction: discord.Interaction, pr: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    channel = interaction.channel
+    # Must be in a bound channel (or its thread)
+    parent_id = getattr(channel, "parent_id", None) or channel.id
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Channel not bound", color=COLOR_TOOL_FAILURE)
+        )
+        return
+    # Create thread for the review
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Use this in a text channel", color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
+    try:
+        thread = await channel.create_thread(
+            name=f"PR Review: {pr}"[:100], type=discord.ChannelType.public_thread
+        )
+    except discord.Forbidden:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Missing permission to create threads", color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
+    except discord.HTTPException as exc:
+        await interaction.followup.send(
+            embed=discord.Embed(title="❌ Failed to create thread", description=str(exc)[:500], color=COLOR_TOOL_FAILURE),
+            ephemeral=True
+        )
+        return
+    # Create session with from-pr flag
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    handler = InteractionHandler(thread)
+    lock = bot.session_manager.get_lock(thread.id)
+    async with lock:
+        try:
+            bridge = await bot.session_manager.create_session(
+                thread.id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                from_pr=pr,
+                add_dirs=extra_dirs or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Error",
+                    description=f"```\n{str(exc)[:500]}\n```",
+                    color=COLOR_TOOL_FAILURE,
+                )
+            )
+            return
+    embed = discord.Embed(
+        title="📋 PR Review started",
+        description=f"See thread: {thread.mention}",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+
+# ---------------------------------------------------------------------------
+# /agent command group
+# ---------------------------------------------------------------------------
+
+agent_group = app_commands.Group(
+    name="agent",
+    description="Manage custom Claude agents.",
+)
+
+
+@agent_group.command(name="create", description="Create a custom agent")
+@app_commands.describe(name="Agent name", prompt="Agent system prompt", description="Optional description")
+async def agent_create(
+    interaction: discord.Interaction, name: str, prompt: str, description: str = ""
+) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bot.agent_manager.create(name, prompt, description)
+    embed = discord.Embed(
+        title=f"\u2705 Agent `{name}` created",
+        description=f"Prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@agent_group.command(name="list", description="List available agents")
+async def agent_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    agents = bot.agent_manager.list_all()
+    if not agents:
+        await interaction.response.send_message("No custom agents defined. Use `/agent create`.", ephemeral=True)
+        return
+    embed = discord.Embed(title="\U0001f916 Custom Agents", color=COLOR_INFO)
+    for aname, ainfo in agents.items():
+        desc = ainfo.get("description", "")
+        prompt_preview = ainfo.get("prompt", "")[:100]
+        embed.add_field(
+            name=aname,
+            value=f"{desc}\n`{prompt_preview}{'…' if len(ainfo.get('prompt', '')) > 100 else ''}`",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@agent_group.command(name="use", description="Use a custom agent in this thread")
+@app_commands.describe(name="Agent name")
+async def agent_use(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    thread_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None)
+    if parent_id is None:
+        await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
+        return
+    agent = bot.agent_manager.get(name)
+    if not agent:
+        await interaction.response.send_message(f"\u274c Agent `{name}` not found.", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message("Parent channel not bound.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    agents_json = {name: {"description": agent["description"], "prompt": agent["prompt"]}}
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(parent_id)
+    mcp_servers = bot.project_manager.get_mcp_servers(parent_id)
+    channel = interaction.channel
+    handler = InteractionHandler(channel)
+    lock = bot.session_manager.get_lock(thread_id)
+    async with lock:
+        await bot.session_manager.stop_session(thread_id)
+        try:
+            await bot.session_manager.create_session(
+                thread_id, project_path, bot.config,
+                system_prompt=system_prompt,
+                on_ask_user=handler.handle_ask_user_question,
+                agent_name=name,
+                custom_agents=agents_json,
+                add_dirs=extra_dirs or None,
+                mcp_servers=mcp_servers or None,
+            )
+        except Exception as exc:
+            await interaction.followup.send(f"\u274c Failed to use agent: `{exc}`", ephemeral=True)
+            return
+    embed = discord.Embed(
+        title=f"\U0001f916 Agent `{name}` activated",
+        description=f"{agent['description']}\nNew session started.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed)
+
+
+@agent_group.command(name="delete", description="Delete a custom agent")
+@app_commands.describe(name="Agent name")
+async def agent_delete(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if bot.agent_manager.delete(name):
+        embed = discord.Embed(
+            title=f"\U0001f5d1\ufe0f Agent `{name}` deleted",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"\u274c Agent `{name}` not found.", ephemeral=True
+        )
+
+
+# ---------------------------------------------------------------------------
+# /mcp command group
+# ---------------------------------------------------------------------------
+
+mcp_group = app_commands.Group(
+    name="mcp",
+    description="Manage MCP servers for Claude.",
+    default_permissions=discord.Permissions(administrator=True),
+)
+
+
+@mcp_group.command(name="add", description="Add a stdio MCP server")
+@app_commands.describe(name="Server name", command="Command to run", args="Space-separated arguments")
+async def mcp_add(
+    interaction: discord.Interaction, name: str, command: str, args: str = ""
+) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    config: dict = {"type": "stdio", "command": command}
+    if args:
+        config["args"] = args.split()
+    bot.project_manager.add_mcp_server(parent_id, name, config)
+    embed = discord.Embed(
+        title=f"\u2705 MCP server `{name}` added",
+        description=f"Type: stdio\nCommand: `{command}`" + (f"\nArgs: `{args}`" if args else ""),
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="add-url", description="Add an HTTP MCP server")
+@app_commands.describe(name="Server name", url="Server URL")
+async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    config: dict = {"type": "http", "url": url}
+    bot.project_manager.add_mcp_server(parent_id, name, config)
+    embed = discord.Embed(
+        title=f"\u2705 MCP server `{name}` added",
+        description=f"Type: http\nURL: `{url}`",
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="list", description="List configured MCP servers")
+async def mcp_list(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    servers = bot.project_manager.get_mcp_servers(parent_id)
+    if not servers:
+        await interaction.response.send_message("No MCP servers configured.", ephemeral=True)
+        return
+    embed = discord.Embed(title="\U0001f50c MCP Servers", color=COLOR_INFO)
+    for sname, sconfig in servers.items():
+        stype = sconfig.get("type", "stdio")
+        if stype == "http":
+            detail = f"URL: `{sconfig.get('url', 'N/A')}`"
+        else:
+            cmd = sconfig.get("command", "?")
+            sargs = " ".join(sconfig.get("args", []))
+            detail = f"Command: `{cmd}`" + (f"\nArgs: `{sargs}`" if sargs else "")
+        embed.add_field(name=f"{sname} ({stype})", value=detail, inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(name="remove", description="Remove an MCP server")
+@app_commands.describe(name="Server name")
+async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    channel_id = interaction.channel_id
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    if bot.project_manager.remove_mcp_server(parent_id, name):
+        embed = discord.Embed(
+            title=f"\u2705 MCP server `{name}` removed",
+            color=COLOR_INFO,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(
+            f"\u274c MCP server `{name}` not found.", ephemeral=True
+        )
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -834,6 +1617,7 @@ def main() -> None:
         bot2.project_manager = bot.project_manager
         bot2.session_manager = bot.session_manager
         bot2.cost_tracker = bot.cost_tracker
+        bot2.agent_manager = bot.agent_manager
         bot2._start_time = bot._start_time
         bot2.run(config.discord_bot_token, log_handler=None)
 
