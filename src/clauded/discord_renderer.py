@@ -39,6 +39,7 @@ from .claude_bridge import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from claude_code_sdk.types import StreamEvent
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -123,6 +124,38 @@ class DiscordRenderer:
                         'model': getattr(event, 'model', '') or '',
                     }
                     break
+
+                # -------------------------------------------------------
+                # Feature #61: handle StreamEvent for partial messages
+                # -------------------------------------------------------
+                if isinstance(event, StreamEvent):
+                    ev = event.event
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                saw_text = True
+                                buffer += text
+
+                                now = time.time()
+                                if start_time is None:
+                                    start_time = now
+
+                                # Enter typewriter mode once streaming long enough.
+                                if not typewriter and (now - start_time) > FAST_PATH_SECONDS:
+                                    typewriter = True
+                                    live_msg, buffer = await self._typewriter_tick(
+                                        live_msg, buffer
+                                    )
+                                    last_edit = now
+                                elif typewriter and (now - last_edit) >= EDIT_INTERVAL_SECONDS:
+                                    live_msg, buffer = await self._typewriter_tick(
+                                        live_msg, buffer
+                                    )
+                                    last_edit = now
+                    # StreamEvent handled — skip the content-list branch
+                    continue
 
                 if isinstance(content, list):
                     for block in content:

@@ -187,11 +187,18 @@ class ClaudedBot(commands.Bot):
                 system_prompt = self.project_manager.get_system_prompt(channel.id)
                 extra_dirs = self.project_manager.get_extra_dirs(channel.id)
                 mcp_servers = self.project_manager.get_mcp_servers(channel.id)
+                async def _pre_tool_notify(tool_name: str, input_data: dict) -> None:
+                    try:
+                        await thread.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
+                    except Exception:
+                        pass  # best-effort; don't break the stream
+
                 bridge = await self.session_manager.create_session(
                     thread.id,
                     project_path,
                     self.config,
                     on_ask_user=handler.handle_ask_user_question,
+                    on_pre_tool_use=_pre_tool_notify,
                     system_prompt=system_prompt,
                     add_dirs=extra_dirs or None,
                     mcp_servers=mcp_servers or None,
@@ -263,11 +270,20 @@ class ClaudedBot(commands.Bot):
                     stored_prompt = stored.get("system_prompt") if stored else None
                     extra_dirs = self.project_manager.get_extra_dirs(parent_id)
                     mcp_servers = self.project_manager.get_mcp_servers(parent_id)
+                    _thread_target = message.channel
+
+                    async def _pre_tool_notify_thread(tool_name: str, input_data: dict) -> None:
+                        try:
+                            await _thread_target.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
+                        except Exception:
+                            pass  # best-effort; don't break the stream
+
                     bridge = await self.session_manager.create_session(
                         thread_id,
                         project_path,
                         self.config,
                         on_ask_user=handler.handle_ask_user_question,
+                        on_pre_tool_use=_pre_tool_notify_thread,
                         system_prompt=stored_prompt or system_prompt,
                         model_override=stored_model,
                         resume_session_id=resume_id,

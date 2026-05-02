@@ -48,6 +48,7 @@ class _FakeBridge:
         project_path: str,
         config: Config,
         on_ask_user: Any = None,
+        on_pre_tool_use: Any = None,
         system_prompt: Any = None,
         model_override: Any = None,
         resume_session_id: Any = None,
@@ -70,6 +71,7 @@ class _FakeBridge:
         self.project_path = project_path
         self.config = config
         self.on_ask_user = on_ask_user
+        self.on_pre_tool_use = on_pre_tool_use
         self.resume_session_id = resume_session_id
         self.effort = effort
         self.allowed_tools = allowed_tools
