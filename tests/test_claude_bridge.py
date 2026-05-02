@@ -20,6 +20,7 @@ from claude_code_sdk import ResultMessage
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.config import Config
+from clauded.session_config import SessionConfig
 
 
 # ---------------------------------------------------------------------------
@@ -155,3 +156,33 @@ async def test_result_message_updates_stats(
     assert bridge.total_cost == pytest.approx(0.1234)
     assert bridge.num_turns == 4
     assert bridge.model == "claude-sonnet-4-5"
+
+
+# ---------------------------------------------------------------------------
+# SessionConfig integration
+# ---------------------------------------------------------------------------
+
+
+def test_bridge_accepts_session_config(cfg: Config) -> None:
+    """ClaudeBridge can be constructed with a SessionConfig."""
+    sc = SessionConfig(
+        system_prompt="Be concise",
+        model_override="opus",
+        effort="high",
+        max_budget_usd=10.0,
+        user="testuser",
+    )
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    assert bridge.system_prompt == "Be concise"
+    assert bridge.model == "opus"
+    assert bridge._effort == "high"
+    assert bridge._max_budget_usd == 10.0
+    assert bridge._user == "testuser"
+
+
+def test_bridge_default_session_config(cfg: Config) -> None:
+    """ClaudeBridge uses default SessionConfig when none is provided."""
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+    assert bridge.system_prompt is None
+    assert bridge._effort is None
+    assert bridge._user is None

@@ -43,6 +43,7 @@ from claude_code_sdk.types import (
 )
 
 from .config import Config
+from .session_config import SessionConfig
 
 log = logging.getLogger("clauded.claude_bridge")
 
@@ -84,57 +85,40 @@ class ClaudeBridge:
         self,
         project_path: str,
         config: Config,
-        on_ask_user: OnAskUser | None = None,
-        on_pre_tool_use: OnPreToolUse | None = None,
-        on_post_tool_use: OnPostToolUse | None = None,
-        on_stop: OnStop | None = None,
-        system_prompt: str | None = None,
-        env: dict[str, str] | None = None,
-        model_override: str | None = None,
-        resume_session_id: str | None = None,
-        effort: str | None = None,
-        allowed_tools: list[str] | None = None,
-        disallowed_tools: list[str] | None = None,
-        max_budget_usd: float | None = None,
-        fork_session: bool = False,
-        add_dirs: list[str] | None = None,
-        from_pr: str | None = None,
-        worktree: str | None = None,
-        agent_name: str | None = None,
-        custom_agents: dict | None = None,
-        mcp_servers: dict | None = None,
-        max_turns: int | None = None,
-        fallback_model: str | None = None,
-        plugin_dirs: list[str] | None = None,
-        settings: str | None = None,
+        session_config: SessionConfig | None = None,
     ) -> None:
+        sc = session_config or SessionConfig()
         self.project_path = project_path
         self._config = config
-        self.on_ask_user = on_ask_user
-        self._on_pre_tool_use = on_pre_tool_use
-        self._on_post_tool_use = on_post_tool_use
-        self._on_stop = on_stop
-        self.system_prompt = system_prompt
-        self._env = env
+        self._session_config = sc
+        self.on_ask_user = sc.on_ask_user
+        self._on_pre_tool_use = sc.on_pre_tool_use
+        self._on_post_tool_use = sc.on_post_tool_use
+        self._on_stop = sc.on_stop
+        self.system_prompt = sc.system_prompt
+        self._env = sc.env
         self._last_activity = time.time()
         self._start_time = time.time()
-        self._model_override = model_override
-        self._resume_session_id = resume_session_id
-        self._effort = effort
-        self._allowed_tools = allowed_tools or []
-        self._disallowed_tools = disallowed_tools or []
-        self._max_budget_usd = max_budget_usd
-        self._fork_session = fork_session
-        self._add_dirs = add_dirs
-        self._from_pr = from_pr
-        self._worktree = worktree
-        self._agent_name = agent_name
-        self._custom_agents = custom_agents
-        self._mcp_servers = mcp_servers
-        self._max_turns = max_turns
-        self._fallback_model = fallback_model
-        self._plugin_dirs = plugin_dirs or []
-        self._settings = settings
+        self._model_override = sc.model_override
+        self._resume_session_id = sc.resume_session_id
+        self._effort = sc.effort
+        self._allowed_tools = list(sc.allowed_tools) if sc.allowed_tools else []
+        self._disallowed_tools = list(sc.disallowed_tools) if sc.disallowed_tools else []
+        self._max_budget_usd = sc.max_budget_usd
+        self._fork_session = sc.fork_session
+        self._add_dirs = sc.add_dirs
+        self._from_pr = sc.from_pr
+        self._worktree = sc.worktree
+        self._agent_name = sc.agent_name
+        self._custom_agents = sc.custom_agents
+        self._mcp_servers = sc.mcp_servers
+        self._max_turns = sc.max_turns
+        self._fallback_model = sc.fallback_model
+        self._plugin_dirs = list(sc.plugin_dirs) if sc.plugin_dirs else []
+        self._settings = sc.settings
+        self._user = sc.user
+        self._bare = sc.bare
+        self._session_name = sc.session_name
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
@@ -194,6 +178,10 @@ class ClaudeBridge:
         if self._plugin_dirs:
             # Pass the first plugin dir; CLI supports --plugin-dir
             extra_args["plugin-dir"] = self._plugin_dirs[0]
+        if self._bare:
+            extra_args["bare"] = None
+        if self._session_name:
+            extra_args["name"] = self._session_name
 
         # ------------------------------------------------------------------
         # Feature #60: PreToolUse hook for early notification
@@ -273,13 +261,14 @@ class ClaudeBridge:
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
             settings=self._settings,
+            user=self._user,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s env=%s",
+            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s env=%s user=%s",
             self.project_path,
             bool(self.on_ask_user),
             self._resume_session_id,
@@ -287,6 +276,7 @@ class ClaudeBridge:
             bool(hooks),
             True,
             bool(self._env),
+            self._user,
         )
 
     async def send_message(self, text: str) -> AsyncIterator[object]:
@@ -307,17 +297,14 @@ class ClaudeBridge:
 
         try:
             await self._client.query(text)
+
             async for msg in self._client.receive_response():
-                # Update session stats opportunistically — ResultMessage
-                # carries the per-turn totals from the SDK.
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
                 yield msg
-        except Exception:
-            log.exception("Claude SDK stream failed; marking bridge inactive")
+        except BaseException:
             self._active = False
-            # Best-effort: tear down the underlying client so we don't leak
-            # a half-broken connection. Swallow disconnect errors — the
+            # Best-effort disconnect; if it fails, we still re-raise the
             # original exception is what callers care about.
             client = self._client
             self._client = None

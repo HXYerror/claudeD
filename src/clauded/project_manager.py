@@ -33,7 +33,9 @@ class ProjectManager:
         self.projects_root: Path = Path(root).expanduser().resolve()
         self._path = Path(self.path)
         self._projects: Dict[str, Dict[str, str]] = {}
+        self._guild_roots: Dict[str, str] = {}
         self._load()
+        self._load_guild_roots()
 
     # ------------------------------------------------------------------
     # Persistence
@@ -64,7 +66,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def bind(self, channel_id: int, path: str) -> str:
+    def bind(self, channel_id: int, path: str, *, guild_id: int | None = None) -> str:
         """Bind ``channel_id`` to ``path``.
 
         Expands ``~``, fully resolves symlinks, and validates that the
@@ -100,12 +102,13 @@ class ProjectManager:
 
         # Confirm the resolved (symlink-followed) path stays under the
         # configured root. ``Path.is_relative_to`` is available in 3.9+.
+        effective_root = self.get_guild_root(guild_id)
         try:
-            resolved.relative_to(self.projects_root)
+            resolved.relative_to(effective_root)
         except ValueError as exc:
             raise ValueError(
                 f"Path {resolved} is outside the allowed projects root "
-                f"{self.projects_root}."
+                f"{effective_root}."
             ) from exc
 
         expanded = str(resolved)
@@ -126,7 +129,9 @@ class ProjectManager:
     def get_project(self, channel_id: int) -> str | None:
         """Return the bound path for ``channel_id``, or None if unbound."""
         entry = self._projects.get(str(channel_id))
-        return entry["path"] if entry else None
+        if not entry:
+            return None
+        return entry.get("path")
 
     # Alias used by callers that prefer the "path" terminology.
     def get_path(self, channel_id: int) -> str | None:
@@ -304,3 +309,76 @@ class ProjectManager:
             self._save()
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Channel mode (thread vs forum) — #87
+    # ------------------------------------------------------------------
+    def set_channel_mode(self, channel_id: int, mode: str) -> None:
+        """Set channel mode: 'thread' (default) or 'forum'."""
+        if mode not in ("thread", "forum"):
+            raise ValueError(f"Invalid mode: {mode!r}. Must be 'thread' or 'forum'.")
+        key = str(channel_id)
+        entry = self._projects.setdefault(key, {})
+        entry["channel_mode"] = mode
+        self._save()
+
+    def get_channel_mode(self, channel_id: int) -> str:
+        """Return the channel mode ('thread' or 'forum') for ``channel_id``."""
+        return self._projects.get(str(channel_id), {}).get("channel_mode", "thread")
+
+    # ------------------------------------------------------------------
+    # Per-guild project root — #91
+    # ------------------------------------------------------------------
+    def set_guild_root(self, guild_id: int, path: str) -> str:
+        """Set a per-guild projects root directory.
+
+        Validates that the path exists and is a directory. Stores the
+        mapping in ``guild_roots.json`` alongside ``projects.json``.
+        Returns the resolved absolute path.
+
+        Raises:
+            ValueError: if ``path`` is not an existing directory.
+        """
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(f"Not a directory: {path}")
+        self._guild_roots[str(guild_id)] = str(resolved)
+        self._save_guild_roots()
+        return str(resolved)
+
+    def get_guild_root(self, guild_id: int | None) -> Path:
+        """Return the projects root for a guild, falling back to the default."""
+        if guild_id is not None:
+            custom = self._guild_roots.get(str(guild_id))
+            if custom:
+                return Path(custom).resolve()
+        return self.projects_root
+
+    def clear_guild_root(self, guild_id: int) -> bool:
+        """Remove a per-guild root override. Returns True if one existed."""
+        if self._guild_roots.pop(str(guild_id), None) is not None:
+            self._save_guild_roots()
+            return True
+        return False
+
+    def _load_guild_roots(self) -> None:
+        p = os.path.join(self.data_dir, "guild_roots.json")
+        if not os.path.isfile(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._guild_roots = data
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Failed to load guild_roots.json: %s", exc)
+
+    def _save_guild_roots(self) -> None:
+        os.makedirs(self.data_dir, exist_ok=True)
+        p = Path(self.data_dir) / "guild_roots.json"
+        tmp = p.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self._guild_roots, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)

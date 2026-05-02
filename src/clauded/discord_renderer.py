@@ -231,7 +231,8 @@ class DiscordRenderer:
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:300]
                                 prompt = block.input.get("prompt", "")[:500]
-                                indent = "│ " * (task_depth - 1) + "├─"
+                                display_depth = min(task_depth, 10)
+                                indent = "│ " * (display_depth - 1) + "├─"
                                 task_embed = discord.Embed(
                                     title=f"{indent} 🔀 Subtask #{task_depth}",
                                     description=desc,

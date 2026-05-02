@@ -1,7 +1,7 @@
 """Tests for Feature #60 (PreToolUse hooks) and Feature #61 (partial messages).
 
 These tests verify:
-1. ClaudeBridge accepts and wires up on_pre_tool_use callback
+1. ClaudeBridge accepts and wires up on_pre_tool_use callback via SessionConfig
 2. The hooks dict is built correctly when on_pre_tool_use is set
 3. include_partial_messages is always True on options
 4. StreamEvent text deltas are accumulated into the renderer buffer
@@ -19,6 +19,7 @@ from claude_code_sdk.types import StreamEvent
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.config import Config
+from clauded.session_config import SessionConfig
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +60,8 @@ async def _async_iter(items: list[Any]):
 async def test_bridge_stores_on_pre_tool_use(cfg: Config) -> None:
     """ClaudeBridge.__init__ stores the on_pre_tool_use callback."""
     cb = AsyncMock()
-    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_pre_tool_use=cb)
+    sc = SessionConfig(on_pre_tool_use=cb)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     assert bridge._on_pre_tool_use is cb
 
 
@@ -79,7 +81,8 @@ async def test_bridge_start_builds_hooks_when_callback_set(
 
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
 
-    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_pre_tool_use=cb)
+    sc = SessionConfig(on_pre_tool_use=cb)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     await bridge.start()
 
     assert len(captured_options) == 1
@@ -131,7 +134,8 @@ async def test_pre_tool_hook_invokes_callback(
 
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
 
-    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_pre_tool_use=cb)
+    sc = SessionConfig(on_pre_tool_use=cb)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     await bridge.start()
 
     # Extract the registered hook function and call it directly
@@ -165,7 +169,8 @@ async def test_pre_tool_hook_defaults_to_unknown_tool(
 
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
 
-    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_pre_tool_use=_capture)
+    sc = SessionConfig(on_pre_tool_use=_capture)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     await bridge.start()
 
     hook_fn = captured_hooks[0]["PreToolUse"][0].hooks[0]
@@ -194,7 +199,8 @@ async def test_pre_tool_hook_swallows_callback_errors(
 
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
 
-    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, on_pre_tool_use=_explode)
+    sc = SessionConfig(on_pre_tool_use=_explode)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     await bridge.start()
 
     hook_fn = captured_hooks[0]["PreToolUse"][0].hooks[0]
@@ -266,7 +272,7 @@ async def test_stream_event_yielded_from_send_message(
 
 
 # ---------------------------------------------------------------------------
-# SessionManager passes on_pre_tool_use through
+# SessionManager passes on_pre_tool_use through via SessionConfig
 # ---------------------------------------------------------------------------
 
 
@@ -303,7 +309,94 @@ async def test_session_manager_passes_on_pre_tool_use(
 
     sm = SessionManager(session_store=SessionStore(data_dir=str(tmp_path / "store")))
     cb = AsyncMock()
-    await sm.create_session(99, "/tmp/p", cfg, on_pre_tool_use=cb)
+    sc = SessionConfig(on_pre_tool_use=cb)
+    await sm.create_session(99, "/tmp/p", cfg, sc)
 
     assert len(captured_kwargs) == 1
-    assert captured_kwargs[0]["on_pre_tool_use"] is cb
+    assert captured_kwargs[0]["session_config"] is sc
+    assert sc.on_pre_tool_use is cb
+
+
+# ---------------------------------------------------------------------------
+# Feature #92: User passed to ClaudeCodeOptions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_passes_user_to_options(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When user is set in SessionConfig, start() passes it to ClaudeCodeOptions."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(user="alice#1234")
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert opts.user == "alice#1234"
+
+
+# ---------------------------------------------------------------------------
+# Feature #94: Bare mode sets extra_args
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_bare_mode_extra_args(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When bare=True in SessionConfig, start() adds 'bare' to extra_args."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(bare=True)
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert "bare" in opts.extra_args
+    assert opts.extra_args["bare"] is None
+
+
+# ---------------------------------------------------------------------------
+# Feature #95: Session name sets extra_args
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bridge_session_name_extra_args(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """When session_name is set in SessionConfig, start() adds 'name' to extra_args."""
+    captured_options: list[ClaudeCodeOptions] = []
+
+    def _capture_client(options=None):
+        captured_options.append(options)
+        client = AsyncMock()
+        client.connect = AsyncMock()
+        return client
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", _capture_client)
+
+    sc = SessionConfig(session_name="my-session")
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
+    await bridge.start()
+
+    opts = captured_options[0]
+    assert opts.extra_args.get("name") == "my-session"
