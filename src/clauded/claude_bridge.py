@@ -343,6 +343,13 @@ class ClaudeBridge:
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
                 yield msg
+        except GeneratorExit:
+            # Caller broke out of the async-for loop. DON'T try to
+            # disconnect here — the SDK's anyio TaskGroup can't be
+            # closed from a different task, which causes a crash.
+            # The session stays active for future messages.  If cleanup
+            # is needed, the caller should explicitly call bridge.stop().
+            return
         except BaseException:
             self._active = False
             # Best-effort disconnect; if it fails, we still re-raise the

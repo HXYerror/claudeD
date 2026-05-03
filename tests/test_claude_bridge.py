@@ -186,3 +186,45 @@ def test_bridge_default_session_config(cfg: Config) -> None:
     assert bridge.system_prompt is None
     assert bridge._effort is None
     assert bridge._user is None
+
+
+# ---------------------------------------------------------------------------
+# GeneratorExit handling (Limitation 1 fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_message_generator_exit_keeps_session_active(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """Breaking out of the async-for loop must NOT disconnect or deactivate."""
+    rm = ResultMessage(
+        subtype="success",
+        duration_ms=10,
+        duration_api_ms=5,
+        is_error=False,
+        num_turns=1,
+        session_id="sess-ge",
+        total_cost_usd=0.01,
+    )
+
+    async def _many_messages():
+        yield rm
+        yield rm  # second message — caller will break before consuming this
+
+    client = _make_client(_many_messages)
+    monkeypatch.setattr(
+        "clauded.claude_bridge.ClaudeSDKClient", lambda options=None: client
+    )
+
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+    await bridge.start()
+    assert bridge.is_active is True
+
+    # Break out of the loop after the first message
+    async for msg in bridge.send_message("hi"):
+        break
+
+    # Session must still be active and client must NOT have been disconnected
+    assert bridge.is_active is True
+    client.disconnect.assert_not_awaited()
