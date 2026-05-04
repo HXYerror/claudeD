@@ -373,7 +373,7 @@ class DiscordRenderer:
 
                             # --- Special tool display: Task subtask (#55, #74) ---
                             # Creates a separate Discord thread for each sub-agent
-                            if name == "Task":
+                            if name in ("Task", "Agent"):
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:300]
                                 prompt = block.input.get("prompt", "")[:500]
@@ -439,7 +439,7 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: TaskOutput (#74) ---
-                            if name == "TaskOutput":
+                            if name in ("TaskOutput", "AgentOutput"):
                                 output = block.input.get("output", "")[:500]
                                 task_out_embed = discord.Embed(
                                     title="📤 Subtask Output",
@@ -452,7 +452,7 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: TaskStop (#74) ---
-                            if name == "TaskStop":
+                            if name in ("TaskStop", "AgentStop"):
                                 task_depth = max(0, task_depth - 1)
                                 task_stop_embed = discord.Embed(
                                     title="⏹️ Subtask Stopped",
@@ -650,7 +650,7 @@ class DiscordRenderer:
                             tool_id = getattr(block, "tool_use_id", None)
                             # --- Task result display (#55, #74) ---
                             result_name = tool_names.get(tool_id, "") if tool_id else ""
-                            if result_name == "Task":
+                            if result_name in ("Task", "Agent"):
                                 task_depth = max(0, task_depth - 1)
                                 content_str = str(block.content)[:500] if block.content else ""
                                 is_err = bool(getattr(block, "is_error", False))
