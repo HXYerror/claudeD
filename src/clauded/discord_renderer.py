@@ -87,6 +87,69 @@ _THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
 _CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
 
 
+
+class _SubagentDetailView(discord.ui.View):
+    """View with buttons to expand sub-agent details or jump to thread."""
+
+    def __init__(self, sub_thread: discord.Thread, *, timeout: float = 300, guild_id: int | None = None):
+        super().__init__(timeout=timeout)
+        self._sub_thread = sub_thread
+        self._expanded = False
+
+        # Add link button for thread jump (opens directly in Discord)
+        if guild_id:
+            url = f"https://discord.com/channels/{guild_id}/{sub_thread.id}"
+            self.add_item(discord.ui.Button(
+                label="🔗 跳转 Thread",
+                style=discord.ButtonStyle.link,
+                url=url,
+            ))
+
+    @discord.ui.button(label="📋 展开详情", style=discord.ButtonStyle.secondary)
+    async def expand_details(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self._expanded:
+            await interaction.response.send_message("Already expanded.", ephemeral=True)
+            return
+        self._expanded = True
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        # Fetch messages from sub-thread and post them in the main thread
+        try:
+            messages = []
+            async for msg in self._sub_thread.history(limit=50, oldest_first=True):
+                messages.append(msg)
+
+            if not messages:
+                await interaction.followup.send("No messages in sub-thread.", ephemeral=True)
+                return
+
+            # Build a summary of the sub-agent's interaction
+            lines = []
+            for msg in messages:
+                if msg.embeds:
+                    for embed in msg.embeds:
+                        title = embed.title or ""
+                        desc = (embed.description or "")[:200]
+                        lines.append(f"**{title}** {desc}")
+                elif msg.content:
+                    lines.append(msg.content[:200])
+
+            detail_text = "\n".join(lines)
+
+            # Send as embed(s) in main thread — split if needed
+            chunks = [detail_text[i:i+4000] for i in range(0, len(detail_text), 4000)]
+            for i, chunk in enumerate(chunks[:3]):  # max 3 embeds
+                embed = discord.Embed(
+                    title=f"📋 Sub-agent Details" + (f" ({i+1})" if len(chunks) > 1 else ""),
+                    description=chunk,
+                    color=COLOR_INFO,
+                )
+                await interaction.followup.send(embed=embed)
+        except Exception as e:
+            await interaction.followup.send(f"Failed to fetch details: {e}", ephemeral=True)
+
+
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
 
@@ -404,12 +467,14 @@ class DiscordRenderer:
                                         subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
 
                                     # In the main thread, show compact summary with link
+                                    _guild_id = getattr(self.target, 'guild', None) and self.target.guild.id
+                                    _view = _SubagentDetailView(sub_thread, guild_id=_guild_id)
                                     summary_embed = discord.Embed(
                                         title=f"🔀 Subtask #{task_depth}",
                                         description=f"{desc}\n\n📎 Details: {sub_thread.mention}",
                                         color=COLOR_INFO,
                                     )
-                                    tmsg = await self._safe_send(embed=summary_embed)
+                                    tmsg = await self._safe_send(embed=summary_embed, view=_view)
                                     if tmsg and tool_id:
                                         tool_msgs[tool_id] = tmsg
 
@@ -680,12 +745,14 @@ class DiscordRenderer:
 
                                     # Update main thread summary
                                     if tool_id in tool_msgs:
+                                        _guild_id = getattr(self.target, 'guild', None) and self.target.guild.id
+                                        _view = _SubagentDetailView(sub_thread, guild_id=_guild_id)
                                         summary_embed = discord.Embed(
                                             title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
                                             description=f"📎 Details: {sub_thread.mention}",
                                             color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
                                         )
-                                        await self._safe_edit(tool_msgs[tool_id], embed=summary_embed)
+                                        await self._safe_edit(tool_msgs[tool_id], embed=summary_embed, view=_view)
                                     continue
 
                                 # Fallback: inline display (no sub-thread was created)
@@ -956,9 +1023,10 @@ class DiscordRenderer:
         *,
         embed: discord.Embed | None = None,
         file: discord.File | None = None,
+        view: discord.ui.View | None = None,
     ) -> discord.Message | None:
         """Send a message, swallowing transient HTTP errors with a short backoff."""
-        if not content and embed is None and file is None:
+        if not content and embed is None and file is None and view is None:
             return None
 
         kwargs: dict = {}
@@ -968,6 +1036,8 @@ class DiscordRenderer:
             kwargs["embed"] = embed
         if file is not None:
             kwargs["file"] = file
+        if view is not None:
+            kwargs["view"] = view
 
         try:
             msg = await self.target.send(**kwargs)
@@ -1001,6 +1071,7 @@ class DiscordRenderer:
         content: str | None = None,
         *,
         embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
     ) -> None:
         """Edit a message, swallowing transient HTTP errors."""
         kwargs: dict = {}
@@ -1008,6 +1079,8 @@ class DiscordRenderer:
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
         if not kwargs:
             return
 
@@ -1212,6 +1285,7 @@ class RetryView(discord.ui.View):
 __all__ = [
     "DiscordRenderer",
     "RetryView",
+    "_SubagentDetailView",
     "COLOR_CLAUDE",
     "COLOR_TOOL_RUNNING",
     "COLOR_TOOL_SUCCESS",
