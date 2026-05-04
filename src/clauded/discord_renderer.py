@@ -17,6 +17,11 @@ writes it to a Discord channel/thread with three behaviors:
 The renderer also smart-splits text on paragraph → line → space boundaries
 and protects unclosed ``` code fences by closing-and-reopening them across
 chunk boundaries.
+
+Sub-agent threads: when Claude spawns a sub-agent via the ``Task`` tool,
+a separate Discord thread is created for that sub-agent's full interaction.
+The main thread shows a compact summary with a link to the sub-thread.
+Messages are routed to sub-threads based on ``parent_tool_use_id``.
 """
 
 from __future__ import annotations
@@ -90,6 +95,49 @@ class DiscordRenderer:
         self._last_msg: discord.Message | None = None
 
     # ------------------------------------------------------------------
+    # Helper: build a tool embed from a ToolUseBlock
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_tool_embed(block: ToolUseBlock) -> discord.Embed:
+        """Build a colored embed summarizing a tool invocation."""
+        name = getattr(block, "name", "tool") or "tool"
+        if name == "Bash":
+            cmd = block.input.get("command", "")[:500]
+            return discord.Embed(
+                title=f"🔄 {name}",
+                description=f"```bash\n{cmd}\n```",
+                color=COLOR_TOOL_RUNNING,
+            )
+        elif name == "Write":
+            path = block.input.get("file_path", block.input.get("file", ""))
+            return discord.Embed(
+                title="🔄 Write",
+                description=f"📄 `{path}`",
+                color=COLOR_TOOL_RUNNING,
+            )
+        elif name == "Edit":
+            path = block.input.get("file_path", block.input.get("file", ""))
+            return discord.Embed(
+                title="🔄 Edit",
+                description=f"📄 `{path}`",
+                color=COLOR_TOOL_RUNNING,
+            )
+        elif name == "Read":
+            path = block.input.get("file_path", block.input.get("file", ""))
+            return discord.Embed(
+                title="🔄 Read",
+                description=f"📄 `{path}`",
+                color=COLOR_TOOL_RUNNING,
+            )
+        else:
+            return discord.Embed(
+                title=f"🔄 {name}",
+                description="Executing...",
+                color=COLOR_TOOL_RUNNING,
+            )
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -108,6 +156,9 @@ class DiscordRenderer:
         task_depth = 0                            # subtask nesting depth (#74)
         # Stats populated from ResultMessage
         stats: dict | None = None
+        # Sub-agent thread tracking: parent_tool_use_id -> thread/renderer
+        subagent_threads: dict[str, discord.Thread] = {}
+        subagent_renderers: dict[str, "DiscordRenderer"] = {}
 
         try:
             async for event in bridge.send_message(user_text):
@@ -125,6 +176,100 @@ class DiscordRenderer:
                         'model': getattr(event, 'model', '') or '',
                     }
                     break
+
+                # -------------------------------------------------------
+                # Sub-agent routing: check parent_tool_use_id
+                # -------------------------------------------------------
+                ptid = getattr(event, 'parent_tool_use_id', None)
+                if ptid and ptid in subagent_renderers:
+                    sub_renderer = subagent_renderers[ptid]
+                    # Route StreamEvents to sub-thread
+                    if isinstance(event, StreamEvent):
+                        ev = event.event
+                        if ev.get("type") == "content_block_delta":
+                            delta = ev.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    # Buffer deltas for sub-agent, flush periodically
+                                    if not hasattr(sub_renderer, '_sub_buffer'):
+                                        sub_renderer._sub_buffer = ""
+                                        sub_renderer._sub_msg = None
+                                        sub_renderer._sub_last_edit = 0.0
+                                    sub_renderer._sub_buffer += text
+                                    now = time.time()
+                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                        if sub_renderer._sub_msg is None:
+                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                        else:
+                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                        sub_renderer._sub_last_edit = now
+                        continue
+
+                    # Route content-bearing messages to sub-thread
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, TextBlock):
+                                text = getattr(block, "text", "") or ""
+                                if text:
+                                    if not hasattr(sub_renderer, '_sub_buffer'):
+                                        sub_renderer._sub_buffer = ""
+                                        sub_renderer._sub_msg = None
+                                        sub_renderer._sub_last_edit = 0.0
+                                    sub_renderer._sub_buffer += text
+                                    now = time.time()
+                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                        if sub_renderer._sub_msg is None:
+                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                        else:
+                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                        sub_renderer._sub_last_edit = now
+                            elif isinstance(block, ToolUseBlock):
+                                # Flush text buffer before tool embed
+                                if hasattr(sub_renderer, '_sub_buffer') and sub_renderer._sub_buffer:
+                                    if sub_renderer._sub_msg:
+                                        await sub_renderer._safe_edit(sub_renderer._sub_msg, content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    else:
+                                        await sub_renderer._safe_send(content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    sub_renderer._sub_buffer = ""
+                                    sub_renderer._sub_msg = None
+                                tool_embed = self._build_tool_embed(block)
+                                tool_id = getattr(block, "id", None)
+                                name = getattr(block, "name", "tool") or "tool"
+                                if tool_id:
+                                    tool_names[tool_id] = name
+                                tmsg = await sub_renderer._safe_send(embed=tool_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                            elif isinstance(block, ToolResultBlock):
+                                tool_id = getattr(block, "tool_use_id", None)
+                                result_name = tool_names.get(tool_id, "") if tool_id else ""
+                                is_err = bool(getattr(block, "is_error", False))
+                                if tool_id and tool_id in tool_msgs:
+                                    if is_err:
+                                        result_embed = discord.Embed(
+                                            title=f"❌ {result_name or 'tool'}",
+                                            color=COLOR_TOOL_FAILURE,
+                                        )
+                                        error_text = str(block.content)[:500] if block.content else "Failed"
+                                        result_embed.description = f"```\n{error_text}\n```"
+                                    else:
+                                        result_embed = discord.Embed(
+                                            title=f"✅ {result_name or 'tool'}",
+                                            color=COLOR_TOOL_SUCCESS,
+                                        )
+                                    await sub_renderer._safe_edit(tool_msgs[tool_id], embed=result_embed)
+                            elif isinstance(block, ThinkingBlock):
+                                thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
+                                embed = discord.Embed(
+                                    title="💭 Thinking...",
+                                    description=f"||{thinking_text}||",
+                                    color=COLOR_THINKING,
+                                )
+                                await sub_renderer._safe_send(embed=embed)
+                    continue  # Don't process in main thread
 
                 # -------------------------------------------------------
                 # Feature #61: handle StreamEvent for partial messages
@@ -227,26 +372,74 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: Task subtask (#55, #74) ---
-                            if name == "Task":
+                            # Creates a separate Discord thread for each sub-agent
+                            if name in ("Task", "Agent"):
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:300]
                                 prompt = block.input.get("prompt", "")[:500]
-                                display_depth = min(task_depth, 10)
-                                indent = "│ " * (display_depth - 1) + "├─"
-                                task_embed = discord.Embed(
-                                    title=f"{indent} 🔀 Subtask #{task_depth}",
-                                    description=desc,
-                                    color=COLOR_INFO,
-                                )
-                                if prompt:
-                                    task_embed.add_field(name="Prompt", value=f"```\n{prompt[:500]}\n```", inline=False)
-                                tmsg = await self._safe_send(embed=task_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
+
+                                # Try to create a sub-agent thread
+                                try:
+                                    parent_channel = self.target
+                                    if hasattr(parent_channel, 'parent') and parent_channel.parent:
+                                        parent_channel = parent_channel.parent
+
+                                    thread_name = f"🔀 Subtask: {desc[:80]}" if desc else f"🔀 Subtask #{task_depth}"
+
+                                    # Create thread in the parent channel
+                                    anchor_msg = await parent_channel.send(
+                                        embed=discord.Embed(
+                                            title=thread_name,
+                                            description=f"Sub-agent working on: {desc}" if desc else "Sub-agent started",
+                                            color=COLOR_INFO,
+                                        )
+                                    )
+                                    sub_thread = await anchor_msg.create_thread(
+                                        name=thread_name[:100],
+                                        auto_archive_duration=60,
+                                    )
+
+                                    if tool_id:
+                                        subagent_threads[tool_id] = sub_thread
+                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
+
+                                    # In the main thread, show compact summary with link
+                                    summary_embed = discord.Embed(
+                                        title=f"🔀 Subtask #{task_depth}",
+                                        description=f"{desc}\n\n📎 Details: {sub_thread.mention}",
+                                        color=COLOR_INFO,
+                                    )
+                                    tmsg = await self._safe_send(embed=summary_embed)
+                                    if tmsg and tool_id:
+                                        tool_msgs[tool_id] = tmsg
+
+                                    # Post prompt in sub-thread if available
+                                    if prompt and tool_id and tool_id in subagent_renderers:
+                                        prompt_embed = discord.Embed(
+                                            title="📋 Task Prompt",
+                                            description=f"```\n{prompt[:500]}\n```",
+                                            color=COLOR_INFO,
+                                        )
+                                        await subagent_renderers[tool_id]._safe_send(embed=prompt_embed)
+
+                                except discord.HTTPException:
+                                    # Fallback: show inline if thread creation fails
+                                    display_depth = min(task_depth, 10)
+                                    indent = "│ " * (display_depth - 1) + "├─"
+                                    task_embed = discord.Embed(
+                                        title=f"{indent} 🔀 Subtask #{task_depth}",
+                                        description=desc,
+                                        color=COLOR_INFO,
+                                    )
+                                    if prompt:
+                                        task_embed.add_field(name="Prompt", value=f"```\n{prompt[:500]}\n```", inline=False)
+                                    tmsg = await self._safe_send(embed=task_embed)
+                                    if tmsg is not None and tool_id:
+                                        tool_msgs[tool_id] = tmsg
                                 continue
 
                             # --- Special tool display: TaskOutput (#74) ---
-                            if name == "TaskOutput":
+                            if name in ("TaskOutput", "AgentOutput"):
                                 output = block.input.get("output", "")[:500]
                                 task_out_embed = discord.Embed(
                                     title="📤 Subtask Output",
@@ -259,7 +452,7 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: TaskStop (#74) ---
-                            if name == "TaskStop":
+                            if name in ("TaskStop", "AgentStop"):
                                 task_depth = max(0, task_depth - 1)
                                 task_stop_embed = discord.Embed(
                                     title="⏹️ Subtask Stopped",
@@ -416,18 +609,7 @@ class DiscordRenderer:
                                 continue
 
                             # Build a colored embed for the tool execution
-                            tool_embed = discord.Embed(
-                                title=f"🔄 {name}",
-                                color=COLOR_TOOL_RUNNING,
-                            )
-                            if name == "Bash":
-                                cmd = block.input.get("command", "")[:500]
-                                tool_embed.description = f"```bash\n{cmd}\n```"
-                            elif name in ("Write", "Edit", "Read"):
-                                path = block.input.get("file_path", block.input.get("file", ""))
-                                tool_embed.description = f"📄 `{path}`"
-                            else:
-                                tool_embed.description = "Executing..."
+                            tool_embed = self._build_tool_embed(block)
 
                             tmsg = await self._safe_send(embed=tool_embed)
                             if tmsg is not None and tool_id:
@@ -468,10 +650,45 @@ class DiscordRenderer:
                             tool_id = getattr(block, "tool_use_id", None)
                             # --- Task result display (#55, #74) ---
                             result_name = tool_names.get(tool_id, "") if tool_id else ""
-                            if result_name == "Task":
+                            if result_name in ("Task", "Agent"):
                                 task_depth = max(0, task_depth - 1)
                                 content_str = str(block.content)[:500] if block.content else ""
                                 is_err = bool(getattr(block, "is_error", False))
+
+                                # Update sub-agent thread if one was created
+                                if tool_id and tool_id in subagent_threads:
+                                    sub_thread = subagent_threads[tool_id]
+
+                                    # Flush any remaining sub-agent buffer
+                                    if tool_id in subagent_renderers:
+                                        sr = subagent_renderers[tool_id]
+                                        if hasattr(sr, '_sub_buffer') and sr._sub_buffer:
+                                            if sr._sub_msg:
+                                                await sr._safe_edit(sr._sub_msg, content=sr._sub_buffer[:DISCORD_MAX_LEN])
+                                            else:
+                                                await sr._safe_send(content=sr._sub_buffer[:DISCORD_MAX_LEN])
+                                            sr._sub_buffer = ""
+
+                                    # Post completion in sub-thread
+                                    result_text = content_str or "Done"
+                                    done_embed = discord.Embed(
+                                        title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                        description=result_text,
+                                        color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                    )
+                                    await subagent_renderers[tool_id]._safe_send(embed=done_embed)
+
+                                    # Update main thread summary
+                                    if tool_id in tool_msgs:
+                                        summary_embed = discord.Embed(
+                                            title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                            description=f"📎 Details: {sub_thread.mention}",
+                                            color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                        )
+                                        await self._safe_edit(tool_msgs[tool_id], embed=summary_embed)
+                                    continue
+
+                                # Fallback: inline display (no sub-thread was created)
                                 if is_err:
                                     task_result_embed = discord.Embed(
                                         title="❌ Subtask failed",
@@ -772,24 +989,11 @@ class DiscordRenderer:
                     self._last_msg = msg
                 return msg
             except discord.HTTPException:
-                log.exception("Discord send failed after rate-limit backoff; dropping")
+                log.warning("Discord send failed after backoff", exc_info=True)
                 return None
         except discord.HTTPException:
-            log.warning("Discord send failed; backing off and retrying once")
-            await asyncio.sleep(HTTP_BACKOFF_SECONDS)
-            try:
-                # Reset file stream if it was consumed by the first attempt
-                if "file" in kwargs:
-                    f = kwargs["file"]
-                    if hasattr(f, 'fp') and hasattr(f.fp, 'seek'):
-                        f.fp.seek(0)
-                msg = await self.target.send(**kwargs)
-                if content:
-                    self._last_msg = msg
-                return msg
-            except discord.HTTPException:
-                log.exception("Discord send failed after retry; dropping content")
-                return None
+            log.warning("Discord send failed", exc_info=True)
+            return None
 
     async def _safe_edit(
         self,
@@ -798,47 +1002,39 @@ class DiscordRenderer:
         *,
         embed: discord.Embed | None = None,
     ) -> None:
-        """Edit a message, swallowing transient HTTP errors with a short backoff."""
+        """Edit a message, swallowing transient HTTP errors."""
         kwargs: dict = {}
         if content is not None:
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed
-
         if not kwargs:
             return
 
         try:
             await msg.edit(**kwargs)
-            return
         except discord.RateLimited as exc:
             retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
-            log.debug("Discord edit rate-limited; sleeping %.2fs", retry)
+            log.warning("Discord edit rate-limited; sleeping %.2fs", retry)
             await asyncio.sleep(retry)
             try:
                 await msg.edit(**kwargs)
             except discord.HTTPException:
-                log.warning("Discord edit failed after rate-limit backoff; dropping")
+                log.warning("Discord edit failed after backoff", exc_info=True)
         except discord.HTTPException:
-            log.debug("Discord edit failed; backing off and retrying once")
-            await asyncio.sleep(HTTP_BACKOFF_SECONDS)
-            try:
-                await msg.edit(**kwargs)
-            except discord.HTTPException:
-                log.warning("Discord edit failed after retry; dropping update")
+            log.warning("Discord edit failed", exc_info=True)
 
     # ------------------------------------------------------------------
-    # Smart splitting
+    # Smart text splitting
     # ------------------------------------------------------------------
 
-    def _smart_split(self, text: str, limit: int = DISCORD_MAX_LEN) -> list[str]:
-        """Split ``text`` into <= ``limit``-char chunks.
+    @staticmethod
+    def _smart_split(text: str, *, limit: int = DISCORD_MAX_LEN) -> list[str]:
+        """Split ``text`` into chunks that fit within ``limit``.
 
-        Preference order for split points: paragraph (``\\n\\n``) > line
-        (``\\n``) > space > hard cut. If a chunk would leave an unclosed
-        triple-backtick code fence, we close it with ``\\n```\\n`` and
-        reopen the next chunk with ``\\n```\\n`` so each rendered Discord
-        message is syntactically self-contained.
+        Break preference: paragraph (``\\n\\n``) → line (``\\n``) → space →
+        hard cut. Code fences are closed at the cut and re-opened in the
+        next chunk to keep every chunk self-contained.
         """
         if not text:
             return []
@@ -847,68 +1043,60 @@ class DiscordRenderer:
 
         chunks: list[str] = []
         remaining = text
-        # Reserve a few chars for a possible "\n```" close fence.
-        fence_reserve = len("\n```")
 
-        while len(remaining) > limit:
-            cut = self._find_cut(remaining, limit - fence_reserve)
-            chunk = remaining[:cut]
-            tail = remaining[cut:]
-            # Strip a leading newline that we just split on.
-            if tail.startswith("\n"):
-                tail = tail.lstrip("\n")
+        while remaining:
+            if len(remaining) <= limit:
+                chunks.append(remaining)
+                break
 
-            # If the chunk leaves an unclosed code fence, close it here and
-            # reopen at the start of the next chunk so syntax highlighting
-            # doesn't bleed across messages.
+            # Leave space for a potential close-fence if the chunk has an
+            # unclosed code block.
+            fence_reserve = len("\n```")
+            cut = limit - fence_reserve
+
+            # Look for a good break point in the back half of the chunk.
+            half = cut // 2
+
+            # 1) Paragraph boundary (\n\n)
+            idx = remaining.rfind("\n\n", half, cut)
+            if idx >= 0:
+                idx += 2  # include the double newline in the first chunk
+            else:
+                # 2) Line boundary (\n)
+                idx = remaining.rfind("\n", half, cut)
+                if idx >= 0:
+                    idx += 1
+                else:
+                    # 3) Space
+                    idx = remaining.rfind(" ", half, cut)
+                    if idx >= 0:
+                        idx += 1
+                    else:
+                        # 4) Hard cut
+                        idx = cut
+
+            chunk = remaining[:idx]
+            remaining = remaining[idx:]
+
+            # Fix unclosed code fences.
             if chunk.count("```") % 2 == 1:
-                # Try to detect the language tag of the open fence so we can
-                # reopen with the same one.
-                lang = self._detect_open_fence_lang(chunk)
-                chunk = chunk.rstrip() + "\n```"
-                tail = f"```{lang}\n" + tail
+                lang = DiscordRenderer._detect_open_fence_lang(chunk)
+                chunk += "\n```"
+                remaining = f"```{lang}\n" + remaining
+
+            # Strip leading blank lines from the next chunk (avoids a visual
+            # gap when the split happened at a paragraph boundary).
+            remaining = remaining.lstrip("\n")
 
             chunks.append(chunk)
-            remaining = tail
 
-        if remaining:
-            chunks.append(remaining)
         return chunks
 
     @staticmethod
-    def _find_cut(text: str, limit: int) -> int:
-        """Return a "good" cut index <= ``limit``.
-
-        Tries paragraph break, then line, then space, then a hard cut.
-        Cuts are required to be at least ~half the limit so we don't
-        produce tiny chunks just because the first paragraph is short.
-        """
-        if len(text) <= limit:
-            return len(text)
-
-        # Discord splits the text immediately after the cut, so
-        # ``rfind`` returns the index of the separator; we cut *after* it
-        # for "\n\n"/"\n" so the newline ends the previous chunk.
-        floor = max(1, limit // 2)
-
-        para = text.rfind("\n\n", 0, limit)
-        if para >= floor:
-            return para + 2
-
-        line = text.rfind("\n", 0, limit)
-        if line >= floor:
-            return line + 1
-
-        space = text.rfind(" ", 0, limit)
-        if space >= floor:
-            return space + 1
-
-        return limit
-
-    @staticmethod
     def _detect_open_fence_lang(chunk: str) -> str:
-        """Return the language tag of the *open* fence in ``chunk`` (or "")."""
-        # Find the last ``` that opens a fence (i.e. an odd-indexed one).
+        """Return the language tag of the last unclosed ``\u0060\u0060\u0060`` fence in *chunk*."""
+        # Walk through all ``` occurrences; the last odd-numbered one is the
+        # currently open fence.
         idx = -1
         cursor = 0
         opens = 0
