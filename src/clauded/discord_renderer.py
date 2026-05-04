@@ -191,7 +191,20 @@ class DiscordRenderer:
                             if delta.get("type") == "text_delta":
                                 text = delta.get("text", "")
                                 if text:
-                                    await sub_renderer._safe_send(content=text[:DISCORD_MAX_LEN])
+                                    # Buffer deltas for sub-agent, flush periodically
+                                    if not hasattr(sub_renderer, '_sub_buffer'):
+                                        sub_renderer._sub_buffer = ""
+                                        sub_renderer._sub_msg = None
+                                        sub_renderer._sub_last_edit = 0.0
+                                    sub_renderer._sub_buffer += text
+                                    now = time.time()
+                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                        if sub_renderer._sub_msg is None:
+                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                        else:
+                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                        sub_renderer._sub_last_edit = now
                         continue
 
                     # Route content-bearing messages to sub-thread
@@ -200,10 +213,28 @@ class DiscordRenderer:
                             if isinstance(block, TextBlock):
                                 text = getattr(block, "text", "") or ""
                                 if text:
-                                    # Smart-split long text for sub-thread
-                                    for chunk in sub_renderer._smart_split(text, limit=DISCORD_MAX_LEN):
-                                        await sub_renderer._safe_send(content=chunk)
+                                    if not hasattr(sub_renderer, '_sub_buffer'):
+                                        sub_renderer._sub_buffer = ""
+                                        sub_renderer._sub_msg = None
+                                        sub_renderer._sub_last_edit = 0.0
+                                    sub_renderer._sub_buffer += text
+                                    now = time.time()
+                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                        if sub_renderer._sub_msg is None:
+                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                        else:
+                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                        sub_renderer._sub_last_edit = now
                             elif isinstance(block, ToolUseBlock):
+                                # Flush text buffer before tool embed
+                                if hasattr(sub_renderer, '_sub_buffer') and sub_renderer._sub_buffer:
+                                    if sub_renderer._sub_msg:
+                                        await sub_renderer._safe_edit(sub_renderer._sub_msg, content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    else:
+                                        await sub_renderer._safe_send(content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    sub_renderer._sub_buffer = ""
+                                    sub_renderer._sub_msg = None
                                 tool_embed = self._build_tool_embed(block)
                                 tool_id = getattr(block, "id", None)
                                 name = getattr(block, "name", "tool") or "tool"
@@ -627,6 +658,16 @@ class DiscordRenderer:
                                 # Update sub-agent thread if one was created
                                 if tool_id and tool_id in subagent_threads:
                                     sub_thread = subagent_threads[tool_id]
+
+                                    # Flush any remaining sub-agent buffer
+                                    if tool_id in subagent_renderers:
+                                        sr = subagent_renderers[tool_id]
+                                        if hasattr(sr, '_sub_buffer') and sr._sub_buffer:
+                                            if sr._sub_msg:
+                                                await sr._safe_edit(sr._sub_msg, content=sr._sub_buffer[:DISCORD_MAX_LEN])
+                                            else:
+                                                await sr._safe_send(content=sr._sub_buffer[:DISCORD_MAX_LEN])
+                                            sr._sub_buffer = ""
 
                                     # Post completion in sub-thread
                                     result_text = content_str or "Done"

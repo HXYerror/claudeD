@@ -341,7 +341,7 @@ async def test_task_failure_updates_both_threads():
     # The summary embed should be updated (via edit) to show failure
     last_embed = summary_msgs[0].embeds[0]
     # After edit, it should show "Failed" or the thread mention
-    assert "Failed" in (last_embed.title or "") or sub_thread.mention in (last_embed.description or "")
+    assert "Failed" in (last_embed.title or ""), "Summary embed should show failure after edit"
 
 
 @pytest.mark.asyncio
