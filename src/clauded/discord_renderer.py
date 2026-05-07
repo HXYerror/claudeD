@@ -814,8 +814,8 @@ class DiscordRenderer:
                 duration_s = stats['duration_ms'] / 1000
                 footer = (
                     f"\n\n-# 💰 ${stats['cost']:.4f}"
-                    f" │ 📥 {stats['input_tokens']}"
-                    f" │ 📤 {stats['output_tokens']}"
+                    f" │ 📥 {stats['input_tokens']} tokens"
+                    f" │ 📤 {stats['output_tokens']} tokens"
                     f" │ ⏱️ {duration_s:.1f}s"
                 )
                 await self._safe_edit(self._last_msg, content=current + footer)

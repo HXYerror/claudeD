@@ -196,7 +196,11 @@ class ClaudedBot(commands.Bot):
     async def _handle_channel_message(self, message: discord.Message) -> None:
         """Channel (non-thread) message: open a new thread + session."""
         # Only trigger if bot is mentioned
-        if self.user and self.user.id not in [m.id for m in message.mentions]:
+        # Accept real @mention, role mention, or text containing bot name
+        bot_mentioned = self.user and self.user.id in [m.id for m in message.mentions]
+        role_mentioned = any(r.name and self.user and self.user.name and r.name.lower() == self.user.name.lower() for r in message.role_mentions)
+        bot_name_in_text = self.user and self.user.name and self.user.name.lower() in message.content.lower()
+        if not bot_mentioned and not role_mentioned and not bot_name_in_text:
             return
 
         channel = message.channel
