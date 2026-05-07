@@ -150,6 +150,13 @@ class _SubagentDetailView(discord.ui.View):
             await interaction.followup.send(f"Failed to fetch details: {e}", ephemeral=True)
 
 
+def _fmt_tokens(n: int) -> str:
+    """Format token count: 2235 -> 2.2k, 523 -> 523."""
+    if n >= 1000:
+        return f"{n/1000:.1f}k"
+    return str(n)
+
+
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
 
@@ -814,8 +821,8 @@ class DiscordRenderer:
                 duration_s = stats['duration_ms'] / 1000
                 footer = (
                     f"\n\n-# 💰 ${stats['cost']:.4f}"
-                    f" │ 📥 {stats['input_tokens']} tokens"
-                    f" │ 📤 {stats['output_tokens']} tokens"
+                    f" │ 📥 {_fmt_tokens(stats['input_tokens'])}"
+                    f" │ 📤 {_fmt_tokens(stats['output_tokens'])}"
                     f" │ ⏱️ {duration_s:.1f}s"
                 )
                 await self._safe_edit(self._last_msg, content=current + footer)
