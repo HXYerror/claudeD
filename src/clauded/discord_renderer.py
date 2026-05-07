@@ -232,8 +232,8 @@ class DiscordRenderer:
                     # Capture stats from the result
                     stats = {
                         'cost': float(getattr(event, 'total_cost_usd', 0) or 0),
-                        'input_tokens': int(getattr(event, 'input_tokens', 0) or 0),
-                        'output_tokens': int(getattr(event, 'output_tokens', 0) or 0),
+                        'input_tokens': int((getattr(event, 'usage', None) or {}).get('input_tokens', 0) or 0),
+                        'output_tokens': int((getattr(event, 'usage', None) or {}).get('output_tokens', 0) or 0),
                         'duration_ms': (time.time() - stream_start) * 1000,
                         'num_turns': int(getattr(event, 'num_turns', 0) or 0),
                         'model': getattr(event, 'model', '') or '',
