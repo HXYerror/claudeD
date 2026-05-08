@@ -283,6 +283,18 @@ class ClaudeBridge:
         # Always assign hooks dict (we now unconditionally register PreCompact etc.)
         hooks = _hooks_dict
 
+        use_can_use_tool = (
+            self.on_ask_user is not None
+            and self._config.claude_permission_mode == "bypassPermissions"
+        )
+
+        if self.on_ask_user is not None and not use_can_use_tool:
+            log.warning(
+                "AskUserQuestion interactive prompts disabled — "
+                "requires permission_mode='bypassPermissions' (current: '%s')",
+                self._config.claude_permission_mode,
+            )
+
         options = ClaudeCodeOptions(
             cwd=self.project_path,
             env=self._env or {},
@@ -291,10 +303,7 @@ class ClaudeBridge:
             # Only use can_use_tool when bypassing permissions.
             # In other modes, the CLI's permission system handles tool approval,
             # and our callback format is incompatible with the CLI's Zod schema.
-            can_use_tool=self._can_use_tool if (
-                self.on_ask_user is not None
-                and self._config.claude_permission_mode == "bypassPermissions"
-            ) else None,
+            can_use_tool=self._can_use_tool if use_can_use_tool else None,
             resume=self._resume_session_id,
             append_system_prompt=full_system_prompt,
             allowed_tools=self._allowed_tools,

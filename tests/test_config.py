@@ -79,3 +79,13 @@ def test_projects_root_defaults_to_home(
     isolated_env.setenv("DISCORD_BOT_TOKEN", "tok-abc")
     cfg = load_config()
     assert cfg.projects_root == str(home.resolve())
+
+
+def test_typo_warning_logged(isolated_env, caplog):
+    """Common env var typos produce a warning."""
+    import logging
+    isolated_env.setenv("DISCORD_BOT_TOKEN", "tok")
+    isolated_env.setenv("CLAUDE_PREMISSION_MODE", "bypassPermissions")
+    with caplog.at_level(logging.WARNING):
+        load_config()
+    assert "did you mean" in caplog.text.lower() or "CLAUDE_PERMISSION_MODE" in caplog.text
