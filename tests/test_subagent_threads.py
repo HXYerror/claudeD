@@ -1,8 +1,8 @@
-"""Tests for sub-agent thread display in DiscordRenderer.
+"""Tests for sub-agent inline display in DiscordRenderer.
 
-Validates that when Claude spawns a sub-agent via the Task tool, a separate
-Discord thread is created for the sub-agent's full interaction, while the
-main thread shows a compact summary with a link.
+Validates that when Claude spawns a sub-agent via the Task tool, a separator
+embed is posted inline in the main thread. All sub-agent content renders
+in the main thread — no separate threads are created.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from clauded.discord_renderer import (
 )
 from clauded.claude_bridge import (
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     ToolResultBlock,
     ResultMessage,
@@ -50,50 +51,24 @@ class FakeMessage:
             self.embeds = [kwargs["embed"]]
 
 
-class FakeThread:
-    """Minimal discord.Thread stand-in."""
-    def __init__(self, name: str = "test-thread"):
-        self.name = name
-        self.id = 999
-        self.mention = f"<#{self.id}>"
-        self._messages: list[FakeMessage] = []
-
-    async def send(self, content=None, **kwargs):
-        msg = FakeMessage(id=len(self._messages) + 100, content=content or "")
-        if "embed" in kwargs:
-            msg.embeds = [kwargs["embed"]]
-        self._messages.append(msg)
-        return msg
-
-
 class FakeChannel:
-    """Minimal discord channel that can create threads."""
+    """Minimal discord channel."""
     def __init__(self):
         self._messages: list[FakeMessage] = []
-        self._threads: list[FakeThread] = []
-        self.parent = None  # not a thread itself
+        self.parent = None
         self.guild = None
 
     async def send(self, content=None, **kwargs):
         msg = FakeMessage(id=len(self._messages) + 1, content=content or "")
         if "embed" in kwargs:
             msg.embeds = [kwargs["embed"]]
-        # Attach create_thread to the message
-        thread = FakeThread(name="sub-thread")
-        self._threads.append(thread)
-
-        async def _create_thread(name="thread", auto_archive_duration=60):
-            thread.name = name
-            return thread
-
-        msg.create_thread = _create_thread
         self._messages.append(msg)
         return msg
 
 
 class FakeMainThread:
-    """Minimal discord thread (the main conversation thread) with a parent channel."""
-    def __init__(self, parent_channel: FakeChannel):
+    """Minimal discord thread (the main conversation thread)."""
+    def __init__(self, parent_channel: FakeChannel | None = None):
         self.parent = parent_channel
         self._messages: list[FakeMessage] = []
         self.guild = None
@@ -154,17 +129,15 @@ class TestBuildToolEmbed:
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent thread creation tests
+# Sub-agent inline display tests
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_task_creates_subagent_thread():
-    """A Task ToolUseBlock should create a sub-thread and show summary in main."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+async def test_task_shows_inline_separator():
+    """A Task ToolUseBlock should show a separator embed in the main thread."""
+    main_thread = FakeMainThread()
 
     events = [
-        # Main agent sends a Task tool use
         AssistantMessage(
             content=[
                 ToolUseBlock(id="task-1", name="Task", input={"description": "Fix the bug", "prompt": "Please fix"}),
@@ -172,7 +145,6 @@ async def test_task_creates_subagent_thread():
             model="claude-sonnet",
             parent_tool_use_id=None,
         ),
-        # Task result
         AssistantMessage(
             content=[
                 ToolResultBlock(tool_use_id="task-1", content="Bug fixed!", is_error=False),
@@ -195,31 +167,62 @@ async def test_task_creates_subagent_thread():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "fix the bug")
 
-    # A thread should have been created in parent channel
-    assert len(parent_channel._threads) == 1
-    sub_thread = parent_channel._threads[0]
-    assert "Subtask" in sub_thread.name
-
-    # Main thread should have the compact summary with thread mention
-    summary_msgs = [m for m in main_thread._messages if m.embeds]
-    assert len(summary_msgs) >= 1
-    # First embed should be the summary with thread link
-    first_embed = summary_msgs[0].embeds[0]
+    # Should have separator embed in main thread (edited to completion)
+    embed_msgs = [m for m in main_thread._messages if m.embeds]
+    assert len(embed_msgs) >= 1
+    first_embed = embed_msgs[0].embeds[0]
     assert "Subtask" in first_embed.title
-
-    # Sub-thread should have completion embed
-    sub_msgs = sub_thread._messages
-    assert len(sub_msgs) >= 1
-    # Check for completion embed
-    done_embeds = [m for m in sub_msgs if m.embeds and "Complete" in (m.embeds[0].title or "")]
-    assert len(done_embeds) == 1
+    # After completion, embed is edited — description shows result, not original desc
+    assert first_embed.description is not None
 
 
 @pytest.mark.asyncio
-async def test_subagent_messages_routed_to_thread():
-    """Messages with parent_tool_use_id should go to the sub-thread."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+async def test_task_completion_updates_separator():
+    """When a Task completes, the separator embed should be updated."""
+    main_thread = FakeMainThread()
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id="task-1", name="Task", input={"description": "Fix the bug"}),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="task-1", content="Bug fixed!", is_error=False),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=1000,
+            duration_api_ms=900,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-1",
+            total_cost_usd=0.01,
+        ),
+    ]
+
+    bridge = FakeBridge(events)
+    renderer = DiscordRenderer(main_thread)
+    await renderer.render_response(bridge, "fix the bug")
+
+    # The separator embed should have been edited to show completion
+    embed_msgs = [m for m in main_thread._messages if m.embeds]
+    assert len(embed_msgs) >= 1
+    # After edit, the embed should show "Subtask Complete"
+    final_embed = embed_msgs[0].embeds[0]
+    assert "Complete" in (final_embed.title or "")
+
+
+@pytest.mark.asyncio
+async def test_subagent_messages_stay_in_main_thread():
+    """Messages with parent_tool_use_id should render in the main thread (no routing)."""
+    main_thread = FakeMainThread()
 
     events = [
         # Main agent creates a task
@@ -230,26 +233,10 @@ async def test_subagent_messages_routed_to_thread():
             model="claude-sonnet",
             parent_tool_use_id=None,
         ),
-        # Sub-agent sends text (has parent_tool_use_id)
+        # Sub-agent sends text (has parent_tool_use_id) — should go to main thread
         AssistantMessage(
             content=[
                 TextBlock(text="I'm researching the topic now..."),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id="task-2",
-        ),
-        # Sub-agent uses a tool
-        AssistantMessage(
-            content=[
-                ToolUseBlock(id="bash-1", name="Bash", input={"command": "grep -r topic ."}),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id="task-2",
-        ),
-        # Sub-agent tool result
-        AssistantMessage(
-            content=[
-                ToolResultBlock(tool_use_id="bash-1", content="found results", is_error=False),
             ],
             model="claude-sonnet",
             parent_tool_use_id="task-2",
@@ -277,30 +264,15 @@ async def test_subagent_messages_routed_to_thread():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "research this")
 
-    sub_thread = parent_channel._threads[0]
-
-    # Sub-thread should have: prompt (optional), text, tool embed, tool result, completion
-    # Text message should be in sub-thread
-    text_msgs = [m for m in sub_thread._messages if m.content and "researching" in m.content]
+    # Text should be in main thread
+    text_msgs = [m for m in main_thread._messages if m.content and "researching" in m.content]
     assert len(text_msgs) >= 1
-
-    # Tool activity embed should be in sub-thread (rolling tool log)
-    tool_embeds = [m for m in sub_thread._messages if m.embeds and "Tool Activity" in (m.embeds[0].title or "")]
-    assert len(tool_embeds) >= 1
-    # Bash should appear in the tool log description
-    tool_desc = tool_embeds[0].embeds[0].description or ""
-    assert "Bash" in tool_desc
-
-    # Main thread should NOT have the sub-agent's text
-    main_text = [m for m in main_thread._messages if m.content and "researching" in m.content]
-    assert len(main_text) == 0
 
 
 @pytest.mark.asyncio
-async def test_task_failure_updates_both_threads():
-    """When a Task fails, both main and sub-thread should reflect the failure."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+async def test_task_failure_shows_in_main_thread():
+    """When a Task fails, the main thread separator should reflect the failure."""
+    main_thread = FakeMainThread()
 
     events = [
         AssistantMessage(
@@ -332,137 +304,17 @@ async def test_task_failure_updates_both_threads():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "deploy")
 
-    sub_thread = parent_channel._threads[0]
-
-    # Sub-thread should have failure embed
-    fail_embeds = [m for m in sub_thread._messages if m.embeds and "Failed" in (m.embeds[0].title or "")]
-    assert len(fail_embeds) == 1
-
-    # Main thread summary should be updated to show failure
-    summary_msgs = [m for m in main_thread._messages if m.embeds]
-    assert len(summary_msgs) >= 1
-    # The summary embed should be updated (via edit) to show failure
-    last_embed = summary_msgs[0].embeds[0]
-    # After edit, it should show "Failed" or the thread mention
-    assert "Failed" in (last_embed.title or ""), "Summary embed should show failure after edit"
-
-
-@pytest.mark.asyncio
-async def test_thread_creation_failure_falls_back_inline():
-    """If thread creation fails, fall back to inline subtask display."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
-
-    # Make parent channel's send raise HTTPException
-    original_send = parent_channel.send
-
-    async def _failing_send(*args, **kwargs):
-        raise discord.HTTPException(MagicMock(), "Thread creation failed")
-
-    parent_channel.send = _failing_send
-
-    events = [
-        AssistantMessage(
-            content=[
-                ToolUseBlock(id="task-4", name="Task", input={"description": "Some task", "prompt": "do it"}),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        AssistantMessage(
-            content=[
-                ToolResultBlock(tool_use_id="task-4", content="Done", is_error=False),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        ResultMessage(
-            subtype="result",
-            duration_ms=1000,
-            duration_api_ms=900,
-            is_error=False,
-            num_turns=1,
-            session_id="sess-4",
-            total_cost_usd=0.01,
-        ),
-    ]
-
-    bridge = FakeBridge(events)
-    renderer = DiscordRenderer(main_thread)
-    await renderer.render_response(bridge, "do something")
-
-    # No threads should have been created
-    assert len(parent_channel._threads) == 0
-
-    # Main thread should have inline subtask display
+    # Main thread should have the failure embed (edited from separator)
     embed_msgs = [m for m in main_thread._messages if m.embeds]
     assert len(embed_msgs) >= 1
-    # Should show inline subtask embed with depth indicator
-    first_embed = embed_msgs[0].embeds[0]
-    assert "Subtask" in first_embed.title
+    last_embed = embed_msgs[0].embeds[0]
+    assert "❌" in (last_embed.title or "")
 
 
 @pytest.mark.asyncio
-async def test_stream_event_routed_to_subagent():
-    """StreamEvents with parent_tool_use_id go to sub-thread."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
-
-    events = [
-        # Create task
-        AssistantMessage(
-            content=[
-                ToolUseBlock(id="task-5", name="Task", input={"description": "Stream test"}),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        # StreamEvent from sub-agent
-        StreamEvent(
-            uuid="se-1",
-            session_id="sess-5",
-            event={"type": "content_block_delta", "delta": {"type": "text_delta", "text": "streaming text"}},
-            parent_tool_use_id="task-5",
-        ),
-        # Task completes
-        AssistantMessage(
-            content=[
-                ToolResultBlock(tool_use_id="task-5", content="Done", is_error=False),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        ResultMessage(
-            subtype="result",
-            duration_ms=1000,
-            duration_api_ms=900,
-            is_error=False,
-            num_turns=1,
-            session_id="sess-5",
-            total_cost_usd=0.01,
-        ),
-    ]
-
-    bridge = FakeBridge(events)
-    renderer = DiscordRenderer(main_thread)
-    await renderer.render_response(bridge, "test")
-
-    sub_thread = parent_channel._threads[0]
-
-    # The streaming text should appear in the sub-thread
-    text_msgs = [m for m in sub_thread._messages if m.content and "streaming" in m.content]
-    assert len(text_msgs) >= 1
-
-    # Main thread should NOT have the streaming text
-    main_text = [m for m in main_thread._messages if m.content and "streaming" in m.content]
-    assert len(main_text) == 0
-
-
-@pytest.mark.asyncio
-async def test_multiple_subagents_get_separate_threads():
-    """Multiple Task tools create separate sub-threads."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+async def test_multiple_subtasks_get_separate_separators():
+    """Multiple Task tools create separate separator embeds in main thread."""
+    main_thread = FakeMainThread()
 
     events = [
         # First task
@@ -480,18 +332,6 @@ async def test_multiple_subagents_get_separate_threads():
             ],
             model="claude-sonnet",
             parent_tool_use_id=None,
-        ),
-        # Sub-agent A sends text
-        AssistantMessage(
-            content=[TextBlock(text="Alpha working")],
-            model="claude-sonnet",
-            parent_tool_use_id="task-a",
-        ),
-        # Sub-agent B sends text
-        AssistantMessage(
-            content=[TextBlock(text="Beta working")],
-            model="claude-sonnet",
-            parent_tool_use_id="task-b",
         ),
         # Both complete
         AssistantMessage(
@@ -519,26 +359,19 @@ async def test_multiple_subagents_get_separate_threads():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "multi-task")
 
-    # All subtasks share a single thread
-    assert len(parent_channel._threads) == 1
+    # Two separator embeds for the two subtasks (both edited to "Complete")
+    subtask_embeds = [m for m in main_thread._messages if m.embeds and "Subtask" in (m.embeds[0].title or "")]
+    assert len(subtask_embeds) >= 2
 
-    # Both subtask texts should be in the shared thread
-    shared_thread = parent_channel._threads[0]
-    a_text = [m for m in shared_thread._messages if m.content and "Alpha" in m.content]
-    b_text = [m for m in shared_thread._messages if m.content and "Beta" in m.content]
-    assert len(a_text) >= 1
-    assert len(b_text) >= 1
-
-    # Separator embeds should exist for each subtask
-    sep_embeds = [m for m in shared_thread._messages if m.embeds and "━━━" in (m.embeds[0].title or "")]
-    assert len(sep_embeds) >= 2
+    # After completion, both should show "Complete"
+    assert "Complete" in subtask_embeds[0].embeds[0].title
+    assert "Complete" in subtask_embeds[1].embeds[0].title
 
 
 @pytest.mark.asyncio
 async def test_non_subagent_messages_stay_in_main():
     """Messages without parent_tool_use_id go to the main thread as usual."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+    main_thread = FakeMainThread()
 
     events = [
         AssistantMessage(
@@ -561,21 +394,15 @@ async def test_non_subagent_messages_stay_in_main():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "hello")
 
-    # No sub-threads created
-    assert len(parent_channel._threads) == 0
-
     # Main thread has the text
     text_msgs = [m for m in main_thread._messages if m.content and "Hello from main" in m.content]
     assert len(text_msgs) >= 1
 
 
 @pytest.mark.asyncio
-async def test_subagent_thinking_routed_to_thread():
-    """ThinkingBlock in sub-agent messages goes to sub-thread."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
-
-    from clauded.claude_bridge import ThinkingBlock
+async def test_subagent_thinking_renders_in_main():
+    """ThinkingBlock in sub-agent messages renders in main thread."""
+    main_thread = FakeMainThread()
 
     events = [
         AssistantMessage(
@@ -610,69 +437,17 @@ async def test_subagent_thinking_routed_to_thread():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "think")
 
-    sub_thread = parent_channel._threads[0]
-
-    # Thinking embed should be in sub-thread
-    thinking_embeds = [m for m in sub_thread._messages if m.embeds and "Thinking" in (m.embeds[0].title or "")]
+    # Thinking embed should be in main thread (rendered inline)
+    thinking_embeds = [m for m in main_thread._messages if m.embeds and "Thinking" in (m.embeds[0].title or "")]
     assert len(thinking_embeds) >= 1
-
-    # Main thread should NOT have the thinking embed (except the summary)
-    main_thinking = [m for m in main_thread._messages if m.embeds and "Thinking" in (m.embeds[0].title or "")]
-    assert len(main_thinking) == 0
-
-
-@pytest.mark.asyncio
-async def test_task_prompt_posted_in_subthread():
-    """When a Task has a prompt, it should be posted in the sub-thread."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
-
-    events = [
-        AssistantMessage(
-            content=[
-                ToolUseBlock(id="task-7", name="Task", input={
-                    "description": "Write tests",
-                    "prompt": "Write unit tests for the auth module",
-                }),
-            ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        AssistantMessage(
-            content=[ToolResultBlock(tool_use_id="task-7", content="Tests written", is_error=False)],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
-        ),
-        ResultMessage(
-            subtype="result",
-            duration_ms=1000,
-            duration_api_ms=900,
-            is_error=False,
-            num_turns=1,
-            session_id="sess-9",
-            total_cost_usd=0.01,
-        ),
-    ]
-
-    bridge = FakeBridge(events)
-    renderer = DiscordRenderer(main_thread)
-    await renderer.render_response(bridge, "write tests")
-
-    sub_thread = parent_channel._threads[0]
-
-    # Sub-thread should have the prompt embed
-    prompt_embeds = [m for m in sub_thread._messages if m.embeds and "Prompt" in (m.embeds[0].title or "")]
-    assert len(prompt_embeds) >= 1
 
 
 @pytest.mark.asyncio
 async def test_unknown_parent_tool_use_id_not_routed():
-    """Messages with parent_tool_use_id that doesn't match a known Task are not routed."""
-    parent_channel = FakeChannel()
-    main_thread = FakeMainThread(parent_channel)
+    """Messages with parent_tool_use_id that doesn't match a known Task are processed normally."""
+    main_thread = FakeMainThread()
 
     events = [
-        # Message with unknown parent_tool_use_id — should be processed normally in main
         AssistantMessage(
             content=[TextBlock(text="Unknown parent message")],
             model="claude-sonnet",
@@ -693,9 +468,113 @@ async def test_unknown_parent_tool_use_id_not_routed():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "test")
 
-    # No sub-threads created
-    assert len(parent_channel._threads) == 0
-
     # Message should be in main thread
     text_msgs = [m for m in main_thread._messages if m.content and "Unknown parent" in m.content]
     assert len(text_msgs) >= 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_detail_view_removed():
+    """_SubagentDetailView should no longer exist in the module."""
+    import clauded.discord_renderer as mod
+    assert not hasattr(mod, "_SubagentDetailView")
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_treated_same_as_task():
+    """The 'Agent' tool name should be handled the same as 'Task'."""
+    main_thread = FakeMainThread()
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id="agent-1", name="Agent", input={"description": "Agent subtask"}),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="agent-1", content="Agent done", is_error=False),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=1000,
+            duration_api_ms=900,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-11",
+            total_cost_usd=0.01,
+        ),
+    ]
+
+    bridge = FakeBridge(events)
+    renderer = DiscordRenderer(main_thread)
+    await renderer.render_response(bridge, "agent test")
+
+    # Should have separator embed
+    embed_msgs = [m for m in main_thread._messages if m.embeds and "Subtask" in (m.embeds[0].title or "")]
+    assert len(embed_msgs) >= 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_tools_render_in_main_thread():
+    """Sub-agent tool use blocks should render in the main thread."""
+    main_thread = FakeMainThread()
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id="task-x", name="Task", input={"description": "Run tools"}),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        # Sub-agent uses a tool
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id="bash-1", name="Bash", input={"command": "echo hello"}),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id="task-x",
+        ),
+        # Sub-agent tool result
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="bash-1", content="hello", is_error=False),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id="task-x",
+        ),
+        # Task completes
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="task-x", content="Done", is_error=False),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=2000,
+            duration_api_ms=1800,
+            is_error=False,
+            num_turns=2,
+            session_id="sess-12",
+            total_cost_usd=0.02,
+        ),
+    ]
+
+    bridge = FakeBridge(events)
+    renderer = DiscordRenderer(main_thread)
+    await renderer.render_response(bridge, "run tools")
+
+    # Tool activity embed should be in main thread
+    tool_embeds = [m for m in main_thread._messages if m.embeds and "Tool Activity" in (m.embeds[0].title or "")]
+    assert len(tool_embeds) >= 1
+    # Bash should appear in the tool log
+    tool_desc = tool_embeds[0].embeds[0].description or ""
+    assert "Bash" in tool_desc

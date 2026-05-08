@@ -18,10 +18,9 @@ The renderer also smart-splits text on paragraph → line → space boundaries
 and protects unclosed ``` code fences by closing-and-reopening them across
 chunk boundaries.
 
-Sub-agent threads: when Claude spawns a sub-agent via the ``Task`` tool,
-a separate Discord thread is created for that sub-agent's full interaction.
-The main thread shows a compact summary with a link to the sub-thread.
-Messages are routed to sub-threads based on ``parent_tool_use_id``.
+Sub-agent display: when Claude spawns a sub-agent via the ``Task`` tool,
+a separator embed is posted in the main thread. All sub-agent content
+renders inline in the main thread for simplicity.
 """
 
 from __future__ import annotations
@@ -87,67 +86,6 @@ _THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
 _CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
 
 
-
-class _SubagentDetailView(discord.ui.View):
-    """View with buttons to expand sub-agent details or jump to thread."""
-
-    def __init__(self, sub_thread: discord.Thread, *, timeout: float = 300, guild_id: int | None = None):
-        super().__init__(timeout=timeout)
-        self._sub_thread = sub_thread
-        self._expanded = False
-
-        # Add link button for thread jump (opens directly in Discord)
-        if guild_id:
-            url = f"https://discord.com/channels/{guild_id}/{sub_thread.id}"
-            self.add_item(discord.ui.Button(
-                label="🔗 跳转 Thread",
-                style=discord.ButtonStyle.link,
-                url=url,
-            ))
-
-    @discord.ui.button(label="📋 展开详情", style=discord.ButtonStyle.secondary)
-    async def expand_details(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self._expanded:
-            await interaction.response.send_message("Already expanded.", ephemeral=True)
-            return
-        self._expanded = True
-        button.disabled = True
-        await interaction.response.edit_message(view=self)
-
-        # Fetch messages from sub-thread and post them in the main thread
-        try:
-            messages = []
-            async for msg in self._sub_thread.history(limit=50, oldest_first=True):
-                messages.append(msg)
-
-            if not messages:
-                await interaction.followup.send("No messages in sub-thread.", ephemeral=True)
-                return
-
-            # Build a summary of the sub-agent's interaction
-            lines = []
-            for msg in messages:
-                if msg.embeds:
-                    for embed in msg.embeds:
-                        title = embed.title or ""
-                        desc = (embed.description or "")[:200]
-                        lines.append(f"**{title}** {desc}")
-                elif msg.content:
-                    lines.append(msg.content[:200])
-
-            detail_text = "\n".join(lines)
-
-            # Send as embed(s) in main thread — split if needed
-            chunks = [detail_text[i:i+4000] for i in range(0, len(detail_text), 4000)]
-            for i, chunk in enumerate(chunks[:3]):  # max 3 embeds
-                embed = discord.Embed(
-                    title=f"📋 Sub-agent Details" + (f" ({i+1})" if len(chunks) > 1 else ""),
-                    description=chunk,
-                    color=COLOR_INFO,
-                )
-                await interaction.followup.send(embed=embed)
-        except Exception as e:
-            await interaction.followup.send(f"Failed to fetch details: {e}", ephemeral=True)
 
 
 def _fmt_tokens(n: int) -> str:
@@ -229,11 +167,6 @@ class DiscordRenderer:
         # Rolling tool log (Issue #1: merge consecutive tool embeds)
         tool_log_msg: discord.Message | None = None
         tool_log_lines: list[str] = []
-        # Sub-agent thread tracking: parent_tool_use_id -> thread/renderer
-        subagent_threads: dict[str, discord.Thread] = {}
-        subagent_renderers: dict[str, "DiscordRenderer"] = {}
-        # Single subtasks thread for all sub-agents (Issue #3)
-        subtasks_thread: discord.Thread | None = None
 
         try:
             async for event in bridge.send_message(user_text):
@@ -252,112 +185,6 @@ class DiscordRenderer:
                     }
                     break
 
-                # -------------------------------------------------------
-                # Sub-agent routing: check parent_tool_use_id
-                # -------------------------------------------------------
-                ptid = getattr(event, 'parent_tool_use_id', None)
-                if ptid and ptid in subagent_renderers:
-                    sub_renderer = subagent_renderers[ptid]
-                    # Route StreamEvents to sub-thread
-                    if isinstance(event, StreamEvent):
-                        ev = event.event
-                        if ev.get("type") == "content_block_delta":
-                            delta = ev.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = delta.get("text", "")
-                                if text:
-                                    # Buffer deltas for sub-agent, flush periodically
-                                    if not hasattr(sub_renderer, '_sub_buffer'):
-                                        sub_renderer._sub_buffer = ""
-                                        sub_renderer._sub_msg = None
-                                        sub_renderer._sub_last_edit = 0.0
-                                    sub_renderer._sub_buffer += text
-                                    now = time.time()
-                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
-                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
-                                        if sub_renderer._sub_msg is None:
-                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
-                                        else:
-                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
-                                        sub_renderer._sub_last_edit = now
-                        continue
-
-                    # Route content-bearing messages to sub-thread
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, TextBlock):
-                                text = getattr(block, "text", "") or ""
-                                if text:
-                                    if not hasattr(sub_renderer, '_sub_buffer'):
-                                        sub_renderer._sub_buffer = ""
-                                        sub_renderer._sub_msg = None
-                                        sub_renderer._sub_last_edit = 0.0
-                                    sub_renderer._sub_buffer += text
-                                    now = time.time()
-                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
-                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
-                                        if sub_renderer._sub_msg is None:
-                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
-                                        else:
-                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
-                                        sub_renderer._sub_last_edit = now
-                            elif isinstance(block, ToolUseBlock):
-                                # Flush text buffer before tool embed
-                                if hasattr(sub_renderer, '_sub_buffer') and sub_renderer._sub_buffer:
-                                    if sub_renderer._sub_msg:
-                                        await sub_renderer._safe_edit(sub_renderer._sub_msg, content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
-                                    else:
-                                        await sub_renderer._safe_send(content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
-                                    sub_renderer._sub_buffer = ""
-                                    sub_renderer._sub_msg = None
-                                tool_id = getattr(block, "id", None)
-                                name = getattr(block, "name", "tool") or "tool"
-                                if tool_id:
-                                    tool_names[tool_id] = name
-                                # Rolling tool log for sub-agent
-                                if not hasattr(sub_renderer, '_tool_log_lines'):
-                                    sub_renderer._tool_log_lines = []
-                                    sub_renderer._tool_log_msg = None
-                                sub_renderer._tool_log_lines.append(f"🔄 {name}...")
-                                tool_embed = discord.Embed(
-                                    title="🔧 Tool Activity",
-                                    description="\n".join(sub_renderer._tool_log_lines[-15:]),
-                                    color=COLOR_TOOL_RUNNING,
-                                )
-                                if sub_renderer._tool_log_msg is None:
-                                    sub_renderer._tool_log_msg = await sub_renderer._safe_send(embed=tool_embed)
-                                else:
-                                    await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tool_embed)
-                            elif isinstance(block, ToolResultBlock):
-                                tool_id = getattr(block, "tool_use_id", None)
-                                result_name = tool_names.get(tool_id, "") if tool_id else ""
-                                is_err = bool(getattr(block, "is_error", False))
-                                if hasattr(sub_renderer, '_tool_log_msg') and sub_renderer._tool_log_msg is not None:
-                                    status = "✅" if not is_err else "❌"
-                                    for i in range(len(sub_renderer._tool_log_lines) - 1, -1, -1):
-                                        if sub_renderer._tool_log_lines[i].startswith("🔄 " + (result_name or "")):
-                                            if is_err:
-                                                error_text = str(block.content)[:100] if block.content else "Failed"
-                                                sub_renderer._tool_log_lines[i] = f"{status} {result_name or 'tool'}: {error_text}"
-                                            else:
-                                                sub_renderer._tool_log_lines[i] = f"{status} {result_name or 'tool'}"
-                                            break
-                                    has_errors = any("❌" in l for l in sub_renderer._tool_log_lines)
-                                    tool_embed = discord.Embed(
-                                        title="🔧 Tool Activity",
-                                        description="\n".join(sub_renderer._tool_log_lines[-15:]),
-                                        color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
-                                    )
-                                    await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tool_embed)
-                            elif isinstance(block, ThinkingBlock):
-                                thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
-                                embed = discord.Embed(
-                                    title="💭 Thinking...",
-                                    description=f"||{thinking_text}||",
-                                    color=COLOR_THINKING,
-                                )
-                                await sub_renderer._safe_send(embed=embed)
-                    continue  # Don't process in main thread
 
                 # -------------------------------------------------------
                 # Feature #61: handle StreamEvent for partial messages
@@ -460,79 +287,18 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: Task subtask (#55, #74) ---
-                            # Creates/reuses a single "Subtasks" thread for all sub-agents
+                            # Show separator embed inline in the main thread
                             if name in ("Task", "Agent"):
                                 task_depth += 1
-                                desc = block.input.get("description", "")[:300]
-                                prompt = block.input.get("prompt", "")[:500]
-
-                                # Try to create or reuse a shared subtasks thread
-                                try:
-                                    if subtasks_thread is None:
-                                        parent_channel = self.target
-                                        if hasattr(parent_channel, 'parent') and parent_channel.parent:
-                                            parent_channel = parent_channel.parent
-
-                                        anchor_msg = await parent_channel.send(
-                                            embed=discord.Embed(
-                                                title="🔀 Subtasks",
-                                                description="Sub-agent activity",
-                                                color=COLOR_INFO,
-                                            )
-                                        )
-                                        subtasks_thread = await anchor_msg.create_thread(
-                                            name="🔀 Subtasks"[:100],
-                                            auto_archive_duration=60,
-                                        )
-
-                                    sub_thread = subtasks_thread
-
-                                    if tool_id:
-                                        subagent_threads[tool_id] = sub_thread
-                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
-
-                                    # Post subtask header as separator in the shared thread
-                                    sep = discord.Embed(
-                                        title=f"━━━ Subtask #{task_depth}: {desc[:80]} ━━━",
-                                        color=COLOR_INFO,
-                                    )
-                                    await sub_thread.send(embed=sep)
-
-                                    # In the main thread, show compact summary with link
-                                    _guild_id = getattr(self.target, 'guild', None) and self.target.guild.id
-                                    _view = _SubagentDetailView(sub_thread, guild_id=_guild_id)
-                                    summary_embed = discord.Embed(
-                                        title=f"🔀 Subtask #{task_depth}",
-                                        description=f"{desc}\n\n📎 Details: {sub_thread.mention}",
-                                        color=COLOR_INFO,
-                                    )
-                                    tmsg = await self._safe_send(embed=summary_embed, view=_view)
-                                    if tmsg and tool_id:
-                                        tool_msgs[tool_id] = tmsg
-
-                                    # Post prompt in sub-thread if available
-                                    if prompt and tool_id and tool_id in subagent_renderers:
-                                        prompt_embed = discord.Embed(
-                                            title="📋 Task Prompt",
-                                            description=f"```\n{prompt[:500]}\n```",
-                                            color=COLOR_INFO,
-                                        )
-                                        await subagent_renderers[tool_id]._safe_send(embed=prompt_embed)
-
-                                except discord.HTTPException:
-                                    # Fallback: show inline if thread creation fails
-                                    display_depth = min(task_depth, 10)
-                                    indent = "│ " * (display_depth - 1) + "├─"
-                                    task_embed = discord.Embed(
-                                        title=f"{indent} 🔀 Subtask #{task_depth}",
-                                        description=desc,
-                                        color=COLOR_INFO,
-                                    )
-                                    if prompt:
-                                        task_embed.add_field(name="Prompt", value=f"```\n{prompt[:500]}\n```", inline=False)
-                                    tmsg = await self._safe_send(embed=task_embed)
-                                    if tmsg is not None and tool_id:
-                                        tool_msgs[tool_id] = tmsg
+                                desc = block.input.get("description", "")[:200]
+                                sep_embed = discord.Embed(
+                                    title=f"🔀 Subtask #{task_depth}",
+                                    description=desc or "Sub-agent started",
+                                    color=COLOR_INFO,
+                                )
+                                tmsg = await self._safe_send(embed=sep_embed)
+                                if tmsg and tool_id:
+                                    tool_msgs[tool_id] = tmsg
                                 continue
 
                             # --- Special tool display: TaskOutput (#74) ---
@@ -747,61 +513,14 @@ class DiscordRenderer:
                             result_name = tool_names.get(tool_id, "") if tool_id else ""
                             if result_name in ("Task", "Agent"):
                                 task_depth = max(0, task_depth - 1)
-                                content_str = str(block.content)[:500] if block.content else ""
                                 is_err = bool(getattr(block, "is_error", False))
-
-                                # Update sub-agent thread if one was created
-                                if tool_id and tool_id in subagent_threads:
-                                    sub_thread = subagent_threads[tool_id]
-
-                                    # Flush any remaining sub-agent buffer
-                                    if tool_id in subagent_renderers:
-                                        sr = subagent_renderers[tool_id]
-                                        if hasattr(sr, '_sub_buffer') and sr._sub_buffer:
-                                            if sr._sub_msg:
-                                                await sr._safe_edit(sr._sub_msg, content=sr._sub_buffer[:DISCORD_MAX_LEN])
-                                            else:
-                                                await sr._safe_send(content=sr._sub_buffer[:DISCORD_MAX_LEN])
-                                            sr._sub_buffer = ""
-
-                                    # Post completion in sub-thread
-                                    result_text = content_str or "Done"
+                                if tool_id in tool_msgs:
                                     done_embed = discord.Embed(
-                                        title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
-                                        description=result_text,
+                                        title=f"{'✅' if not is_err else '❌'} Subtask Complete",
+                                        description=str(block.content)[:300] if block.content else "Done",
                                         color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
                                     )
-                                    await subagent_renderers[tool_id]._safe_send(embed=done_embed)
-
-                                    # Update main thread summary
-                                    if tool_id in tool_msgs:
-                                        _guild_id = getattr(self.target, 'guild', None) and self.target.guild.id
-                                        _view = _SubagentDetailView(sub_thread, guild_id=_guild_id)
-                                        summary_embed = discord.Embed(
-                                            title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
-                                            description=f"📎 Details: {sub_thread.mention}",
-                                            color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
-                                        )
-                                        await self._safe_edit(tool_msgs[tool_id], embed=summary_embed, view=_view)
-                                    continue
-
-                                # Fallback: inline display (no sub-thread was created)
-                                if is_err:
-                                    task_result_embed = discord.Embed(
-                                        title="❌ Subtask failed",
-                                        description=content_str or "Failed",
-                                        color=COLOR_TOOL_FAILURE,
-                                    )
-                                else:
-                                    task_result_embed = discord.Embed(
-                                        title="✅ Subtask completed",
-                                        description=content_str or "Done",
-                                        color=COLOR_TOOL_SUCCESS,
-                                    )
-                                if tool_id and tool_id in tool_msgs:
-                                    await self._safe_edit(tool_msgs[tool_id], embed=task_result_embed)
-                                else:
-                                    await self._safe_send(embed=task_result_embed)
+                                    await self._safe_edit(tool_msgs[tool_id], embed=done_embed)
                                 continue
 
                             if result_name == "TaskStop":
@@ -1396,7 +1115,6 @@ class RetryView(discord.ui.View):
 __all__ = [
     "DiscordRenderer",
     "RetryView",
-    "_SubagentDetailView",
     "COLOR_CLAUDE",
     "COLOR_TOOL_RUNNING",
     "COLOR_TOOL_SUCCESS",
