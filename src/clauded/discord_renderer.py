@@ -223,7 +223,21 @@ class DiscordRenderer:
                                 if not hasattr(sub_renderer, '_tool_log_lines'):
                                     sub_renderer._tool_log_lines = []
                                     sub_renderer._tool_log_msg = None
-                                sub_renderer._tool_log_lines.append(f"🔄 {block.name}...")
+                                bname = block.name
+                                if bname == "Bash":
+                                    cmd = block.input.get("command", "")[:80]
+                                    sub_renderer._tool_log_lines.append(f"🔄 Bash: `{cmd}`")
+                                elif bname in ("Write", "Edit", "Read"):
+                                    path = block.input.get("file_path", block.input.get("file", ""))[:60]
+                                    sub_renderer._tool_log_lines.append(f"🔄 {bname}: `{path}`")
+                                elif bname == "WebSearch":
+                                    query = block.input.get("query", "")[:60]
+                                    sub_renderer._tool_log_lines.append(f"🔄 🔍 {query}")
+                                elif bname == "WebFetch":
+                                    url = block.input.get("url", "")[:60]
+                                    sub_renderer._tool_log_lines.append(f"🔄 🌐 {url}")
+                                else:
+                                    sub_renderer._tool_log_lines.append(f"🔄 {bname}...")
                                 tl_embed = discord.Embed(title="🔧 Tool Activity", description="\n".join(sub_renderer._tool_log_lines[-15:]), color=COLOR_TOOL_RUNNING)
                                 if sub_renderer._tool_log_msg is None:
                                     sub_renderer._tool_log_msg = await sub_renderer._safe_send(embed=tl_embed)
@@ -585,7 +599,24 @@ class DiscordRenderer:
                                 tool_log_lines.append(f"🔄 Skill: {skill_name}")
                             else:
                                 # Rolling tool log: merge consecutive tool embeds
-                                tool_log_lines.append(f"🔄 {name}...")
+                                # Add key info for each tool type
+                                if name == "Bash":
+                                    cmd = block.input.get("command", "")[:80]
+                                    tool_log_lines.append(f"🔄 Bash: `{cmd}`")
+                                elif name in ("Write", "Edit", "Read"):
+                                    path = block.input.get("file_path", block.input.get("file", ""))[:60]
+                                    tool_log_lines.append(f"🔄 {name}: `{path}`")
+                                elif name == "WebSearch":
+                                    query = block.input.get("query", "")[:60]
+                                    tool_log_lines.append(f"🔄 🔍 {query}")
+                                elif name == "WebFetch":
+                                    url = block.input.get("url", "")[:60]
+                                    tool_log_lines.append(f"🔄 🌐 {url}")
+                                elif name in ("Glob", "Grep"):
+                                    pattern = block.input.get("pattern", "")[:40]
+                                    tool_log_lines.append(f"🔄 {name}: `{pattern}`")
+                                else:
+                                    tool_log_lines.append(f"🔄 {name}...")
                             tool_embed = discord.Embed(
                                 title="🔧 Tool Activity",
                                 description="\n".join(tool_log_lines[-15:]),
