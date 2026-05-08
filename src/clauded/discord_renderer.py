@@ -19,8 +19,10 @@ and protects unclosed ``` code fences by closing-and-reopening them across
 chunk boundaries.
 
 Sub-agent display: when Claude spawns a sub-agent via the ``Task`` tool,
-a separator embed is posted in the main thread. All sub-agent content
-renders inline in the main thread for simplicity.
+a new thread is created in the parent channel. The thread name includes
+the main thread name so users can identify which conversation it belongs
+to. Sub-agent content is routed to the sub-thread; a compact summary
+embed with a link is posted in the main thread.
 """
 
 from __future__ import annotations
@@ -167,12 +169,103 @@ class DiscordRenderer:
         # Rolling tool log (Issue #1: merge consecutive tool embeds)
         tool_log_msg: discord.Message | None = None
         tool_log_lines: list[str] = []
+        # Sub-agent threads: tool_use_id -> discord.Thread / DiscordRenderer
+        subagent_threads: dict[str, discord.Thread] = {}
+        subagent_renderers: dict[str, "DiscordRenderer"] = {}
 
         try:
             async for event in bridge.send_message(user_text):
                 # Tool results can arrive on UserMessage objects too — handle any
                 # message that exposes a ``content`` list of blocks.
                 content = getattr(event, "content", None)
+
+                # -------------------------------------------------------
+                # Sub-agent routing: redirect to sub-thread renderer
+                # -------------------------------------------------------
+                ptid = getattr(event, 'parent_tool_use_id', None)
+                if ptid and ptid in subagent_renderers:
+                    sub_renderer = subagent_renderers[ptid]
+                    if isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, TextBlock):
+                                # Buffer text for sub-renderer
+                                if not hasattr(sub_renderer, '_sub_buffer'):
+                                    sub_renderer._sub_buffer = ""
+                                    sub_renderer._sub_msg = None
+                                    sub_renderer._sub_last_edit = 0.0
+                                sub_renderer._sub_buffer += block.text
+                                now = time.time()
+                                if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                    display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                    if sub_renderer._sub_msg is None:
+                                        sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                    else:
+                                        await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                    sub_renderer._sub_last_edit = now
+                            elif isinstance(block, ThinkingBlock):
+                                thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
+                                embed = discord.Embed(
+                                    title="💭 Thinking...",
+                                    description=f"||{thinking_text}||",
+                                    color=COLOR_THINKING,
+                                )
+                                await sub_renderer._safe_send(embed=embed)
+                            elif isinstance(block, ToolUseBlock):
+                                # Flush text buffer first
+                                if hasattr(sub_renderer, '_sub_buffer') and sub_renderer._sub_buffer:
+                                    if sub_renderer._sub_msg:
+                                        await sub_renderer._safe_edit(sub_renderer._sub_msg, content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    else:
+                                        await sub_renderer._safe_send(content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
+                                    sub_renderer._sub_buffer = ""
+                                    sub_renderer._sub_msg = None
+                                # Use rolling tool log in sub-thread
+                                if not hasattr(sub_renderer, '_tool_log_lines'):
+                                    sub_renderer._tool_log_lines = []
+                                    sub_renderer._tool_log_msg = None
+                                sub_renderer._tool_log_lines.append(f"🔄 {block.name}...")
+                                tl_embed = discord.Embed(title="🔧 Tool Activity", description="\n".join(sub_renderer._tool_log_lines[-15:]), color=COLOR_TOOL_RUNNING)
+                                if sub_renderer._tool_log_msg is None:
+                                    sub_renderer._tool_log_msg = await sub_renderer._safe_send(embed=tl_embed)
+                                else:
+                                    await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tl_embed)
+                            elif isinstance(block, ToolResultBlock):
+                                # Update tool log in sub-thread
+                                if hasattr(sub_renderer, '_tool_log_lines') and sub_renderer._tool_log_lines:
+                                    is_err = bool(getattr(block, "is_error", False))
+                                    status = "✅" if not is_err else "❌"
+                                    # Update last matching entry
+                                    for i in range(len(sub_renderer._tool_log_lines) - 1, -1, -1):
+                                        if sub_renderer._tool_log_lines[i].startswith("🔄"):
+                                            sub_renderer._tool_log_lines[i] = f"{status} {sub_renderer._tool_log_lines[i][2:]}"
+                                            break
+                                    has_errors = any("❌" in l for l in sub_renderer._tool_log_lines)
+                                    tl_embed = discord.Embed(title="🔧 Tool Activity", description="\n".join(sub_renderer._tool_log_lines[-15:]), color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS)
+                                    if sub_renderer._tool_log_msg:
+                                        await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tl_embed)
+                    # Handle StreamEvent for sub-agent
+                    if isinstance(event, StreamEvent):
+                        ev = event.event
+                        if ev.get("type") == "content_block_delta":
+                            delta = ev.get("delta", {})
+                            if delta.get("type") == "text_delta":
+                                text = delta.get("text", "")
+                                if text:
+                                    if not hasattr(sub_renderer, '_sub_buffer'):
+                                        sub_renderer._sub_buffer = ""
+                                        sub_renderer._sub_msg = None
+                                        sub_renderer._sub_last_edit = 0.0
+                                    sub_renderer._sub_buffer += text
+                                    now = time.time()
+                                    if now - sub_renderer._sub_last_edit >= EDIT_INTERVAL_SECONDS:
+                                        display = sub_renderer._sub_buffer[:DISCORD_MAX_LEN]
+                                        if sub_renderer._sub_msg is None:
+                                            sub_renderer._sub_msg = await sub_renderer._safe_send(content=display + CURSOR)
+                                        else:
+                                            await sub_renderer._safe_edit(sub_renderer._sub_msg, content=display + CURSOR)
+                                        sub_renderer._sub_last_edit = now
+                    continue
+
                 if isinstance(event, ResultMessage):
                     # Capture stats from the result
                     stats = {
@@ -287,18 +380,45 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: Task subtask (#55, #74) ---
-                            # Show separator embed inline in the main thread
+                            # Create a sub-thread for each sub-agent
                             if name in ("Task", "Agent"):
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:200]
-                                sep_embed = discord.Embed(
-                                    title=f"🔀 Subtask #{task_depth}",
-                                    description=desc or "Sub-agent started",
-                                    color=COLOR_INFO,
-                                )
-                                tmsg = await self._safe_send(embed=sep_embed)
-                                if tmsg and tool_id:
-                                    tool_msgs[tool_id] = tmsg
+
+                                try:
+                                    # Get parent channel
+                                    parent_channel = self.target
+                                    if hasattr(parent_channel, 'parent') and parent_channel.parent:
+                                        parent_channel = parent_channel.parent
+
+                                    # Thread name: [main_thread_name] > subtask description
+                                    main_name = getattr(self.target, 'name', 'session')[:30]
+                                    sub_name = f"[{main_name}] 🔀 {desc[:60]}" if desc else f"[{main_name}] 🔀 Subtask #{task_depth}"
+
+                                    anchor = await parent_channel.send(
+                                        embed=discord.Embed(title=sub_name[:100], description=f"Sub-agent for: {self.target.mention}", color=COLOR_INFO)
+                                    )
+                                    sub_thread = await anchor.create_thread(name=sub_name[:100], auto_archive_duration=60)
+
+                                    if tool_id:
+                                        subagent_threads[tool_id] = sub_thread
+                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
+
+                                    # Compact summary in main thread
+                                    summary_embed = discord.Embed(
+                                        title=f"🔀 Subtask #{task_depth}",
+                                        description=f"{desc}\n📎 {sub_thread.mention}",
+                                        color=COLOR_INFO,
+                                    )
+                                    tmsg = await self._safe_send(embed=summary_embed)
+                                    if tmsg and tool_id:
+                                        tool_msgs[tool_id] = tmsg
+                                except discord.HTTPException:
+                                    # Fallback: inline
+                                    sep = discord.Embed(title=f"🔀 Subtask #{task_depth}", description=desc, color=COLOR_INFO)
+                                    tmsg = await self._safe_send(embed=sep)
+                                    if tmsg and tool_id:
+                                        tool_msgs[tool_id] = tmsg
                                 continue
 
                             # --- Special tool display: TaskOutput (#74) ---
@@ -514,7 +634,37 @@ class DiscordRenderer:
                             if result_name in ("Task", "Agent"):
                                 task_depth = max(0, task_depth - 1)
                                 is_err = bool(getattr(block, "is_error", False))
-                                if tool_id in tool_msgs:
+
+                                if tool_id in subagent_threads:
+                                    sub_thread = subagent_threads[tool_id]
+
+                                    # Flush remaining buffer in sub-renderer
+                                    if tool_id in subagent_renderers:
+                                        sr = subagent_renderers[tool_id]
+                                        if hasattr(sr, '_sub_buffer') and sr._sub_buffer:
+                                            if sr._sub_msg:
+                                                await sr._safe_edit(sr._sub_msg, content=sr._sub_buffer[:DISCORD_MAX_LEN])
+                                            else:
+                                                await sr._safe_send(content=sr._sub_buffer[:DISCORD_MAX_LEN])
+
+                                    # Completion embed in sub-thread
+                                    done = discord.Embed(
+                                        title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                        description=str(block.content)[:300] if block.content else "Done",
+                                        color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                    )
+                                    await subagent_renderers[tool_id]._safe_send(embed=done)
+
+                                    # Update main thread summary
+                                    if tool_id in tool_msgs:
+                                        summary = discord.Embed(
+                                            title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                            description=f"📎 {sub_thread.mention}",
+                                            color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                        )
+                                        await self._safe_edit(tool_msgs[tool_id], embed=summary)
+                                elif tool_id in tool_msgs:
+                                    # Fallback: inline completion (no sub-thread was created)
                                     done_embed = discord.Embed(
                                         title=f"{'✅' if not is_err else '❌'} Subtask Complete",
                                         description=str(block.content)[:300] if block.content else "Done",
