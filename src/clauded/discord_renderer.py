@@ -693,18 +693,6 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
-                            # --- Special tool display: Skill ---
-                            if name == "Skill":
-                                skill_name = block.input.get("name", block.input.get("skill", ""))[:100]
-                                tool_embed = discord.Embed(
-                                    title=f"🎯 Skill: {skill_name}",
-                                    color=COLOR_TOOL_RUNNING,
-                                )
-                                tmsg = await self._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
                             # Rolling tool log: merge consecutive tool embeds
                             tool_log_lines.append(f"🔄 {name}...")
                             tool_embed = discord.Embed(
