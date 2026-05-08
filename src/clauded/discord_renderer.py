@@ -98,6 +98,28 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+class _StopButton(discord.ui.View):
+    """A stop button shown during streaming. Clicking interrupts the Claude session."""
+
+    def __init__(self, bridge, *, timeout: float = 600):
+        super().__init__(timeout=timeout)
+        self._bridge = bridge
+        self._stopped = False
+
+    @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger)
+    async def stop_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self._stopped:
+            await interaction.response.send_message("Already stopped.", ephemeral=True)
+            return
+        self._stopped = True
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        try:
+            await self._bridge.interrupt()
+        except Exception:
+            pass
+
+
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
 
@@ -354,6 +376,10 @@ class DiscordRenderer:
                             # Enter typewriter mode once we've been streaming long enough.
                             if not typewriter and (now - start_time) > FAST_PATH_SECONDS:
                                 typewriter = True
+                                # Show stop button when streaming starts
+                                if not hasattr(self, '_stop_view') or self._stop_view is None:
+                                    self._stop_view = _StopButton(bridge)
+                                    self._stop_msg = await self._safe_send(view=self._stop_view)
                                 live_msg, buffer = await self._typewriter_tick(
                                     live_msg, buffer
                                 )
@@ -765,6 +791,15 @@ class DiscordRenderer:
             raise
 
         # Stream finished cleanly. Flush whatever is left.
+        # Disable stop button
+        if hasattr(self, '_stop_msg') and self._stop_msg and hasattr(self, '_stop_view') and self._stop_view:
+            try:
+                self._stop_view.stop_btn.disabled = True
+                await self._safe_edit(self._stop_msg, view=self._stop_view)
+            except Exception:
+                pass
+            self._stop_view = None
+
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
 
         # Append cost/stats footer to the last sent message
