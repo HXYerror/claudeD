@@ -124,6 +124,10 @@ class InteractionHandler:
                 labels, descriptions, multi_select=multi_select, timeout=self.timeout
             )
 
+        # Add a "type your own" button to every question
+        _custom_btn = _CustomInputButton(question_text, header, view)
+        view.add_item(_custom_btn)
+
         embed = discord.Embed(
             title=f"❓ {header}"[:256],
             description=_render_question_body(question_text, options),
@@ -148,6 +152,9 @@ class InteractionHandler:
 
         if not indices:
             return None
+        # Custom text input
+        if indices == [-1] and hasattr(view, '_result') and isinstance(view._result, str):
+            return view._result
         if multi_select:
             return [labels[i] for i in indices if 0 <= i < len(labels)]
         first = indices[0]
@@ -252,6 +259,16 @@ class _BaseAskView(discord.ui.View):
     async def on_timeout(self) -> None:  # type: ignore[override]
         self._set_result(None)
 
+    def _resolve_custom(self, text: str) -> None:
+        """Resolve with a custom text answer instead of option indices."""
+        if self._resolved:
+            return
+        self._resolved = True
+        self._result = text  # store as string, not indices
+        if self._result_future is not None and not self._result_future.done():
+            self._result_future.set_result([-1])  # signal custom input
+        self.stop()
+
     def _resolve(self, indices: list[int]) -> None:
         self._set_result(indices)
         self.stop()
@@ -265,6 +282,42 @@ class _BaseAskView(discord.ui.View):
         fut = self._result_future
         if fut is not None and not fut.done():
             fut.set_result(value)
+
+
+class _CustomInputButton(discord.ui.Button):
+    """Button that opens a Modal for free-text input as alternative to preset options."""
+
+    def __init__(self, question: str, header: str, parent_view: _BaseAskView):
+        super().__init__(label="✏️ 自己输入", style=discord.ButtonStyle.secondary, row=4)
+        self._question = question
+        self._header = header
+        self._parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        modal = _QuickInputModal(self._question, self._header, self._parent_view)
+        await interaction.response.send_modal(modal)
+
+
+class _QuickInputModal(discord.ui.Modal):
+    """Modal for typing a custom answer instead of picking from options."""
+
+    answer = discord.ui.TextInput(
+        label="你的回答",
+        style=discord.TextStyle.paragraph,
+        max_length=2000,
+        required=True,
+    )
+
+    def __init__(self, question: str, header: str, parent_view: _BaseAskView):
+        super().__init__(title=header[:45] or "回答")
+        self.answer.placeholder = question[:100]
+        self._parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.answer.value.strip()
+        if text:
+            self._parent_view._resolve_custom(text)
+        await interaction.response.defer()
 
 
 class AskButtonView(_BaseAskView):
