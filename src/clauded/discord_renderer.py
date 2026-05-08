@@ -414,7 +414,9 @@ class DiscordRenderer:
                                         parent_channel = parent_channel.parent
 
                                     # Thread name: [main_thread_name] > subtask description
-                                    main_name = getattr(self.target, 'name', 'session')[:30]
+                                    main_name = getattr(self.target, 'name', 'session') or 'session'
+                                    # Strip Discord mention markers from name
+                                    main_name = re.sub(r'<@[!&]?\d+>', '', main_name).strip()[:30] or 'session'
                                     sub_name = f"[{main_name}] 🔀 {desc[:60]}" if desc else f"[{main_name}] 🔀 Subtask #{task_depth}"
 
                                     anchor = await parent_channel.send(
