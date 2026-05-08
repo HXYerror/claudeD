@@ -85,7 +85,7 @@ class ClaudedBot(commands.Bot):
         self.agent_manager = AgentManager()
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
-        self._pre_tool_notifications: bool = True
+        self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
 
     async def setup_hook(self) -> None:
