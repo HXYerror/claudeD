@@ -284,9 +284,12 @@ async def test_subagent_messages_routed_to_thread():
     text_msgs = [m for m in sub_thread._messages if m.content and "researching" in m.content]
     assert len(text_msgs) >= 1
 
-    # Tool embed should be in sub-thread
-    tool_embeds = [m for m in sub_thread._messages if m.embeds and "Bash" in (m.embeds[0].title or "")]
+    # Tool activity embed should be in sub-thread (rolling tool log)
+    tool_embeds = [m for m in sub_thread._messages if m.embeds and "Tool Activity" in (m.embeds[0].title or "")]
     assert len(tool_embeds) >= 1
+    # Bash should appear in the tool log description
+    tool_desc = tool_embeds[0].embeds[0].description or ""
+    assert "Bash" in tool_desc
 
     # Main thread should NOT have the sub-agent's text
     main_text = [m for m in main_thread._messages if m.content and "researching" in m.content]
@@ -516,17 +519,19 @@ async def test_multiple_subagents_get_separate_threads():
     renderer = DiscordRenderer(main_thread)
     await renderer.render_response(bridge, "multi-task")
 
-    # Two sub-threads should be created
-    assert len(parent_channel._threads) == 2
+    # All subtasks share a single thread
+    assert len(parent_channel._threads) == 1
 
-    # Each sub-thread should have its own text
-    thread_a = parent_channel._threads[0]
-    thread_b = parent_channel._threads[1]
-
-    a_text = [m for m in thread_a._messages if m.content and "Alpha" in m.content]
-    b_text = [m for m in thread_b._messages if m.content and "Beta" in m.content]
+    # Both subtask texts should be in the shared thread
+    shared_thread = parent_channel._threads[0]
+    a_text = [m for m in shared_thread._messages if m.content and "Alpha" in m.content]
+    b_text = [m for m in shared_thread._messages if m.content and "Beta" in m.content]
     assert len(a_text) >= 1
     assert len(b_text) >= 1
+
+    # Separator embeds should exist for each subtask
+    sep_embeds = [m for m in shared_thread._messages if m.embeds and "━━━" in (m.embeds[0].title or "")]
+    assert len(sep_embeds) >= 2
 
 
 @pytest.mark.asyncio

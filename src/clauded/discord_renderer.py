@@ -226,9 +226,14 @@ class DiscordRenderer:
         task_depth = 0                            # subtask nesting depth (#74)
         # Stats populated from ResultMessage
         stats: dict | None = None
+        # Rolling tool log (Issue #1: merge consecutive tool embeds)
+        tool_log_msg: discord.Message | None = None
+        tool_log_lines: list[str] = []
         # Sub-agent thread tracking: parent_tool_use_id -> thread/renderer
         subagent_threads: dict[str, discord.Thread] = {}
         subagent_renderers: dict[str, "DiscordRenderer"] = {}
+        # Single subtasks thread for all sub-agents (Issue #3)
+        subtasks_thread: discord.Thread | None = None
 
         try:
             async for event in bridge.send_message(user_text):
@@ -305,32 +310,45 @@ class DiscordRenderer:
                                         await sub_renderer._safe_send(content=sub_renderer._sub_buffer[:DISCORD_MAX_LEN])
                                     sub_renderer._sub_buffer = ""
                                     sub_renderer._sub_msg = None
-                                tool_embed = self._build_tool_embed(block)
                                 tool_id = getattr(block, "id", None)
                                 name = getattr(block, "name", "tool") or "tool"
                                 if tool_id:
                                     tool_names[tool_id] = name
-                                tmsg = await sub_renderer._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
+                                # Rolling tool log for sub-agent
+                                if not hasattr(sub_renderer, '_tool_log_lines'):
+                                    sub_renderer._tool_log_lines = []
+                                    sub_renderer._tool_log_msg = None
+                                sub_renderer._tool_log_lines.append(f"🔄 {name}...")
+                                tool_embed = discord.Embed(
+                                    title="🔧 Tool Activity",
+                                    description="\n".join(sub_renderer._tool_log_lines[-15:]),
+                                    color=COLOR_TOOL_RUNNING,
+                                )
+                                if sub_renderer._tool_log_msg is None:
+                                    sub_renderer._tool_log_msg = await sub_renderer._safe_send(embed=tool_embed)
+                                else:
+                                    await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tool_embed)
                             elif isinstance(block, ToolResultBlock):
                                 tool_id = getattr(block, "tool_use_id", None)
                                 result_name = tool_names.get(tool_id, "") if tool_id else ""
                                 is_err = bool(getattr(block, "is_error", False))
-                                if tool_id and tool_id in tool_msgs:
-                                    if is_err:
-                                        result_embed = discord.Embed(
-                                            title=f"❌ {result_name or 'tool'}",
-                                            color=COLOR_TOOL_FAILURE,
-                                        )
-                                        error_text = str(block.content)[:500] if block.content else "Failed"
-                                        result_embed.description = f"```\n{error_text}\n```"
-                                    else:
-                                        result_embed = discord.Embed(
-                                            title=f"✅ {result_name or 'tool'}",
-                                            color=COLOR_TOOL_SUCCESS,
-                                        )
-                                    await sub_renderer._safe_edit(tool_msgs[tool_id], embed=result_embed)
+                                if hasattr(sub_renderer, '_tool_log_msg') and sub_renderer._tool_log_msg is not None:
+                                    status = "✅" if not is_err else "❌"
+                                    for i in range(len(sub_renderer._tool_log_lines) - 1, -1, -1):
+                                        if sub_renderer._tool_log_lines[i].startswith("🔄 " + (result_name or "")):
+                                            if is_err:
+                                                error_text = str(block.content)[:100] if block.content else "Failed"
+                                                sub_renderer._tool_log_lines[i] = f"{status} {result_name or 'tool'}: {error_text}"
+                                            else:
+                                                sub_renderer._tool_log_lines[i] = f"{status} {result_name or 'tool'}"
+                                            break
+                                    has_errors = any("❌" in l for l in sub_renderer._tool_log_lines)
+                                    tool_embed = discord.Embed(
+                                        title="🔧 Tool Activity",
+                                        description="\n".join(sub_renderer._tool_log_lines[-15:]),
+                                        color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
+                                    )
+                                    await sub_renderer._safe_edit(sub_renderer._tool_log_msg, embed=tool_embed)
                             elif isinstance(block, ThinkingBlock):
                                 thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
                                 embed = discord.Embed(
@@ -442,36 +460,43 @@ class DiscordRenderer:
                                 continue
 
                             # --- Special tool display: Task subtask (#55, #74) ---
-                            # Creates a separate Discord thread for each sub-agent
+                            # Creates/reuses a single "Subtasks" thread for all sub-agents
                             if name in ("Task", "Agent"):
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:300]
                                 prompt = block.input.get("prompt", "")[:500]
 
-                                # Try to create a sub-agent thread
+                                # Try to create or reuse a shared subtasks thread
                                 try:
-                                    parent_channel = self.target
-                                    if hasattr(parent_channel, 'parent') and parent_channel.parent:
-                                        parent_channel = parent_channel.parent
+                                    if subtasks_thread is None:
+                                        parent_channel = self.target
+                                        if hasattr(parent_channel, 'parent') and parent_channel.parent:
+                                            parent_channel = parent_channel.parent
 
-                                    thread_name = f"🔀 Subtask: {desc[:80]}" if desc else f"🔀 Subtask #{task_depth}"
-
-                                    # Create thread in the parent channel
-                                    anchor_msg = await parent_channel.send(
-                                        embed=discord.Embed(
-                                            title=thread_name,
-                                            description=f"Sub-agent working on: {desc}" if desc else "Sub-agent started",
-                                            color=COLOR_INFO,
+                                        anchor_msg = await parent_channel.send(
+                                            embed=discord.Embed(
+                                                title="🔀 Subtasks",
+                                                description="Sub-agent activity",
+                                                color=COLOR_INFO,
+                                            )
                                         )
-                                    )
-                                    sub_thread = await anchor_msg.create_thread(
-                                        name=thread_name[:100],
-                                        auto_archive_duration=60,
-                                    )
+                                        subtasks_thread = await anchor_msg.create_thread(
+                                            name="🔀 Subtasks"[:100],
+                                            auto_archive_duration=60,
+                                        )
+
+                                    sub_thread = subtasks_thread
 
                                     if tool_id:
                                         subagent_threads[tool_id] = sub_thread
                                         subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
+
+                                    # Post subtask header as separator in the shared thread
+                                    sep = discord.Embed(
+                                        title=f"━━━ Subtask #{task_depth}: {desc[:80]} ━━━",
+                                        color=COLOR_INFO,
+                                    )
+                                    await sub_thread.send(embed=sep)
 
                                     # In the main thread, show compact summary with link
                                     _guild_id = getattr(self.target, 'guild', None) and self.target.guild.id
@@ -680,12 +705,17 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
-                            # Build a colored embed for the tool execution
-                            tool_embed = self._build_tool_embed(block)
-
-                            tmsg = await self._safe_send(embed=tool_embed)
-                            if tmsg is not None and tool_id:
-                                tool_msgs[tool_id] = tmsg
+                            # Rolling tool log: merge consecutive tool embeds
+                            tool_log_lines.append(f"🔄 {name}...")
+                            tool_embed = discord.Embed(
+                                title="🔧 Tool Activity",
+                                description="\n".join(tool_log_lines[-15:]),
+                                color=COLOR_TOOL_RUNNING,
+                            )
+                            if tool_log_msg is None:
+                                tool_log_msg = await self._safe_send(embed=tool_embed)
+                            else:
+                                await self._safe_edit(tool_log_msg, embed=tool_embed)
 
                             # Show file content preview for Write/Edit tools
                             if block.name == "Write":
@@ -784,10 +814,28 @@ class DiscordRenderer:
                             if result_name == "TaskStop":
                                 continue
 
-                            if tool_id and tool_id in tool_msgs:
+                            is_err = bool(getattr(block, "is_error", False))
+                            name = tool_names.get(tool_id, "tool") if tool_id else "tool"
+                            if tool_log_msg is not None:
+                                # Update rolling tool log
+                                status = "✅" if not is_err else "❌"
+                                for i in range(len(tool_log_lines) - 1, -1, -1):
+                                    if tool_log_lines[i].startswith("🔄 " + name):
+                                        if is_err:
+                                            error_text = str(block.content)[:100] if block.content else "Failed"
+                                            tool_log_lines[i] = f"{status} {name}: {error_text}"
+                                        else:
+                                            tool_log_lines[i] = f"{status} {name}"
+                                        break
+                                has_errors = any("❌" in l for l in tool_log_lines)
+                                tool_embed = discord.Embed(
+                                    title="🔧 Tool Activity",
+                                    description="\n".join(tool_log_lines[-15:]),
+                                    color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
+                                )
+                                await self._safe_edit(tool_log_msg, embed=tool_embed)
+                            elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
-                                name = tool_names.get(tool_id, "tool")
-                                is_err = bool(getattr(block, "is_error", False))
                                 if is_err:
                                     result_embed = discord.Embed(
                                         title=f"❌ {name}",
@@ -937,6 +985,7 @@ class DiscordRenderer:
         """Replace the cursor in ``live_msg`` and emit any overflow as new messages."""
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
+        buffer = self._format_tables(buffer)
         if len(buffer) <= DISCORD_MAX_LEN:
             await self._safe_edit(live_msg, content=buffer)
             self._last_msg = live_msg
@@ -966,6 +1015,7 @@ class DiscordRenderer:
         # Process channel/thread management markers before sending.
         if buffer:
             buffer = await self._process_markers(buffer)
+        buffer = self._format_tables(buffer)
 
         if typewriter and live_msg is not None:
             await self._finalize_typewriter(live_msg, buffer)
@@ -1103,6 +1153,67 @@ class DiscordRenderer:
                 log.warning("Discord edit failed after backoff", exc_info=True)
         except discord.HTTPException:
             log.warning("Discord edit failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Markdown table → code block conversion
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_tables(text: str) -> str:
+        """Convert markdown tables to code blocks for Discord.
+
+        Discord does not render markdown tables, so we wrap them in
+        code blocks where at least the column alignment is preserved.
+        Tables already inside code fences are left untouched.
+        """
+        lines_in = text.split("\n")
+        result: list[str] = []
+        in_table = False
+        in_code_fence = False
+        table_lines: list[str] = []
+
+        for line in lines_in:
+            stripped = line.strip()
+
+            # Track existing code fences
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                if in_table and table_lines:
+                    result.append("```")
+                    result.extend(table_lines)
+                    result.append("```")
+                    in_table = False
+                    table_lines = []
+                result.append(line)
+                continue
+
+            if in_code_fence:
+                result.append(line)
+                continue
+
+            if stripped.startswith("|") and stripped.endswith("|"):
+                if not in_table:
+                    in_table = True
+                    table_lines = []
+                if not all(c in "|-: " for c in stripped):
+                    table_lines.append(stripped)
+            else:
+                if in_table:
+                    if table_lines:
+                        result.append("```")
+                        result.extend(table_lines)
+                        result.append("```")
+                    in_table = False
+                    table_lines = []
+                result.append(line)
+
+        if in_table and table_lines:
+            result.append("```")
+            result.extend(table_lines)
+            result.append("```")
+
+        return "\n".join(result)
+
 
     # ------------------------------------------------------------------
     # Smart text splitting

@@ -163,3 +163,23 @@ def test_detect_open_fence_lang_picks_last_open_fence() -> None:
     # Two fences (closed pair) followed by a third open one with lang "rust".
     chunk = "```py\nfoo\n```\nbetween\n```rust\nbar"
     assert DiscordRenderer._detect_open_fence_lang(chunk) == "rust"
+
+
+# ---------------------------------------------------------------------------
+# _format_tables – code-fence awareness
+# ---------------------------------------------------------------------------
+
+
+def test_format_tables_inside_code_block():
+    """Tables already inside a code fence are not double-wrapped."""
+    text = "Output:\n```\n| id | name |\n|----|\n| 1  | Alice |\n```\nDone."
+    result = DiscordRenderer._format_tables(text)
+    assert result.count("```") == 2  # only the original pair, no double-wrapping
+
+
+def test_format_tables_normal():
+    """A bare markdown table is wrapped in a code block."""
+    text = "Results:\n| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |\nEnd."
+    result = DiscordRenderer._format_tables(text)
+    assert "```" in result  # table wrapped
+    assert "| Alice | 30 |" in result
