@@ -770,7 +770,7 @@ class DiscordRenderer:
         # Append cost/stats footer to the last sent message
         if self._last_msg and stats and stats.get('cost', 0) > 0:
             try:
-                current = self._last_msg.content or ""
+                current = (self._last_msg.content or "").rstrip(CURSOR)
                 duration_s = stats['duration_ms'] / 1000
                 footer = (
                     f"\n\n-# 💰 ${stats['cost']:.4f}"
