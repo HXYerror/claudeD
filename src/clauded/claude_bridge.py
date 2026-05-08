@@ -5,11 +5,11 @@ project directory. A bridge is created per Discord thread, used until the
 session is stopped (manually or because the thread is unbound), and then
 disconnected.
 
-The bridge optionally accepts an ``on_ask_user`` callback that is invoked
-whenever Claude calls the ``AskUserQuestion`` tool. The callback returns the
-``updated_input`` dict (typically with an extra ``answers`` field) — that is
-forwarded to the SDK as a :class:`PermissionResultAllow`. All other tools are
-unconditionally allowed.
+The bridge no longer intercepts ``AskUserQuestion`` via ``can_use_tool``
+(which caused ZodError from the CLI due to a protocol mismatch). Instead,
+``AskUserQuestion`` is handled at the renderer level: the renderer detects
+the ``ToolUseBlock`` and displays the question as an informational embed.
+In ``bypassPermissions`` mode, Claude auto-answers these questions.
 
 The bridge also supports an ``on_pre_tool_use`` callback that fires *before*
 a tool executes (via SDK PreToolUse hooks). This gives callers early
@@ -35,24 +35,13 @@ from claude_code_sdk import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_code_sdk.types import (
-    PermissionResultAllow,
-    PermissionResultDeny,
-    StreamEvent,
-    ToolPermissionContext,
-)
+from claude_code_sdk.types import StreamEvent
 
 from .config import Config
 from .session_config import SessionConfig
 
 log = logging.getLogger("clauded.claude_bridge")
 
-
-# Type alias for the async callback the bot supplies to handle
-# ``AskUserQuestion`` tool invocations. It receives the raw tool input and
-# returns either an updated input dict (forwarded to the SDK as
-# ``PermissionResultAllow.updated_input``) or ``None`` to deny the call.
-OnAskUser = Callable[[dict[str, Any]], Awaitable[dict[str, Any] | None]]
 
 # Type alias for the PreToolUse notification callback. Receives the tool
 # name and the raw tool input dict before execution begins.
@@ -77,7 +66,6 @@ Only use these when the user explicitly asks to create threads or channels.
 """
 
 
-
 class ClaudeBridge:
     """Wrapper around a ``ClaudeSDKClient`` for a single project session."""
 
@@ -91,7 +79,6 @@ class ClaudeBridge:
         self.project_path = project_path
         self._config = config
         self._session_config = sc
-        self.on_ask_user = sc.on_ask_user
         self._on_pre_tool_use = sc.on_pre_tool_use
         self._on_post_tool_use = sc.on_post_tool_use
         self._on_stop = sc.on_stop
@@ -283,27 +270,11 @@ class ClaudeBridge:
         # Always assign hooks dict (we now unconditionally register PreCompact etc.)
         hooks = _hooks_dict
 
-        use_can_use_tool = (
-            self.on_ask_user is not None
-            and self._config.claude_permission_mode == "bypassPermissions"
-        )
-
-        if self.on_ask_user is not None and not use_can_use_tool:
-            log.warning(
-                "AskUserQuestion interactive prompts disabled — "
-                "requires permission_mode='bypassPermissions' (current: '%s')",
-                self._config.claude_permission_mode,
-            )
-
         options = ClaudeCodeOptions(
             cwd=self.project_path,
             env=self._env or {},
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
-            # Only use can_use_tool when bypassing permissions.
-            # In other modes, the CLI's permission system handles tool approval,
-            # and our callback format is incompatible with the CLI's Zod schema.
-            can_use_tool=self._can_use_tool if use_can_use_tool else None,
             resume=self._resume_session_id,
             append_system_prompt=full_system_prompt,
             allowed_tools=self._allowed_tools,
@@ -324,9 +295,8 @@ class ClaudeBridge:
         self._client = client
         self._active = True
         log.info(
-            "ClaudeBridge started for cwd=%s ask_user=%s resume=%s effort=%s hooks=%s partial=%s env=%s user=%s",
+            "ClaudeBridge started for cwd=%s resume=%s effort=%s hooks=%s partial=%s env=%s user=%s",
             self.project_path,
-            bool(self.on_ask_user),
             self._resume_session_id,
             self._effort,
             bool(hooks),
@@ -433,36 +403,9 @@ class ClaudeBridge:
         if isinstance(model, str) and model:
             self._sdk_model = model
 
-    async def _can_use_tool(
-        self,
-        tool_name: str,
-        tool_input: dict[str, Any],
-        context: ToolPermissionContext,
-    ) -> PermissionResultAllow | PermissionResultDeny:
-        """SDK ``can_use_tool`` callback.
-
-        Intercepts ``AskUserQuestion`` and forwards everything else.
-        """
-        if tool_name == "AskUserQuestion" and self.on_ask_user is not None:
-            try:
-                updated = await self.on_ask_user(tool_input)
-            except Exception:
-                log.exception("on_ask_user callback raised; denying tool call")
-                return PermissionResultDeny(
-                    message="Internal error showing question UI."
-                )
-            if updated is None:
-                return PermissionResultDeny(
-                    message="No response from user (timed out)."
-                )
-            return PermissionResultAllow(updated_input=updated)
-
-        return PermissionResultAllow()
-
 
 __all__ = [
     "ClaudeBridge",
-    "OnAskUser",
     "OnPreToolUse",
     "OnPostToolUse",
     "OnStop",

@@ -393,6 +393,38 @@ class DiscordRenderer:
                                 await self._safe_send(embed=plan_embed)
                                 continue
 
+                            # --- AskUserQuestion: display as informational embed ---
+                            # The CLI auto-answers in bypassPermissions mode.
+                            # We just show the question so the user sees what was asked.
+                            if name == "AskUserQuestion":
+                                questions = block.input.get("questions", [])
+                                if questions:
+                                    q_lines = []
+                                    for q in questions:
+                                        if isinstance(q, dict):
+                                            q_text = q.get("question", "")
+                                            options = q.get("options", [])
+                                            q_lines.append(f"**{q_text}**")
+                                            for opt in options[:10]:
+                                                if isinstance(opt, dict):
+                                                    label = opt.get("label", "")
+                                                    q_lines.append(f"  • {label}")
+                                    ask_embed = discord.Embed(
+                                        title="❓ AskUserQuestion",
+                                        description="\n".join(q_lines)[:4000] or "Question with no details",
+                                        color=COLOR_INFO,
+                                    )
+                                else:
+                                    ask_embed = discord.Embed(
+                                        title="❓ AskUserQuestion",
+                                        description="Claude asked a question (auto-answered)",
+                                        color=COLOR_INFO,
+                                    )
+                                tmsg = await self._safe_send(embed=ask_embed)
+                                if tmsg is not None and tool_id:
+                                    tool_msgs[tool_id] = tmsg
+                                continue
+
                             # --- Special tool display: Task subtask (#55, #74) ---
                             # Create a sub-thread for each sub-agent
                             if name in ("Task", "Agent"):
