@@ -236,8 +236,8 @@ async def test_send_message_generator_exit_keeps_session_active(
 
 
 @pytest.mark.asyncio
-async def test_can_use_tool_none_when_not_bypass(monkeypatch):
-    """can_use_tool should be None when permission_mode != bypassPermissions."""
+async def test_can_use_tool_set_when_on_ask_user(monkeypatch):
+    """can_use_tool should be set whenever on_ask_user is provided (any permission_mode)."""
     from clauded.config import Config
     from clauded.session_config import SessionConfig
     from clauded.claude_bridge import ClaudeBridge
@@ -256,4 +256,30 @@ async def test_can_use_tool_none_when_not_bypass(monkeypatch):
     bridge = ClaudeBridge("/tmp", cfg, sc)
     await bridge.start()
     
-    assert captured[0].can_use_tool is None  # should NOT be set in default mode
+    # With the SDK permission format monkey-patch, can_use_tool is always
+    # wired when on_ask_user is set — regardless of permission_mode.
+    assert captured[0].can_use_tool is not None
+
+
+@pytest.mark.asyncio
+async def test_can_use_tool_none_when_no_on_ask_user(monkeypatch):
+    """can_use_tool should be None when on_ask_user is not provided."""
+    from clauded.config import Config
+    from clauded.session_config import SessionConfig
+    from clauded.claude_bridge import ClaudeBridge
+
+    cfg = Config(discord_bot_token="t", claude_model="sonnet",
+                 claude_permission_mode="default", projects_root="/tmp")
+    
+    captured = []
+    class FakeClient:
+        def __init__(self, options=None): captured.append(options)
+        async def connect(self, prompt=None): pass
+    
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+    
+    sc = SessionConfig()  # no on_ask_user
+    bridge = ClaudeBridge("/tmp", cfg, sc)
+    await bridge.start()
+    
+    assert captured[0].can_use_tool is None

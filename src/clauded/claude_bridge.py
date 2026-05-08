@@ -5,11 +5,10 @@ project directory. A bridge is created per Discord thread, used until the
 session is stopped (manually or because the thread is unbound), and then
 disconnected.
 
-The bridge no longer intercepts ``AskUserQuestion`` via ``can_use_tool``
-(which caused ZodError from the CLI due to a protocol mismatch). Instead,
-``AskUserQuestion`` is handled at the renderer level: the renderer detects
-the ``ToolUseBlock`` and displays the question as an informational embed.
-In ``bypassPermissions`` mode, Claude auto-answers these questions.
+The bridge intercepts ``AskUserQuestion`` via ``can_use_tool``. A
+monkey-patch corrects the SDK's control protocol serialization (the SDK
+emits ``{"allow": true}`` but the CLI expects
+``{"behavior": "allow", "updatedInput": {...}}``).
 
 The bridge also supports an ``on_pre_tool_use`` callback that fires *before*
 a tool executes (via SDK PreToolUse hooks). This gives callers early
@@ -35,12 +34,88 @@ from claude_code_sdk import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_code_sdk.types import StreamEvent
+from claude_code_sdk.types import (
+    PermissionResultAllow,
+    PermissionResultDeny,
+    StreamEvent,
+    ToolPermissionContext,
+)
 
 from .config import Config
 from .session_config import SessionConfig
 
 log = logging.getLogger("clauded.claude_bridge")
+
+
+def _patch_sdk_permission_format() -> None:
+    """Monkey-patch claude-code-sdk to use the correct control protocol format.
+
+    The SDK (v0.0.25) serializes PermissionResultAllow as ``{"allow": true}``,
+    but the CLI expects ``{"behavior": "allow", "updatedInput": {...}}``.
+    This patch intercepts the ``can_use_tool`` path in
+    ``Query._handle_control_request`` and emits the correct format.
+    """
+    try:
+        from claude_code_sdk._internal import query as _query
+        from claude_code_sdk.types import (
+            PermissionResultAllow as _Allow,
+            PermissionResultDeny as _Deny,
+            ToolPermissionContext as _Ctx,
+        )
+
+        _original_handle = _query.Query._handle_control_request
+
+        async def _patched_handle(self, request):  # type: ignore[override]
+            request_id = request["request_id"]
+            request_data = request["request"]
+            subtype = request_data.get("subtype")
+
+            if subtype == "can_use_tool" and self.can_use_tool:
+                context = _Ctx(
+                    signal=None,
+                    suggestions=request_data.get("permission_suggestions", []) or [],
+                )
+                response = await self.can_use_tool(
+                    request_data["tool_name"],
+                    request_data["input"],
+                    context,
+                )
+
+                # Use the CORRECT format expected by the CLI
+                if isinstance(response, _Allow):
+                    response_data: dict = {"behavior": "allow"}
+                    if response.updated_input is not None:
+                        response_data["updatedInput"] = response.updated_input
+                elif isinstance(response, _Deny):
+                    response_data = {"behavior": "deny", "message": response.message}
+                else:
+                    raise TypeError(f"Expected PermissionResult, got {type(response)}")
+
+                import json as _json
+
+                control_response = {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": request_id,
+                        "response": response_data,
+                    },
+                }
+                await self.transport.write(_json.dumps(control_response) + "\n")
+                return
+
+            # For all other control requests, use the original handler
+            return await _original_handle(self, request)
+
+        _query.Query._handle_control_request = _patched_handle
+    except Exception as e:
+        logging.getLogger("clauded.claude_bridge").warning(
+            "Failed to patch SDK permission format: %s", e
+        )
+
+
+# Apply the patch at import time
+_patch_sdk_permission_format()
 
 
 # Type alias for the PreToolUse notification callback. Receives the tool
@@ -82,6 +157,7 @@ class ClaudeBridge:
         self._on_pre_tool_use = sc.on_pre_tool_use
         self._on_post_tool_use = sc.on_post_tool_use
         self._on_stop = sc.on_stop
+        self.on_ask_user = sc.on_ask_user
         self.system_prompt = sc.system_prompt
         self._env = sc.env
         self._last_activity = time.time()
@@ -288,6 +364,8 @@ class ClaudeBridge:
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
             settings=self._settings,
+            # AskUserQuestion: wire can_use_tool when on_ask_user is set
+            can_use_tool=self._can_use_tool if self.on_ask_user else None,
             # user= is OS user, not Discord user; pass via system prompt instead
         )
         client = ClaudeSDKClient(options=options)
@@ -377,6 +455,35 @@ class ClaudeBridge:
     # ------------------------------------------------------------------
     # SDK callbacks
     # ------------------------------------------------------------------
+
+    async def _can_use_tool(
+        self,
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Handle tool permission requests from the CLI.
+
+        For ``AskUserQuestion``, delegate to the ``on_ask_user`` callback
+        which renders Discord UI and collects user responses. The answers
+        are returned as ``updated_input`` so the CLI sees them.
+
+        All other tools are auto-approved with ``PermissionResultAllow()``.
+        """
+        if tool_name == "AskUserQuestion" and self.on_ask_user is not None:
+            try:
+                updated = await self.on_ask_user(tool_input)
+            except Exception:
+                log.exception("on_ask_user callback failed")
+                return PermissionResultDeny(message="AskUserQuestion handler error")
+            if updated is None:
+                return PermissionResultDeny(
+                    message="User did not respond in time"
+                )
+            return PermissionResultAllow(updated_input=updated)
+
+        # Auto-approve all other tools
+        return PermissionResultAllow()
 
     def _update_stats(self, msg: ResultMessage) -> None:
         """Pull per-turn totals off a ``ResultMessage`` into instance state.
