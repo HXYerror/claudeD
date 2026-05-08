@@ -39,6 +39,7 @@ import discord
 import re
 
 from .claude_bridge import (
+    AssistantMessage,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
@@ -187,6 +188,8 @@ class DiscordRenderer:
                 ptid = getattr(event, 'parent_tool_use_id', None)
                 if ptid and ptid in subagent_renderers:
                     sub_renderer = subagent_renderers[ptid]
+                    # Only render AssistantMessage content — skip UserMessage
+                # (UserMessage contains tool results and injected context like skill files)
                     if isinstance(content, list):
                         for block in content:
                             if isinstance(block, TextBlock):
@@ -328,7 +331,9 @@ class DiscordRenderer:
                     # StreamEvent handled — skip the content-list branch
                     continue
 
-                if isinstance(content, list):
+                # Only render AssistantMessage content — skip UserMessage
+                # (UserMessage contains injected context like skill files)
+                if isinstance(content, list) and isinstance(event, AssistantMessage):
                     for block in content:
                         if isinstance(block, ThinkingBlock):
                             thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
