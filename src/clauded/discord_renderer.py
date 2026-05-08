@@ -174,8 +174,6 @@ class DiscordRenderer:
         subagent_threads: dict[str, discord.Thread] = {}
         subagent_renderers: dict[str, "DiscordRenderer"] = {}
 
-        _stream_fed = False  # tracks whether StreamEvent already fed the buffer
-
         try:
             async for event in bridge.send_message(user_text):
                 # Tool results can arrive on UserMessage objects too — handle any
@@ -303,9 +301,6 @@ class DiscordRenderer:
                 # -------------------------------------------------------
                 if isinstance(event, StreamEvent):
                     ev = event.event
-                    # Reset stream_fed on new message start
-                    if ev.get("type") == "message_start":
-                        _stream_fed = False
                     if ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {})
                         if delta.get("type") == "text_delta":
@@ -313,7 +308,6 @@ class DiscordRenderer:
                             if text:
                                 saw_text = True
                                 buffer += text
-                                _stream_fed = True  # mark: StreamEvent already fed buffer
 
                                 now = time.time()
                                 if start_time is None:
@@ -349,14 +343,9 @@ class DiscordRenderer:
                             continue
 
                         if isinstance(block, TextBlock):
-                            text = getattr(block, "text", "") or ""
-                            if not text:
-                                continue
-                            # Skip if StreamEvent already fed this text (avoid double-buffering)
-                            if _stream_fed:
-                                continue
-                            saw_text = True
-                            buffer += text
+                            # Skip: with include_partial_messages=True, all text
+                            # arrives via StreamEvent first. TextBlock is a duplicate.
+                            continue
 
                             now = time.time()
                             if start_time is None:
