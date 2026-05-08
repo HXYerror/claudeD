@@ -47,6 +47,7 @@ from .claude_bridge import (
     ToolUseBlock,
 )
 from claude_code_sdk.types import StreamEvent
+from .stream_logger import log_event as _log_stream
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -167,6 +168,7 @@ class DiscordRenderer:
         task_depth = 0                            # subtask nesting depth (#74)
         # Stats populated from ResultMessage
         stats: dict | None = None
+        _last_stop_reason: str | None = None
         # Rolling tool log (Issue #1: merge consecutive tool embeds)
         tool_log_msg: discord.Message | None = None
         tool_log_lines: list[str] = []
@@ -176,6 +178,8 @@ class DiscordRenderer:
 
         try:
             async for event in bridge.send_message(user_text):
+                _log_stream(event, buffer_len=len(buffer))
+
                 # Tool results can arrive on UserMessage objects too — handle any
                 # message that exposes a ``content`` list of blocks.
                 content = getattr(event, "content", None)
@@ -292,6 +296,7 @@ class DiscordRenderer:
                         'duration_ms': (time.time() - stream_start) * 1000,
                         'num_turns': int(getattr(event, 'num_turns', 0) or 0),
                         'model': getattr(event, 'model', '') or '',
+                        'stop_reason': _last_stop_reason,
                     }
                     break
 
@@ -301,6 +306,10 @@ class DiscordRenderer:
                 # -------------------------------------------------------
                 if isinstance(event, StreamEvent):
                     ev = event.event
+                    if ev.get("type") == "message_delta":
+                        delta = ev.get("delta", {})
+                        if "stop_reason" in delta:
+                            _last_stop_reason = delta["stop_reason"]
                     if ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {})
                         if delta.get("type") == "text_delta":
@@ -778,6 +787,8 @@ class DiscordRenderer:
                     f" │ 📤 {_fmt_tokens(stats['output_tokens'])}"
                     f" │ ⏱️ {duration_s:.1f}s"
                 )
+                if _last_stop_reason and _last_stop_reason != "end_turn":
+                    footer += f" │ ⚠️ {_last_stop_reason}"
                 await self._safe_edit(self._last_msg, content=current + footer)
             except Exception:
                 pass
@@ -917,6 +928,7 @@ class DiscordRenderer:
         tool_msgs: dict[str, discord.Message],
     ) -> None:
         """Send any remaining text once the stream completes."""
+        _log_stream(None, buffer_len=len(buffer), extra={"action": "flush", "typewriter": typewriter})
         # Process channel/thread management markers before sending.
         if buffer:
             buffer = await self._process_markers(buffer)
