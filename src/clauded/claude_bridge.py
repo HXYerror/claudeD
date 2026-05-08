@@ -288,7 +288,13 @@ class ClaudeBridge:
             env=self._env or {},
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
-            can_use_tool=self._can_use_tool if self.on_ask_user else None,
+            # Only use can_use_tool when bypassing permissions.
+            # In other modes, the CLI's permission system handles tool approval,
+            # and our callback format is incompatible with the CLI's Zod schema.
+            can_use_tool=self._can_use_tool if (
+                self.on_ask_user is not None
+                and self._config.claude_permission_mode == "bypassPermissions"
+            ) else None,
             resume=self._resume_session_id,
             append_system_prompt=full_system_prompt,
             allowed_tools=self._allowed_tools,
