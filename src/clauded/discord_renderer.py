@@ -920,7 +920,15 @@ class DiscordRenderer:
             return
 
         if buffer:
-            for chunk in self._smart_split(buffer, limit=DISCORD_MAX_LEN):
+            chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN)
+            # If too many chunks, upload as file instead of flooding
+            if len(chunks) > 4:
+                import io as _io
+                summary = buffer[:200] + "..." if len(buffer) > 200 else buffer
+                f = discord.File(_io.BytesIO(buffer.encode()), filename="claude-response.md")
+                await self._safe_send(content=summary, file=f)
+                return
+            for chunk in chunks:
                 if self._should_upload_as_file(chunk):
                     ext, code = self._extract_code_info(chunk)
                     f = discord.File(io.BytesIO(code.encode()), filename=f"output.{ext}")
