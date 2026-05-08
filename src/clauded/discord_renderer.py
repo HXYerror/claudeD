@@ -693,8 +693,13 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
-                            # Rolling tool log: merge consecutive tool embeds
-                            tool_log_lines.append(f"🔄 {name}...")
+                            # Skill: show name in log, suppress content
+                            if name == "Skill":
+                                skill_name = block.input.get("name", block.input.get("skill", ""))[:100]
+                                tool_log_lines.append(f"🔄 Skill: {skill_name}")
+                            else:
+                                # Rolling tool log: merge consecutive tool embeds
+                                tool_log_lines.append(f"🔄 {name}...")
                             tool_embed = discord.Embed(
                                 title="🔧 Tool Activity",
                                 description="\n".join(tool_log_lines[-15:]),
