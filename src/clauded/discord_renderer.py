@@ -303,6 +303,9 @@ class DiscordRenderer:
                 # -------------------------------------------------------
                 if isinstance(event, StreamEvent):
                     ev = event.event
+                    # Reset stream_fed on new message start
+                    if ev.get("type") == "message_start":
+                        _stream_fed = False
                     if ev.get("type") == "content_block_delta":
                         delta = ev.get("delta", {})
                         if delta.get("type") == "text_delta":
