@@ -1164,25 +1164,41 @@ class DiscordRenderer:
 
         Discord does not render markdown tables, so we wrap them in
         code blocks where at least the column alignment is preserved.
+        Tables already inside code fences are left untouched.
         """
         lines_in = text.split("\n")
         result: list[str] = []
         in_table = False
+        in_code_fence = False
         table_lines: list[str] = []
 
         for line in lines_in:
             stripped = line.strip()
-            # Detect table rows: starts with | and ends with |
+
+            # Track existing code fences
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                if in_table and table_lines:
+                    result.append("```")
+                    result.extend(table_lines)
+                    result.append("```")
+                    in_table = False
+                    table_lines = []
+                result.append(line)
+                continue
+
+            if in_code_fence:
+                result.append(line)
+                continue
+
             if stripped.startswith("|") and stripped.endswith("|"):
                 if not in_table:
                     in_table = True
                     table_lines = []
-                # Skip separator rows like |---|---|
                 if not all(c in "|-: " for c in stripped):
                     table_lines.append(stripped)
             else:
                 if in_table:
-                    # End of table — wrap in code block
                     if table_lines:
                         result.append("```")
                         result.extend(table_lines)
@@ -1191,7 +1207,6 @@ class DiscordRenderer:
                     table_lines = []
                 result.append(line)
 
-        # Handle table at end of text
         if in_table and table_lines:
             result.append("```")
             result.extend(table_lines)
