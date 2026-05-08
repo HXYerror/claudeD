@@ -641,10 +641,11 @@ class DiscordRenderer:
                                 preview = file_content.replace("```", "` ` `")[:1500]  # SEC2: escape before truncate
                                 if len(file_content) > 1500:
                                     preview += "\n... (truncated)"
-                                try:
-                                    await self.target.send(f"📝 `{file_path}`\n```{lang}\n{preview}\n```")
-                                except discord.HTTPException:
-                                    pass
+                                # Write preview disabled — path shown in Tool Activity log
+                                # # try:
+                                # #     await self.target.send(f"📝 `{file_path}`\n```{lang}\n{preview}\n```")
+                                # except discord.HTTPException:
+                                # pass
 
                             if block.name == "Edit":
                                 file_path = block.input.get("file_path", "unknown")
@@ -658,10 +659,11 @@ class DiscordRenderer:
                                 diff_str = "\n".join(diff_lines).replace("```", "` ` `")[:1500]  # SEC2: escape before truncate
                                 if len("\n".join(diff_lines)) > 1500:
                                     diff_str += "\n... (truncated)"
-                                try:
-                                    await self.target.send(f"✏️ `{file_path}`\n```diff\n{diff_str}\n```")
-                                except discord.HTTPException:
-                                    pass
+                                # Edit diff disabled — path shown in Tool Activity log
+                                # # try:
+                                # #     await self.target.send(f"✏️ `{file_path}`\n```diff\n{diff_str}\n```")
+                                # except discord.HTTPException:
+                                # pass
 
                         elif isinstance(block, ToolResultBlock):
                             tool_id = getattr(block, "tool_use_id", None)
