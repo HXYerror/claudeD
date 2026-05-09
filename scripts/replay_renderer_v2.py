@@ -7,11 +7,21 @@ exactly as in the live session.
 
 Then sums every send/edit final content and compares against the recorded
 result text.
+
+Set FAIL_RATE > 0 (env) to inject simulated transient HTTPException(503) on
+that fraction of sends — useful for proving the truncation fix holds under
+flaky-network conditions. Default FAIL_RATE=0 behaves as a clean replay.
+
+Usage:
+  PYTHONPATH=src .venv/bin/python scripts/replay_renderer_v2.py logs/repro2-XXXXXX.jsonl
+  FAIL_RATE=0.10 PYTHONPATH=src .venv/bin/python scripts/replay_renderer_v2.py logs/repro2-XXXXXX.jsonl
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import random
 import sys
 import time
 from collections import defaultdict
@@ -20,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
+import discord
 from claude_code_sdk.types import (
     AssistantMessage,
     ResultMessage,
@@ -42,9 +53,13 @@ _renderer_mod.time.time = _virtual_time
 
 from clauded.discord_renderer import DiscordRenderer
 
+FAIL_RATE = float(os.environ.get("FAIL_RATE", "0"))
+SEED = int(os.environ.get("SEED", "42"))
+random.seed(SEED)
+
 
 # ---------------------------------------------------------------------------
-# Fake target
+# Fake target (with optional failure injection)
 # ---------------------------------------------------------------------------
 
 _msg_id = 0
@@ -54,6 +69,12 @@ def _next_id() -> int:
     global _msg_id
     _msg_id += 1
     return _msg_id
+
+
+class _FakeResp:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.reason = "Bad Gateway"
 
 
 class FakeMessage:
@@ -77,21 +98,32 @@ class FakeMessage:
 
 
 class FakeTarget:
-    def __init__(self) -> None:
+    """Fake Discord channel. When ``fail_rate > 0`` injects HTTPException(503)
+    on that fraction of text sends to exercise the retry/fallback path."""
+
+    def __init__(self, fail_rate: float = 0.0) -> None:
         self.messages: list[FakeMessage] = []
+        self.fail_rate = fail_rate
         self.guild = None
         self.parent = None
         self.id = 1
         self.name = "fake"
+        self.fail_count = 0
+        self.success_count = 0
+        self.failed_send_chars = 0
 
     async def send(self, content=None, embed=None, file=None, **kw) -> FakeMessage:
+        if content and self.fail_rate > 0 and random.random() < self.fail_rate:
+            self.fail_count += 1
+            self.failed_send_chars += len(content)
+            raise discord.HTTPException(_FakeResp(503), "simulated transient failure")
+        self.success_count += 1
         m = FakeMessage(content=content or "", embed=embed, file=file)
         self.messages.append(m)
         return m
 
     async def create_thread(self, *, name: str, **kw):
-        # subagent path — return another FakeTarget masquerading
-        return FakeTarget()
+        return FakeTarget(fail_rate=self.fail_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -118,9 +150,6 @@ def reconstruct(events_path: Path, bodies_path: Path):
         events = [json.loads(l) for l in f if l.strip()]
     deltas, textblocks = load_bodies(bodies_path)
 
-    # delta order: text_delta events appear in order; map to event n
-    # but bodies file may have multiple delta entries per event n only if
-    # event is content_block_delta with text_delta — exactly one per event
     out = []
     for rec in events:
         kind = rec["type"]
@@ -199,7 +228,6 @@ def main() -> None:
         # fall back: same stem, .bodies.jsonl
         bodies_path = events_path.parent / (events_path.stem + ".bodies.jsonl")
     if not bodies_path.exists():
-        # try the pattern repro2-TS.bodies.jsonl
         cand = list(events_path.parent.glob(events_path.stem + ".bodies.jsonl"))
         if cand:
             bodies_path = cand[0]
@@ -208,11 +236,12 @@ def main() -> None:
             sys.exit(2)
     print(f"events: {events_path}")
     print(f"bodies: {bodies_path}")
+    print(f"FAIL_RATE={FAIL_RATE}  SEED={SEED}")
 
     events = reconstruct(events_path, bodies_path)
     print(f"reconstructed {len(events)} events")
 
-    target = FakeTarget()
+    target = FakeTarget(fail_rate=FAIL_RATE)
     renderer = DiscordRenderer(target)
     bridge = FakeBridge(events)
 
@@ -237,15 +266,14 @@ def main() -> None:
             total_text_chars += len(c)
             msg_breakdown.append((m.id, len(c), c[-100:]))
 
-    # expected text = textblock_concat (or delta_concat — they're equal in good runs)
-    expected_path = events_path.parent / (events_path.stem.replace("repro2-", "repro2-") + ".textblock_concat.txt")
+    expected_path = events_path.parent / (events_path.stem + ".textblock_concat.txt")
     if not expected_path.exists():
-        # fallback to delta
         expected_path = events_path.parent / (events_path.stem + ".delta_concat.txt")
     expected = expected_path.read_text() if expected_path.exists() else ""
     expected_total = len(expected)
 
     print(f"\nelapsed: {elapsed:.2f}s (virtual)")
+    print(f"send stats: success={target.success_count}  fail={target.fail_count}  failed_send_chars={target.failed_send_chars}")
     print(f"messages with text content: {len(msg_breakdown)}")
     print(f"total embeds: {sum(1 for m in target.messages if m.embed and not m.content)}")
     print(f"total text chars in output: {total_text_chars}")
@@ -263,7 +291,6 @@ def main() -> None:
     else:
         print(f"\n✓ exact match")
 
-    # Save the recorded final content for diff
     out_path = events_path.parent / (events_path.stem + ".rendered.txt")
     with out_path.open("w") as f:
         for mid, n, _ in msg_breakdown:

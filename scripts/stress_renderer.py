@@ -50,6 +50,19 @@ class FakeMessage:
         return self
 
 
+class FlakyMessage(FakeMessage):
+    """Like FakeMessage but ``edit`` rolls a probability and raises 503."""
+
+    def __init__(self, content="", fr: float = 0.0):
+        super().__init__(content)
+        self._fr = fr
+
+    async def edit(self, *, content=None, **kw):
+        if random.random() < self._fr:
+            raise discord.HTTPException(_Resp(503), "flaky edit")
+        return await super().edit(content=content, **kw)
+
+
 class Flaky:
     def __init__(self, fr):
         self.fr = fr
@@ -59,13 +72,12 @@ class Flaky:
         self.id = 1
         self.name = "flaky"
         self.send_fails = 0
-        self.edit_fails = 0
 
     async def send(self, content=None, **kw):
         if random.random() < self.fr:
             self.send_fails += 1
             raise discord.HTTPException(_Resp(503), "flaky send")
-        m = FakeMessage(content)
+        m = FlakyMessage(content, fr=self.fr)
         self.messages.append(m)
         return m
 
@@ -85,16 +97,6 @@ async def main():
     for i in range(50):
         # Add ~120 chars per tick, like Claude streaming
         accumulated += chunk[:120]
-        # FlakyMessage.edit can also fail — patch that too
-        if random.random() < FAIL_RATE and live is not None:
-            target.edit_fails += 1
-            # monkey-patch the FakeMessage's edit to throw once
-            orig = live.edit
-            async def boom(*a, **k):
-                live.edit = orig  # restore for next call
-                raise discord.HTTPException(_Resp(503), "flaky edit")
-            live.edit = boom
-
         live, accumulated = await r._typewriter_tick(live, accumulated)
         if len(accumulated) > 5000:
             break
@@ -109,23 +111,15 @@ async def main():
         c = m.content or ""
         total += len(c.rstrip("▌"))
 
-    print(f"send_fails={target.send_fails}  edit_fails={target.edit_fails}")
+    print(f"send_fails={target.send_fails}")
     print(f"messages produced: {len(target.messages)}")
     print(f"total chars in output: {total}")
-    # The "expected" is everything we ever fed in. Hard to compute exactly
-    # because typewriter_tick collapses cursor messages, but: every
-    # character we put into accumulated must end up in the union of all
-    # message contents.
-    # We instead check: the LAST message must contain the latest tail.
     last = target.messages[-1].content if target.messages else ""
     last_tail = accumulated[-200:]
-    print(f"last_msg_contains_tail = {last_tail in (target.messages[-1].content if target.messages else '')}")
+    print(f"last_msg_contains_tail = {last_tail in last}")
 
     # Assemble all messages in order and check accumulated text appears
     joined = "".join(m.content.rstrip("▌") for m in target.messages)
-    # Some duplication is possible (cursor messages get edited) — what we
-    # need is: every chunk that we ever streamed-in must show up at least
-    # once in the joined output.
     missing = 0
     for piece_start in range(0, len(accumulated), 200):
         piece = accumulated[piece_start:piece_start + 200]
