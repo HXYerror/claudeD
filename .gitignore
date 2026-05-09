@@ -21,6 +21,9 @@ env/
 # Persistent data
 data/
 
+# Runtime + investigation artifacts (regenerable via scripts/)
+logs/
+
 # IDE
 .idea/
 .vscode/
