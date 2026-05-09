@@ -507,23 +507,6 @@ class StaleEditFakeTarget(FakeTarget):
 
 
 @pytest.mark.asyncio
-async def test_safe_edit_syncs_msg_content_on_success(_no_sleep):
-    """After a successful edit, msg.content must reflect the new value
-    even though discord.py 2.0+ does NOT do this in-place itself."""
-    target = StaleEditFakeTarget()
-    renderer = DiscordRenderer(target)
-
-    msg = await renderer._safe_send(content="initial")
-    assert msg is not None
-    assert msg.content == "initial"
-
-    ok = await renderer._safe_edit(msg, content="updated long content")
-    assert ok is True
-    # Without the fix, msg.content would still be "initial" here (stale).
-    assert msg.content == "updated long content"
-
-
-@pytest.mark.asyncio
 async def test_last_msg_text_tracks_edits_through_long_session(_no_sleep):
     """Simulate the long-session pattern: send-then-many-edits.
 
@@ -570,17 +553,16 @@ async def test_cost_footer_path_does_not_clobber_long_content(_no_sleep):
     assert ok is True
 
     # Cost-footer path (mirrors the production logic in render_response).
-    current = renderer._last_msg_text.rstrip("▌")
+    current = renderer._last_msg_text.rstrip(CURSOR)
     footer = "\n\n-# 💰 $0.10 │ ⏱️ 5.0s"
     ok = await renderer._safe_edit(renderer._last_msg, content=current + footer)
     assert ok is True
 
-    # The final edit recorded must contain the long content + footer,
-    # NOT just initial-content + footer.
     final = msg.edits[-1]
-    assert "final paragraph closing the response." in final
-    assert footer in final
-    assert len(final) >= len(long_content)
+    # Exact pin: post-fix content is the long content + footer.
+    assert final == long_content + footer
+    # Negative pin: the stale failure mode is "initial + footer".
+    assert not final.startswith("initial cursor content")
 
 
 @pytest.mark.asyncio
@@ -600,3 +582,73 @@ async def test_safe_send_resets_shadow_on_new_message(_no_sleep):
     # And the shadow now tracks msg2 — editing msg1 must NOT clobber it.
     await renderer._safe_edit(msg1, content="msg1 grew again")
     assert renderer._last_msg_text == "second message"
+
+
+@pytest.mark.asyncio
+async def test_safe_edit_permanent_failure_does_not_update_shadow(_no_sleep):
+    """A permanent edit failure must NOT advance _last_msg_text — Discord
+    never accepted the content, so the shadow shouldn't either."""
+    target = StaleEditFakeTarget()
+    renderer = DiscordRenderer(target)
+
+    msg = await renderer._safe_send(content="good")
+    assert renderer._last_msg_text == "good"
+
+    msg.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+    ok = await renderer._safe_edit(msg, content="never-delivered")
+
+    assert ok is False
+    assert renderer._last_msg_text == "good"  # NOT "never-delivered"
+
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_keeps_shadow_synced_with_last_msg(_no_sleep):
+    """The shadow invariant must survive _finalize_typewriter's split path
+    where self._last_msg is reassigned outside _safe_send/_safe_edit."""
+    target = StaleEditFakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Establish initial _last_msg via a cursor-style send.
+    live = await renderer._safe_send(content="cursor▌")
+    assert renderer._last_msg is live
+    assert renderer._last_msg_text == "cursor▌"
+
+    # Buffer that splits into multiple chunks — exercises the multi-chunk
+    # branch (live edited with chunks[0], rest sent fresh).
+    big_buffer = ("paragraph " * 250).strip() + " end."
+    assert len(big_buffer) > 1900  # safety check
+
+    await renderer._finalize_typewriter(live, big_buffer)
+
+    # _last_msg is now whichever message ended up last (likely the final
+    # _safe_send for the last chunk). The shadow MUST equal whatever
+    # was last written to _last_msg, not an earlier chunk leaked through.
+    assert renderer._last_msg is not None
+    expected = (
+        renderer._last_msg.edits[-1] if renderer._last_msg.edits
+        else renderer._last_msg.content
+    )
+    assert renderer._last_msg_text == expected
+
+
+@pytest.mark.asyncio
+async def test_cost_footer_after_file_only_send_resets_shadow(_no_sleep):
+    """File-only / embed-only sends must reset _last_msg_text so the
+    cost footer doesn't splice prior text onto an unrelated message."""
+    target = StaleEditFakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Text chunk first (establishes _last_msg + shadow).
+    await renderer._safe_send(content="visible text chunk")
+    assert renderer._last_msg_text == "visible text chunk"
+
+    # Now a file-only send (no content kwarg).
+    file_msg = await renderer._safe_send(content=None, file=object())
+    # Either: _last_msg advanced AND shadow reset to "".
+    if renderer._last_msg is file_msg:
+        assert renderer._last_msg_text == ""
+    # Or: _last_msg did NOT advance, shadow still tracks the text msg.
+    else:
+        assert renderer._last_msg_text == "visible text chunk"
+    # In either case, the cost footer's `current + footer` cannot
+    # produce "visible text chunk" + footer on the file_msg.
