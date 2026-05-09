@@ -917,14 +917,6 @@ class DiscordRenderer:
         # The last chunk becomes the new live buffer with a fresh cursor message.
         tail = middle_and_last[-1] if middle_and_last else ""
         new_live = await self._safe_send(content=tail + CURSOR) if tail else None
-        # If the tail send failed but we still have a live_msg from `first`,
-        # keep that live_msg alive so subsequent tick can edit it. But the
-        # tail content has been lost — tracked via the error log.
-        if new_live is None and tail:
-            log.error(
-                "Typewriter tail send failed; %d chars of buffer abandoned",
-                len(tail),
-            )
         return new_live, tail
 
     async def _finalize_typewriter(
@@ -1197,7 +1189,7 @@ class DiscordRenderer:
 
         async def _op() -> discord.Message:
             await msg.edit(**kwargs)
-            return msg  # truthy sentinel — _retry_http only checks None vs not-None
+            return msg
 
         result = await self._retry_http(
             _op,

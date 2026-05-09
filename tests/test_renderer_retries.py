@@ -21,7 +21,11 @@ Scenarios covered (per round-1 review must-have list):
 9. ``_typewriter_tick`` split path with permanent-503 edit on first
    chunk → falls back to send for the first chunk.
 10. ``_finalize_typewriter`` all three branches each fall back to send
-    when edit fails permanently.
+    when edit fails permanently (split into three explicit tests).
+11. ``_typewriter_apply`` returns the original ``live_msg`` when both
+    edit and send fail permanently (pins the docstring invariant).
+12. Sub-agent typewriter path falls back to fresh send on persistent
+    edit failure (round-1 architect A1 regression).
 
 Plus a regression test for C2: ``HTTPException(MagicMock(), ...)`` flowing
 through ``_safe_send`` does not raise ``TypeError``.
@@ -341,42 +345,111 @@ async def test_typewriter_tick_split_first_chunk_edit_fails(_no_sleep):
 
 
 @pytest.mark.asyncio
-async def test_finalize_typewriter_fallback_branches(_no_sleep):
-    """All three branches fall back to send when edit fails permanently."""
+async def test_finalize_typewriter_single_message_branch(_no_sleep):
+    """Branch 1: buffer ≤ DISCORD_MAX_LEN — edit fails, falls back to send."""
     target = FakeTarget()
     renderer = DiscordRenderer(target)
-
-    # Branch 1: buffer fits in one message.
     live = FakeMessage("stale")
     live.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+
     await renderer._finalize_typewriter(live, "short content")
-    # The fresh send arrived and self._last_msg points to it.
+
+    # Edit failed permanently → fresh send took over.
     assert renderer._last_msg is not live
+    assert renderer._last_msg is not None
     assert renderer._last_msg.content == "short content"
+    # Original live_msg untouched.
+    assert live.content == "stale"
 
-    # Branch 2: buffer too big — first chunk edit fails, fallback send.
-    target2 = FakeTarget()
-    renderer2 = DiscordRenderer(target2)
-    live2 = FakeMessage("stale")
-    live2.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_defensive_empty_chunks_branch(_no_sleep, monkeypatch):
+    """Branch 2: ``_smart_split`` returns ``[]`` — defensive ``or [...]``
+    fallback kicks in. Edit on the defensive chunk fails, fallback send."""
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    live = FakeMessage("stale")
+    live.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+
+    # Force the defensive `or [buffer[:DISCORD_MAX_LEN]]` branch.
+    monkeypatch.setattr(DiscordRenderer, "_smart_split", staticmethod(lambda *a, **kw: []))
+
+    big_buffer = "z" * (DISCORD_MAX_LEN + 200)
+    await renderer._finalize_typewriter(live, big_buffer)
+
+    # The defensive chunk = buffer[:DISCORD_MAX_LEN] was sent fresh after
+    # edit failed permanently.
+    assert renderer._last_msg is not live
+    assert renderer._last_msg is not None
+    assert renderer._last_msg.content == big_buffer[:DISCORD_MAX_LEN]
+    assert live.content == "stale"
+
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_multi_chunk_first_chunk_branch(_no_sleep):
+    """Branch 3: buffer > DISCORD_MAX_LEN splits into multiple chunks —
+    edit on chunks[0] fails, falls back to send for the first chunk."""
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    live = FakeMessage("stale")
+    live.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+
+    # Buffer big enough that smart_split produces ≥ 2 chunks.
     big_buffer = "y" * (DISCORD_MAX_LEN * 2 + 50)
-    await renderer2._finalize_typewriter(live2, big_buffer)
-    # live2 not edited successfully — fallback send happened, plus the
-    # remaining chunks were sent. Total chars >= big_buffer length.
-    total = sum(len(m.content) for m in target2.messages)
-    assert total >= len(big_buffer)
-    assert renderer2._last_msg is not None
+    await renderer._finalize_typewriter(live, big_buffer)
 
-    # Branch 3: defensive empty-chunks branch — exercised when smart_split
-    # returns a degenerate result. We force it via a buffer that fits.
-    target3 = FakeTarget()
-    renderer3 = DiscordRenderer(target3)
-    live3 = FakeMessage("stale")
-    live3.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
-    await renderer3._finalize_typewriter(live3, "")
-    # Empty buffer: edit-fallback path with empty content. With C2 fix,
-    # _safe_edit on empty content returns True via the early-return.
-    # _last_msg should be set to the original live3 (edit succeeded with
-    # no kwargs) OR to a fresh send. Either is acceptable; what matters
-    # is no crash.
-    assert renderer3._last_msg is not None
+    # First chunk: edit fails → fresh send. Remaining chunks: sent normally.
+    # Total characters delivered ≥ original buffer length.
+    total = sum(len(m.content) for m in target.messages)
+    assert total >= len(big_buffer)
+    assert renderer._last_msg is not None
+    # At least 2 messages produced (one fallback send + ≥1 follow-up).
+    assert len(target.messages) >= 2
+    assert live.content == "stale"
+
+
+# ---------------------------------------------------------------------------
+# _typewriter_apply contract tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_typewriter_apply_both_paths_fail_keeps_live_msg(_no_sleep):
+    """Documented invariant: when both edit and send fail permanently,
+    return the original ``live_msg`` so the next tick has something to
+    edit against. Regressing to ``return None`` would lose this."""
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    msg = FakeMessage("previous")
+    msg.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 1)
+    target.send_raises = [_http(503)] * (MAX_HTTP_RETRIES + 1)
+
+    result = await renderer._typewriter_apply(msg, "hello")
+
+    assert result is msg                # original live_msg preserved
+    assert len(target.messages) == 0    # no new message created
+
+
+@pytest.mark.asyncio
+async def test_subagent_typewriter_falls_back_on_edit_failure(_no_sleep):
+    """Sub-agent regression test for round-1 architect A1.
+
+    The sub-agent path calls ``_typewriter_apply`` (the same method used
+    by the main path). If a future refactor inlined ``_safe_edit`` /
+    ``_safe_send`` into the sub-agent call sites, the silent-loss bug
+    would return. Pin the contract on a sub-renderer instance: when its
+    ``live_msg`` is permanently-503ing, ``_typewriter_apply`` falls back
+    to a fresh send."""
+    sub_target = FakeTarget()
+    sub_renderer = DiscordRenderer(sub_target)
+
+    live = FakeMessage("old sub content")
+    live.edit_raises = [_http(503)] * (MAX_HTTP_RETRIES + 5)
+
+    result = await sub_renderer._typewriter_apply(live, "new sub text")
+
+    assert result is not None
+    assert result is not live              # fallback created a fresh message
+    assert result.content == "new sub text"
+    # Original live unchanged — edit attempts all failed.
+    assert live.content == "old sub content"
