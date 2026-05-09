@@ -82,6 +82,15 @@ EDIT_INTERVAL_SECONDS = 1.2
 # Sleep used when an edit/send fails (likely rate-limited) before continuing.
 HTTP_BACKOFF_SECONDS = 0.5
 
+# How many extra retry attempts when a send/edit raises a transient HTTP
+# error (5xx or rate-limited) before we finally give up. Discord's REST API
+# is occasionally bumpy under load and silently dropping a chunk in the
+# middle of a long typewriter session is what produces the truncation
+# users have reported. With a short exponential backoff (0.5s, 1s, 2s, 4s,
+# 8s) we cover ~15s of intermittent badness, which is well above what we
+# observe in practice.
+MAX_HTTP_RETRIES = 5
+
 # Threshold above which a code block is uploaded as a file attachment.
 CODE_FILE_UPLOAD_THRESHOLD = 3000
 
@@ -871,7 +880,15 @@ class DiscordRenderer:
             if live_msg is None:
                 live_msg = await self._safe_send(content=content)
             else:
-                await self._safe_edit(live_msg, content=content)
+                ok = await self._safe_edit(live_msg, content=content)
+                if not ok:
+                    # Edit failed permanently — the existing live_msg is
+                    # stale. Send a fresh message so the buffer doesn't
+                    # get stuck and grow forever; the next tick will keep
+                    # extending this new message instead.
+                    fresh = await self._safe_send(content=content)
+                    if fresh is not None:
+                        live_msg = fresh
             return live_msg, buffer
 
         # Buffer too big for one message — split it.
@@ -881,39 +898,81 @@ class DiscordRenderer:
 
         first, *middle_and_last = chunks
         # Finalize the current live message with the first chunk (no cursor).
+        first_ok = True
         if live_msg is None:
-            live_msg = await self._safe_send(content=first)
+            sent = await self._safe_send(content=first)
+            first_ok = sent is not None
+            if sent is not None:
+                live_msg = sent
         else:
-            await self._safe_edit(live_msg, content=first)
+            ok = await self._safe_edit(live_msg, content=first)
+            if not ok:
+                # Edit failed — try sending instead so we don't lose `first`.
+                sent = await self._safe_send(content=first)
+                first_ok = sent is not None
+                if sent is not None:
+                    live_msg = sent
 
         # Any middle chunks are sent as their own messages with no cursor.
+        # If a middle chunk send fails permanently we have no way to recover
+        # in-band; _safe_send already logs at error level so the bot operator
+        # can see exactly which chunk was dropped.
         for mid in middle_and_last[:-1]:
             await self._safe_send(content=mid)
 
         # The last chunk becomes the new live buffer with a fresh cursor message.
         tail = middle_and_last[-1] if middle_and_last else ""
         new_live = await self._safe_send(content=tail + CURSOR) if tail else None
+        # If the tail send failed but we still have a live_msg from `first`,
+        # keep that live_msg alive so subsequent tick can edit it. But the
+        # tail content has been lost — tracked via the error log.
+        if new_live is None and tail:
+            log.error(
+                "Typewriter tail send failed; %d chars of buffer abandoned",
+                len(tail),
+            )
         return new_live, tail
 
     async def _finalize_typewriter(
         self, live_msg: discord.Message, buffer: str
     ) -> None:
-        """Replace the cursor in ``live_msg`` and emit any overflow as new messages."""
+        """Replace the cursor in ``live_msg`` and emit any overflow as new messages.
+
+        If the in-place edit fails permanently we fall back to sending a
+        fresh message; otherwise the entire ``buffer`` content would be
+        silently lost (see truncation root-cause analysis 5/9).
+        """
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
         buffer = self._format_tables(buffer)
         if len(buffer) <= DISCORD_MAX_LEN:
-            await self._safe_edit(live_msg, content=buffer)
-            self._last_msg = live_msg
+            ok = await self._safe_edit(live_msg, content=buffer)
+            if ok:
+                self._last_msg = live_msg
+            else:
+                fresh = await self._safe_send(content=buffer)
+                if fresh is not None:
+                    self._last_msg = fresh
             return
 
         chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN)
         if not chunks:  # pragma: no cover - defensive
-            await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN])
-            self._last_msg = live_msg
+            ok = await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN])
+            if ok:
+                self._last_msg = live_msg
+            else:
+                fresh = await self._safe_send(content=buffer[:DISCORD_MAX_LEN])
+                if fresh is not None:
+                    self._last_msg = fresh
             return
 
-        await self._safe_edit(live_msg, content=chunks[0])
+        ok = await self._safe_edit(live_msg, content=chunks[0])
+        if ok:
+            self._last_msg = live_msg
+        else:
+            fresh = await self._safe_send(content=chunks[0])
+            if fresh is not None:
+                self._last_msg = fresh
         for chunk in chunks[1:]:
             sent = await self._safe_send(content=chunk)
             if sent is not None:
@@ -1007,7 +1066,16 @@ class DiscordRenderer:
         file: discord.File | None = None,
         view: discord.ui.View | None = None,
     ) -> discord.Message | None:
-        """Send a message, swallowing transient HTTP errors with a short backoff."""
+        """Send a message with retry/backoff on transient HTTP errors.
+
+        Discord's REST occasionally returns 5xx or rate-limits us. Silently
+        dropping a chunk in the middle of a long typewriter session was the
+        root cause of the truncation users reported (a 471s session would
+        rack up enough send/edit calls to almost certainly hit at least one
+        transient failure). We now retry up to ``MAX_HTTP_RETRIES`` times
+        with exponential backoff before finally giving up. If we DO give up
+        on a content send, we log at error level so it shows up in bot.log.
+        """
         if not content and embed is None and file is None and view is None:
             return None
 
@@ -1021,31 +1089,57 @@ class DiscordRenderer:
         if view is not None:
             kwargs["view"] = view
 
-        try:
-            msg = await self.target.send(**kwargs)
-            if content:
-                self._last_msg = msg
-            return msg
-        except discord.RateLimited as exc:
-            retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
-            log.warning("Discord send rate-limited; sleeping %.2fs", retry)
-            await asyncio.sleep(retry)
+        backoff = HTTP_BACKOFF_SECONDS
+        for attempt in range(MAX_HTTP_RETRIES + 1):
             try:
-                # Reset file stream if it was consumed by the first attempt
-                if "file" in kwargs:
-                    f = kwargs["file"]
-                    if hasattr(f, 'fp') and hasattr(f.fp, 'seek'):
-                        f.fp.seek(0)
                 msg = await self.target.send(**kwargs)
                 if content:
                     self._last_msg = msg
                 return msg
-            except discord.HTTPException:
-                log.warning("Discord send failed after backoff", exc_info=True)
-                return None
-        except discord.HTTPException:
-            log.warning("Discord send failed", exc_info=True)
-            return None
+            except discord.RateLimited as exc:
+                wait = max(backoff, float(getattr(exc, "retry_after", 1.0)))
+                log.warning(
+                    "Discord send rate-limited (attempt %d/%d); sleeping %.2fs",
+                    attempt + 1, MAX_HTTP_RETRIES + 1, wait,
+                )
+                await asyncio.sleep(wait)
+            except discord.HTTPException as exc:
+                # 5xx and unknown HTTP errors get retried; 4xx (other than
+                # 429 which RateLimited covers) are usually our bug and
+                # retrying won't help.
+                status = getattr(exc, "status", 0) or 0
+                retriable = status >= 500 or status == 0
+                if not retriable or attempt == MAX_HTTP_RETRIES:
+                    if content:
+                        log.error(
+                            "Discord send permanently failed after %d attempts "
+                            "(status=%s); DROPPED %d chars of content",
+                            attempt + 1, status, len(content or ""),
+                            exc_info=True,
+                        )
+                    else:
+                        log.warning(
+                            "Discord send failed after %d attempts (status=%s)",
+                            attempt + 1, status, exc_info=True,
+                        )
+                    return None
+                log.warning(
+                    "Discord send transient failure (attempt %d/%d, status=%s); "
+                    "sleeping %.2fs",
+                    attempt + 1, MAX_HTTP_RETRIES + 1, status, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 8.0)
+            # Reset file stream between attempts so the second send doesn't
+            # see an empty buffer.
+            if "file" in kwargs:
+                f = kwargs["file"]
+                if hasattr(f, 'fp') and hasattr(f.fp, 'seek'):
+                    try:
+                        f.fp.seek(0)
+                    except Exception:
+                        pass
+        return None
 
     async def _safe_edit(
         self,
@@ -1054,8 +1148,16 @@ class DiscordRenderer:
         *,
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
-    ) -> None:
-        """Edit a message, swallowing transient HTTP errors."""
+    ) -> bool:
+        """Edit a message with retry/backoff. Returns True iff the edit
+        eventually succeeded.
+
+        We expose the success bool so callers (most importantly
+        ``_typewriter_tick``) can fall back to a fresh ``send`` if an edit
+        on a stale message fails permanently — otherwise the live cursor
+        message is forever stuck at its previous content while the buffer
+        keeps growing in memory.
+        """
         kwargs: dict = {}
         if content is not None:
             kwargs["content"] = content
@@ -1064,20 +1166,45 @@ class DiscordRenderer:
         if view is not None:
             kwargs["view"] = view
         if not kwargs:
-            return
+            return True
 
-        try:
-            await msg.edit(**kwargs)
-        except discord.RateLimited as exc:
-            retry = max(HTTP_BACKOFF_SECONDS, float(getattr(exc, "retry_after", 1.0)))
-            log.warning("Discord edit rate-limited; sleeping %.2fs", retry)
-            await asyncio.sleep(retry)
+        backoff = HTTP_BACKOFF_SECONDS
+        for attempt in range(MAX_HTTP_RETRIES + 1):
             try:
                 await msg.edit(**kwargs)
-            except discord.HTTPException:
-                log.warning("Discord edit failed after backoff", exc_info=True)
-        except discord.HTTPException:
-            log.warning("Discord edit failed", exc_info=True)
+                return True
+            except discord.RateLimited as exc:
+                wait = max(backoff, float(getattr(exc, "retry_after", 1.0)))
+                log.warning(
+                    "Discord edit rate-limited (attempt %d/%d); sleeping %.2fs",
+                    attempt + 1, MAX_HTTP_RETRIES + 1, wait,
+                )
+                await asyncio.sleep(wait)
+            except discord.HTTPException as exc:
+                status = getattr(exc, "status", 0) or 0
+                retriable = status >= 500 or status == 0
+                if not retriable or attempt == MAX_HTTP_RETRIES:
+                    if content:
+                        log.error(
+                            "Discord edit permanently failed after %d attempts "
+                            "(status=%s); UNDELIVERED %d chars",
+                            attempt + 1, status, len(content or ""),
+                            exc_info=True,
+                        )
+                    else:
+                        log.warning(
+                            "Discord edit failed after %d attempts (status=%s)",
+                            attempt + 1, status, exc_info=True,
+                        )
+                    return False
+                log.warning(
+                    "Discord edit transient failure (attempt %d/%d, status=%s); "
+                    "sleeping %.2fs",
+                    attempt + 1, MAX_HTTP_RETRIES + 1, status, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 8.0)
+        return False
 
     # ------------------------------------------------------------------
     # Markdown table → code block conversion
