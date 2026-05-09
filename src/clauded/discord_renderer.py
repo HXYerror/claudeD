@@ -106,6 +106,23 @@ class DiscordRenderer:
     def __init__(self, target: discord.abc.Messageable) -> None:
         self.target = target
         self._last_msg: discord.Message | None = None
+        # Track the text we LAST WROTE to ``_last_msg``.
+        #
+        # discord.py 2.0+'s ``Message.edit(...)`` is NOT in-place: per
+        # the official docstring ("Edits are no longer in-place, the
+        # newly edited message is returned instead"), the call constructs
+        # and returns a fresh ``Message`` object built from the API
+        # response. The ``self`` we passed in keeps its original
+        # ``.content`` forever — even after a successful edit. Reading
+        # ``_last_msg.content`` after we've edited it therefore returns
+        # the ORIGINAL ``send`` payload (typically the cursor-stage
+        # short text), not what's currently visible in Discord.
+        #
+        # Using that stale value to compute the cost-footer overwrite was
+        # the long-session truncation root cause: the footer wrote back
+        # ``stale_initial + footer``, clobbering everything written via
+        # subsequent edits.
+        self._last_msg_text: str = ""
 
     # ------------------------------------------------------------------
     # Helper: build a tool embed from a ToolUseBlock
@@ -777,7 +794,11 @@ class DiscordRenderer:
         # Append cost/stats footer to the last sent message
         if self._last_msg and stats and stats.get('cost', 0) > 0:
             try:
-                current = (self._last_msg.content or "").rstrip(CURSOR)
+                # Use our own shadow of what we last wrote, NOT
+                # ``_last_msg.content`` — that's discord.py's local
+                # cache and lags the actual edit state. Reading from
+                # there silently truncated long sessions.
+                current = self._last_msg_text.rstrip(CURSOR)
                 duration_s = stats['duration_ms'] / 1000
                 footer = (
                     f"\n\n-# 💰 ${stats['cost']:.4f}"
@@ -1158,6 +1179,7 @@ class DiscordRenderer:
         )
         if msg is not None and content:
             self._last_msg = msg
+            self._last_msg_text = content
         return msg
 
     async def _safe_edit(
@@ -1196,6 +1218,21 @@ class DiscordRenderer:
             label="edit",
             content_len=len(content) if content else 0,
         )
+        # Sync our content shadow on success. discord.py 2.0+'s
+        # ``Message.edit()`` is NOT in-place — per its official
+        # docstring it constructs and returns a NEW ``Message``
+        # object, leaving ``self.content`` unchanged forever. Without
+        # syncing, ``_last_msg.content`` stays at its initial-send
+        # value and any later read — most importantly the cost-footer
+        # append — silently overwrites the message in Discord with
+        # that stale value (truncation root cause, fixed 5/9).
+        if result is not None and content is not None:
+            try:
+                msg.content = content
+            except Exception:
+                pass
+            if msg is self._last_msg:
+                self._last_msg_text = content
         return result is not None
 
     # ------------------------------------------------------------------
