@@ -652,3 +652,38 @@ async def test_cost_footer_after_file_only_send_resets_shadow(_no_sleep):
         assert renderer._last_msg_text == "visible text chunk"
     # In either case, the cost footer's `current + footer` cannot
     # produce "visible text chunk" + footer on the file_msg.
+
+
+@pytest.mark.asyncio
+async def test_shadow_survives_embed_send_between_text_edits(_no_sleep):
+    """Tool embeds (sent via _safe_send(embed=...) interleaved with text
+    edits) must NOT clobber the typewriter's text shadow. Otherwise the
+    cost-footer rewrites long content with '' + footer — a recurrence of
+    bug #113 via a different trigger path (architect round-2 finding C1)."""
+    target = StaleEditFakeTarget()
+    r = DiscordRenderer(target)
+    live = await r._safe_send(content="hi▌")
+    assert r._last_msg is live
+    assert r._last_msg_text == "hi▌"
+
+    # Embed-only send (mimics tool-call embed during streaming).
+    # Pre-fix (round-2 widening): this would advance _last_msg to embed_msg
+    # and reset shadow to "", silently breaking the typewriter contract.
+    embed_msg = await r._safe_send(content=None, embed=object())
+    # Post-fix: _last_msg unchanged, shadow unchanged.
+    assert r._last_msg is live
+    assert r._last_msg_text == "hi▌"
+
+    # Typewriter resumes editing the live cursor msg.
+    long_text = "hi there, here is a long response…▌"
+    ok = await r._safe_edit(live, content=long_text)
+    assert ok is True
+    assert r._last_msg_text == long_text  # shadow tracked because is-guard holds
+
+    # Finalize.
+    final_text = "hi there, here is a long response."
+    await r._finalize_typewriter(live, final_text)
+
+    # Cost-footer-equivalent read MUST see the long content, not "".
+    current = r._last_msg_text.rstrip(CURSOR)
+    assert current.startswith("hi there, here is a long response")

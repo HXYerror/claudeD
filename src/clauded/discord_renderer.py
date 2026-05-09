@@ -980,7 +980,8 @@ class DiscordRenderer:
                 await self._safe_send(content=summary, file=f)
                 return
             for chunk in chunks:
-                if self._should_upload_as_file(chunk):
+                is_file = self._should_upload_as_file(chunk)
+                if is_file:
                     ext, code = self._extract_code_info(chunk)
                     f = discord.File(io.BytesIO(code.encode()), filename=f"output.{ext}")
                     sent = await self._safe_send(file=f)
@@ -988,6 +989,9 @@ class DiscordRenderer:
                     sent = await self._safe_send(content=chunk)
                 if sent is not None:
                     self._last_msg = sent
+                    if is_file:
+                        # File-only — no text body for the cost footer to splice.
+                        self._last_msg_text = ""
             return
 
         # No text buffered. If we never showed *anything* (no text, no tools),
@@ -1161,9 +1165,15 @@ class DiscordRenderer:
             content_len=len(content or ""),
             between_attempts=_reset_file if "file" in kwargs else None,
         )
-        if msg is not None:
+        # Only advance the shadow on content-bearing sends. Embed-only and
+        # file-only sends do NOT touch _last_msg here — callers that want
+        # _last_msg to track them must reassign it (and the shadow)
+        # explicitly. See #113 round-2: widening this to "any successful
+        # send" lets an interleaved tool-embed clobber the shadow to "" and
+        # the cost-footer then rewrites the long text down to just footer.
+        if msg is not None and content:
             self._last_msg = msg
-            self._last_msg_text = content or ""
+            self._last_msg_text = content
         return msg
 
     async def _safe_edit(
@@ -1174,8 +1184,13 @@ class DiscordRenderer:
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
     ) -> bool:
-        """Edit a message with retry/backoff. Returns ``True`` iff the edit
+        """Edit ``msg`` with retry/backoff. Returns ``True`` iff the edit
         eventually succeeded.
+
+        The shadow ``self._last_msg_text`` is updated only when ``msg is
+        self._last_msg``. Callers that mutate ``self._last_msg`` directly
+        (e.g., ``_finalize_typewriter``, ``_flush``) are responsible for
+        keeping the shadow consistent — see #113.
 
         We expose the success bool so callers (most importantly
         ``_typewriter_tick``) can fall back to a fresh ``send`` if an edit
