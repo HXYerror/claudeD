@@ -352,7 +352,11 @@ class ClaudeBridge:
             permission_mode=self._config.claude_permission_mode,
             model=self.model,
             resume=self._resume_session_id,
-            append_system_prompt=full_system_prompt,
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": full_system_prompt,
+            },
             allowed_tools=self._allowed_tools,
             disallowed_tools=self._disallowed_tools,
             extra_args=extra_args,
