@@ -23,6 +23,7 @@ import discord
 import pytest
 
 from clauded.bot import ClaudedBot
+from clauded.cogs._unbound import UNBOUND_HINT_MESSAGE
 from clauded.config import Config
 from clauded.cost_tracker import CostTracker
 from clauded.project_manager import ProjectManager
@@ -134,6 +135,8 @@ def cfg(tmp_path: Path) -> Config:
         claude_model="sonnet",
         claude_permission_mode="default",
         projects_root=str(tmp_path),
+        # These tests exercise the v1.11 unbound fallback path; enable it.
+        allow_unbound_fallback=True,
     )
 
 
@@ -248,9 +251,10 @@ async def test_unbound_channel_first_message_falls_back_to_home_with_hint(
     # the bridge would emit.
     assert thread.messages, "Hint message expected on the thread"
     first = thread.messages[0]["content"]
-    assert "isn't bound to a project" in first
-    assert "/project bind" in first
-    assert "home directory" in first
+    # tester-2: pin to the exported constant — no substring drift, no
+    # accidental wording divergence between cog and bot module.
+    assert first.startswith("💡"), f"Hint must lead with the lightbulb: {first!r}"
+    assert first == UNBOUND_HINT_MESSAGE
 
 
 @pytest.mark.asyncio
@@ -382,5 +386,8 @@ async def test_broken_home_dir_friendly_error(
     assert msg._created_thread is None
     # Friendly error replied.
     assert msg.replies, "A reply should have been sent for the broken home"
-    assert "home directory" in msg.replies[0]
-    assert "/project bind" in msg.replies[0]
+    reply = msg.replies[0]
+    assert "home directory" in reply
+    assert "/project bind" in reply
+    # sec-2: error must NOT leak the operator's home path or any other path.
+    assert str(bogus) not in reply, "broken-home reply leaked the path"

@@ -11,7 +11,6 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Set, Tuple
 
 log = logging.getLogger("clauded.project_manager")
 
@@ -32,12 +31,11 @@ class ProjectManager:
         root = projects_root if projects_root is not None else str(Path.home())
         self.projects_root: Path = Path(root).expanduser().resolve()
         self._path = Path(self.path)
-        self._projects: Dict[str, Dict[str, str]] = {}
-        self._guild_roots: Dict[str, str] = {}
+        self._projects: dict[str, dict[str, str]] = {}
+        self._guild_roots: dict[str, str] = {}
         # Channels that have already been shown the "unbound, falling back to
-        # ~" hint this process. In-memory only — a bot restart re-arms the
-        # one-shot hint, which is the desired behavior per PRD R3.1.
-        self._hinted_unbound_channels: Set[int] = set()
+        # ~" hint this process. In-memory only — bot restart re-arms the hint.
+        self._hinted_unbound_channels: set[int] = set()
         self._load()
         self._load_guild_roots()
 
@@ -146,38 +144,37 @@ class ProjectManager:
         """Return True if ``channel_id`` has a binding."""
         return str(channel_id) in self._projects
 
-    # ------------------------------------------------------------------
-    # Unbound-channel fallback (v1.11, #110)
-    # ------------------------------------------------------------------
-    def get_path_or_default(self, channel_id: int) -> Tuple[Path, bool]:
-        """Return ``(path, is_bound)`` for ``channel_id``.
+    def _assert_bound(self, channel_id: int) -> None:
+        """Defense in depth: refuse mutating ops on unbound channels.
 
-        - When the channel is bound, returns ``(Path(bound_path), True)``.
-        - When unbound, returns ``(Path.home().resolve(), False)``.
-
-        The ``.resolve()`` on the home-directory fallback is intentional —
-        macOS ships ``/tmp -> /private/tmp`` and similar symlinked layouts
-        that the v1.0 `#11` fix taught us must be canonicalized at the
-        binding boundary. Applying ``.resolve()`` to ``Path.home()`` here
-        keeps the unbound path subject to the same canonicalization
-        discipline (e.g. ``/Users/x`` vs ``/private/Users/x``) so the cwd
-        we hand to Claude matches whatever it would receive after a
-        ``/project bind``.
+        Cog-level ``reject_if_unbound`` is the user-facing guard; this raises
+        a programming-error ``ValueError`` if a caller bypasses it.
         """
+        if not self.is_bound(channel_id):
+            raise ValueError(
+                f"channel {channel_id} is not bound; cannot mutate project state"
+            )
+
+    # ------------------------------------------------------------------
+    # Unbound-channel fallback
+    # ------------------------------------------------------------------
+    def get_path_or_default(self, channel_id: int) -> tuple[Path, bool]:
+        """Return ``(path, is_bound)`` — bound path or ``$HOME`` fallback."""
         if self.is_bound(channel_id):
             p = self.get_path(channel_id)
-            assert p is not None  # is_bound guarantees this
-            return Path(p), True
-        return Path.home().resolve(), False
+            if p is not None:
+                return Path(p), True
+            # Partial entry (no path key) — treat as unbound.
+        try:
+            return Path.home().resolve(), False
+        except (RuntimeError, OSError):
+            # ``Path.home()`` raises when ``$HOME`` is unset and there's no
+            # passwd entry. Return a sentinel that ``Path.is_dir()`` reports
+            # False for, so the caller's broken-home guard fires cleanly.
+            return Path("/nonexistent"), False
 
     def should_hint_unbound(self, channel_id: int) -> bool:
-        """Return True the FIRST time we should nudge ``channel_id`` about
-        ``/project bind``; False on every subsequent call.
-
-        Atomic: the membership check and insertion happen together, so two
-        concurrent callers can't both receive ``True``. State is in-memory
-        only and resets on bot restart (PRD R3.1).
-        """
+        """Return True only the first time we should nudge ``channel_id`` about /project bind."""
         if channel_id in self._hinted_unbound_channels:
             return False
         self._hinted_unbound_channels.add(channel_id)
@@ -188,6 +185,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def set_system_prompt(self, channel_id: int, prompt: str) -> None:
         """Store a system prompt for the given channel binding."""
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.get(key)
         if entry is None:
@@ -216,6 +214,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def set_budget(self, channel_id: int, amount: float) -> None:
         """Store a max budget (USD) for the given channel binding."""
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.get(key)
         if entry is None:
@@ -245,6 +244,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def add_extra_dir(self, channel_id: int, path: str) -> str:
         """Add an extra directory. Validates and stores. Returns resolved path."""
+        self._assert_bound(channel_id)
         raw_parts = Path(path).expanduser().parts
         if any(part == ".." for part in raw_parts):
             raise ValueError("Path may not contain '..' segments.")
@@ -275,6 +275,7 @@ class ProjectManager:
 
     def remove_extra_dir(self, channel_id: int, path: str) -> bool:
         """Remove an extra directory. Returns True if removed."""
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.get(key, {})
         dirs = entry.get("extra_dirs", [])
@@ -297,6 +298,7 @@ class ProjectManager:
         ``{"type": "stdio", "command": "npx", "args": [...]}`` or
         ``{"type": "http", "url": "https://..."}``
         """
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.get(key, {})
         mcps = entry.get("mcp_servers", {})
@@ -311,6 +313,7 @@ class ProjectManager:
 
     def remove_mcp_server(self, channel_id: int, name: str) -> bool:
         """Remove an MCP server by name. Returns True if it existed."""
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.get(key, {})
         mcps = entry.get("mcp_servers", {})
@@ -326,6 +329,7 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def set_env(self, channel_id: int, key: str, value: str) -> None:
         """Store an environment variable for the given channel binding."""
+        self._assert_bound(channel_id)
         k = str(channel_id)
         entry = self._projects.get(k, {})
         env = entry.get("env", {})
@@ -341,6 +345,7 @@ class ProjectManager:
 
     def remove_env(self, channel_id: int, key: str) -> bool:
         """Remove an environment variable. Returns True if removed."""
+        self._assert_bound(channel_id)
         k = str(channel_id)
         entry = self._projects.get(k, {})
         env = entry.get("env", {})
@@ -358,6 +363,7 @@ class ProjectManager:
         """Set channel mode: 'thread' (default) or 'forum'."""
         if mode not in ("thread", "forum"):
             raise ValueError(f"Invalid mode: {mode!r}. Must be 'thread' or 'forum'.")
+        self._assert_bound(channel_id)
         key = str(channel_id)
         entry = self._projects.setdefault(key, {})
         entry["channel_mode"] = mode

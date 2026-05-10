@@ -150,7 +150,10 @@ async def project_system_prompt(interaction: discord.Interaction) -> None:
     if await reject_if_unbound(interaction, bot):
         return
 
-    modal = SystemPromptModal(channel_id, bot.project_manager)
+    # Threads inherit the parent channel's binding; resolve to parent so the
+    # prompt attaches to the bound row, not the (unbound) thread id.
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    modal = SystemPromptModal(parent_id, bot.project_manager)
     await interaction.response.send_modal(modal)
 
 
@@ -166,8 +169,11 @@ async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
         return
     if await reject_if_unbound(interaction, bot):
         return
+    # Threads inherit the parent channel's binding; resolve to parent so
+    # the extra dir attaches to the bound row, not the (unbound) thread id.
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
     try:
-        resolved = bot.project_manager.add_extra_dir(channel_id, path)
+        resolved = bot.project_manager.add_extra_dir(parent_id, path)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return

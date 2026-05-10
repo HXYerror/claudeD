@@ -1,16 +1,8 @@
 """Parametrized tests verifying Group A commands call ``reject_if_unbound``.
 
-PRD: ``docs/prd/v1.11-unbound-fallback.md`` Acceptance Criterion C.
-Issue: #127.
-
-The contract under test:
-    On an unbound channel, a Group A command MUST send the unified ephemeral
-    refusal message AND skip its underlying side-effect (no agent created, no
-    MCP server registered, no session spawned, ...).
-
-We pick one representative command per cog file. The helper itself is covered
-by ``tests/test_unbound_handler.py`` (#126); here we just verify each cog
-correctly applies the guard.
+Each Group A command MUST, on an unbound channel, send the unified
+ephemeral refusal AND skip its underlying side-effect (no agent created,
+no MCP server registered, no session spawned, ...).
 """
 
 from __future__ import annotations
@@ -23,16 +15,22 @@ import discord
 
 from clauded.bot import ClaudedBot
 from clauded.cogs._unbound import UNBOUND_REFUSE_MESSAGE
-from clauded.cogs.agent import agent_create
-from clauded.cogs.mcp import mcp_add
-from clauded.cogs.ops import review_pr
-from clauded.cogs.project import env_set
-from clauded.cogs.session import session_resume
+from clauded.cogs.agent import agent_create, agent_delete
+from clauded.cogs.mcp import mcp_add, mcp_add_url, mcp_remove
+from clauded.cogs.ops import plugin_add, review_pr
+from clauded.cogs.project import env_remove, env_set, project_add_dir
+from clauded.cogs.session import (
+    session_fork,
+    session_resume,
+    session_security_review,
+    session_settings,
+    session_worktree,
+)
 
 
 def _make_interaction(*, channel_id: int = 1234) -> MagicMock:
-    """Build a discord.Interaction stub whose channel is a bound TextChannel
-    by default. Tests mutate ``bot.project_manager.is_bound`` to flip state.
+    """Build a discord.Interaction stub. Tests mutate ``bot.project_manager.is_bound``
+    to flip channel state.
     """
     channel = MagicMock(spec=discord.TextChannel)
     channel.id = channel_id
@@ -58,17 +56,25 @@ def _make_bot(*, is_bound: bool) -> MagicMock:
     bot.project_manager = MagicMock()
     bot.project_manager.is_bound = MagicMock(return_value=is_bound)
     bot.project_manager.add_mcp_server = MagicMock()
+    bot.project_manager.remove_mcp_server = MagicMock(return_value=True)
     bot.project_manager.set_env = MagicMock()
+    bot.project_manager.remove_env = MagicMock(return_value=True)
+    bot.project_manager.add_extra_dir = MagicMock(return_value="/tmp/x")
     bot.project_manager.get_path = MagicMock(return_value=None)
     bot.project_manager.get_stored_session = MagicMock(return_value=None)
     bot.agent_manager = MagicMock()
     bot.agent_manager.create = MagicMock()
+    bot.agent_manager.delete = MagicMock(return_value=True)
+    bot._recreate_session = AsyncMock(return_value=None)
     return bot
 
 
 # (cog_name, callback, kwargs_for_call, sentinel_check)
-# sentinel_check: callable(bot) → asserts the side-effect helper was NOT invoked.
+# sentinel_check: callable(bot) → asserts the side-effect helper was NOT
+# invoked. Each entry covers a distinct (cog × subcommand) site so we
+# catch a future copy-paste site that forgets the guard.
 GROUP_A_CASES = [
+    # cogs/agent.py
     (
         "agent_create",
         agent_create.callback,
@@ -76,11 +82,31 @@ GROUP_A_CASES = [
         lambda bot: bot.agent_manager.create.assert_not_called(),
     ),
     (
+        "agent_delete",
+        agent_delete.callback,
+        {"name": "tester"},
+        lambda bot: bot.agent_manager.delete.assert_not_called(),
+    ),
+    # cogs/mcp.py
+    (
         "mcp_add",
         mcp_add.callback,
         {"name": "srv", "command": "/bin/true", "args": ""},
         lambda bot: bot.project_manager.add_mcp_server.assert_not_called(),
     ),
+    (
+        "mcp_add_url",
+        mcp_add_url.callback,
+        {"name": "srv", "url": "https://example.com/mcp"},
+        lambda bot: bot.project_manager.add_mcp_server.assert_not_called(),
+    ),
+    (
+        "mcp_remove",
+        mcp_remove.callback,
+        {"name": "srv"},
+        lambda bot: bot.project_manager.remove_mcp_server.assert_not_called(),
+    ),
+    # cogs/ops.py
     (
         "review_pr",
         review_pr.callback,
@@ -91,16 +117,60 @@ GROUP_A_CASES = [
         lambda bot: bot.project_manager.get_path.assert_not_called(),
     ),
     (
+        "plugin_add",
+        plugin_add.callback,
+        {"path": "/tmp"},
+        lambda bot: bot._recreate_session.assert_not_called(),
+    ),
+    # cogs/session.py
+    (
         "session_resume",
         session_resume.callback,
         {},
         lambda bot: bot.project_manager.get_stored_session.assert_not_called(),
     ),
     (
+        "session_fork",
+        session_fork.callback,
+        {},
+        lambda bot: bot._recreate_session.assert_not_called(),
+    ),
+    (
+        "session_worktree",
+        session_worktree.callback,
+        {"name": "feat"},
+        lambda bot: bot._recreate_session.assert_not_called(),
+    ),
+    (
+        "session_security_review",
+        session_security_review.callback,
+        {},
+        lambda bot: bot._recreate_session.assert_not_called(),
+    ),
+    (
+        "session_settings",
+        session_settings.callback,
+        {"json_str": "{}"},
+        lambda bot: bot._recreate_session.assert_not_called(),
+    ),
+    # cogs/project.py
+    (
         "env_set",
         env_set.callback,
         {"key": "FOO", "value": "bar"},
         lambda bot: bot.project_manager.set_env.assert_not_called(),
+    ),
+    (
+        "env_remove",
+        env_remove.callback,
+        {"key": "FOO"},
+        lambda bot: bot.project_manager.remove_env.assert_not_called(),
+    ),
+    (
+        "project_add_dir",
+        project_add_dir.callback,
+        {"path": "/tmp"},
+        lambda bot: bot.project_manager.add_extra_dir.assert_not_called(),
     ),
 ]
 
@@ -123,9 +193,6 @@ async def test_group_a_refuses_on_unbound(
 
     no_side_effect(bot)
 
-    # Refusal message must have gone out — either via response or followup
-    # depending on whether the command deferred first. Helper unit tests cover
-    # the routing logic; here we just check ONE of them carries the message.
     response_calls = [
         ca.args + tuple(ca.kwargs.values())
         for ca in interaction.response.send_message.await_args_list
@@ -151,26 +218,25 @@ async def test_group_a_passes_through_on_bound(
     name: str, callback, kwargs: dict, no_side_effect
 ) -> None:
     """Each Group A command, when run on a bound channel, does NOT send the
-    unified refusal. (The command may still bail for other reasons — e.g.,
-    ``/session resume`` returning ``No saved session to resume.`` — but the
-    bound check itself must pass through.)
+    unified refusal. We also positively assert that ``is_bound`` was
+    consulted, which proves the gate executed (and didn't reject) instead
+    of being silently bypassed by a future refactor.
     """
     interaction = _make_interaction()
     bot = _make_bot(is_bound=True)
     interaction.client = bot
 
-    # Stub out anything that would otherwise blow up in the body. We only
-    # care that the FIRST gate (reject_if_unbound) didn't fire.
-    bot._recreate_session = AsyncMock(return_value=None)
     bot.session_manager = MagicMock()
     bot.session_manager.get_lock = MagicMock(return_value=AsyncMock())
     bot.session_manager.create_session = AsyncMock(return_value=None)
+    bot.session_manager.stop_session = AsyncMock(return_value=True)
+    bot.session_manager.get_session = MagicMock(return_value=None)
 
     try:
         await callback(interaction, **kwargs)
     except Exception:
-        # Some commands fail downstream because of incomplete mocks; that's
-        # fine — we only assert the helper didn't reject.
+        # Some commands fail downstream because of incomplete mocks; the
+        # gate's outcome was already captured above.
         pass
 
     response_calls = [
@@ -188,3 +254,5 @@ async def test_group_a_passes_through_on_bound(
         f"{name} sent UNBOUND_REFUSE_MESSAGE on a BOUND channel. "
         f"response={response_calls} followup={followup_calls}"
     )
+
+    bot.project_manager.is_bound.assert_called()

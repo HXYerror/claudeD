@@ -126,8 +126,11 @@ cp .env.example .env
 | `CLAUDE_MODEL` | No | `sonnet` | Default Claude model (`sonnet`, `opus`, `haiku`, or full model ID) |
 | `CLAUDE_PERMISSION_MODE` | No | `default` | Permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` |
 | `CLAUDED_PROJECTS_ROOT` | No | `~` (home dir) | Root directory for project bindings — paths outside this are rejected |
+| `CLAUDED_ALLOW_UNBOUND_FALLBACK` | No | `false` | When `1`/`true`, `@bot` in an unbound channel falls back to `$HOME` as `cwd`. When unset/`false` (default), the message is silently ignored — run `/project bind <path>` first. ⚠️ See security warning below |
 
 > ⚠️ **Security warning:** Setting `CLAUDE_PERMISSION_MODE=bypassPermissions` disables all tool-permission prompts. Claude will execute shell commands and file edits without confirmation. Only use this if every Discord user with channel access is trusted with shell access on the host machine.
+
+> ⚠️ **Security warning:** Setting `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` lets *any* user with channel-write permission run Claude with `cwd=$HOME` — including reading `~/.ssh`, `~/.aws`, etc. Unlike `/project bind`, the fallback path is *not* validated against `CLAUDED_PROJECTS_ROOT` and *does not* require Discord administrator. Only enable if every potential message author is trusted with read access to the operator's home directory. The default (`false`) is the v1.0 behavior: unbound channels ignore `@bot`.
 
 ---
 

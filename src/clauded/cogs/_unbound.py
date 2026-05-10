@@ -1,20 +1,4 @@
-"""Unified "channel not bound" refusal for Group A (project-mutating) commands.
-
-See ``docs/prd/v1.11-unbound-fallback.md`` (R2) for the classification of
-commands and rationale. Group A commands write project-scoped state and
-MUST refuse on unbound channels rather than silently scattering files into
-``~``.
-
-This module exists so the message text and the parent-thread fallback logic
-live in exactly one place, and so callers across cogs can add a single guard:
-
-    from clauded.cogs._unbound import reject_if_unbound
-
-    async def my_command(interaction):
-        if await reject_if_unbound(interaction, bot):
-            return
-        ...
-"""
+"""Unified unbound-channel refusal + hint string for Group A commands."""
 
 from __future__ import annotations
 
@@ -26,27 +10,39 @@ UNBOUND_REFUSE_MESSAGE = (
     "Run `/project bind <path>` first, then retry."
 )
 
+UNBOUND_HINT_MESSAGE = (
+    "💡 This channel isn't bound to a project. "
+    "I'll use your home directory (`~`) as the working directory. "
+    "Run `/project bind <path>` to scope to a specific project."
+)
+
+NO_CHANNEL_MESSAGE = "❌ This command must be run in a channel."
+
 
 async def reject_if_unbound(interaction: discord.Interaction, bot) -> bool:
-    """Return ``True`` if the interaction's channel is unbound and a refusal
-    reply has been sent. Caller MUST ``return`` immediately after a ``True``
-    result — the response has already been sent to Discord.
-
-    Threads inherit their parent channel's bound state, so we resolve the
-    parent ``channel_id`` for ``discord.Thread`` instances before checking
-    ``ProjectManager.is_bound``.
-    """
+    """Refuse Group A commands on unbound channels. Returns True iff refusal sent."""
     ch = interaction.channel
-    channel_id = ch.parent_id if isinstance(ch, discord.Thread) else ch.id
+    if ch is None:
+        # DM, cache miss, or permission gap — fall back to interaction.channel_id.
+        channel_id = interaction.channel_id
+    elif isinstance(ch, discord.Thread):
+        # Threads inherit the parent channel's bound state.
+        channel_id = ch.parent_id or interaction.channel_id
+    else:
+        channel_id = ch.id
+
+    sender = (
+        interaction.followup.send
+        if interaction.response.is_done()
+        else interaction.response.send_message
+    )
+
+    if channel_id is None:
+        await sender(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return True
+
     if bot.project_manager.is_bound(channel_id):
         return False
 
-    if not interaction.response.is_done():
-        await interaction.response.send_message(
-            UNBOUND_REFUSE_MESSAGE, ephemeral=True
-        )
-    else:
-        await interaction.followup.send(
-            UNBOUND_REFUSE_MESSAGE, ephemeral=True
-        )
+    await sender(UNBOUND_REFUSE_MESSAGE, ephemeral=True)
     return True
