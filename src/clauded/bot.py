@@ -194,7 +194,12 @@ class ClaudedBot(commands.Bot):
     # ------------------------------------------------------------------
 
     async def _handle_channel_message(self, message: discord.Message) -> None:
-        """Channel (non-thread) message: open a new thread + session."""
+        """Channel (non-thread) message: open a new thread + session.
+
+        If the channel is bound, scope the session to that project path.
+        Otherwise (v1.11, #110) fall back to the operator's home directory
+        and surface a one-time hint nudging the user to ``/project bind``.
+        """
         # Only trigger if bot is mentioned
         # Accept real @mention, role mention, or text containing bot name
         bot_mentioned = self.user and self.user.id in [m.id for m in message.mentions]
@@ -204,20 +209,42 @@ class ClaudedBot(commands.Bot):
             return
 
         channel = message.channel
-        if not self.project_manager.is_bound(channel.id):
-            return  # Channel isn't wired up; ignore.
+        # v1.11 #110: bound channels keep their stored path; unbound
+        # channels fall back to ``$HOME`` so the bot is usable immediately
+        # without a prior ``/project bind``.
+        project_path_obj, is_bound = self.project_manager.get_path_or_default(channel.id)
 
-        project_path = self.project_manager.get_path(channel.id)
-        if project_path is None:
-            log.warning("Channel %s reports bound but has no path", channel.id)
-            return
+        # Safety guard for a broken $HOME (R4.1). ``Path.home()`` itself
+        # raises ``RuntimeError`` if ``$HOME`` is unset and there's no
+        # passwd entry; ``is_dir()`` covers the "set but doesn't exist"
+        # case. Only check on the unbound path — bound paths are validated
+        # at bind time.
+        if not is_bound:
+            try:
+                home_ok = project_path_obj.is_dir()
+            except (OSError, RuntimeError) as exc:
+                home_ok = False
+                home_err: Exception = exc
+            else:
+                home_err = OSError(f"home directory does not exist: {project_path_obj}")
+            if not home_ok:
+                try:
+                    await message.reply(
+                        f"❌ Couldn't determine your home directory ({home_err}). "
+                        "Run `/project bind <path>` to use this bot."
+                    )
+                except discord.HTTPException:
+                    log.debug("Could not surface broken-home error to channel")
+                return
+
+        project_path = str(project_path_obj)
 
         # #87: support forum channel mode
         channel_mode = self.project_manager.get_channel_mode(channel.id)
         is_forum = channel_mode == "forum" and isinstance(channel, discord.ForumChannel)
 
         if not is_forum and not isinstance(channel, discord.TextChannel):
-            log.warning("Bound channel %s is not a TextChannel or ForumChannel; skipping", channel.id)
+            log.warning("Channel %s is not a TextChannel or ForumChannel; skipping", channel.id)
             return
 
         # Strip the bot mention from the message content
@@ -256,6 +283,20 @@ class ClaudedBot(commands.Bot):
             except discord.HTTPException:
                 log.debug("Could not surface thread-creation error to channel")
             return
+
+        # v1.11 #110: post the one-time unbound hint as the FIRST thread
+        # message, before the bridge starts streaming, so the user sees it
+        # immediately. ``should_hint_unbound`` is atomic and resets only on
+        # bot restart, per PRD R3.
+        if not is_bound and self.project_manager.should_hint_unbound(channel.id):
+            try:
+                await thread.send(
+                    "💡 This channel isn't bound to a project. I'll use your "
+                    "home directory (`~`) as the working directory. Run "
+                    "`/project bind <path>` to scope to a specific project."
+                )
+            except discord.HTTPException:
+                log.debug("Could not post unbound-fallback hint to thread")
 
         # Acquire the per-thread lock *before* creating the session so a
         # concurrent thread message that Discord delivers out of order can't
@@ -361,14 +402,37 @@ class ClaudedBot(commands.Bot):
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
     ) -> None:
-        """Thread message: route to the existing/new session for that thread."""
-        if not self.project_manager.is_bound(parent_id):
-            return  # Parent channel isn't bound; ignore.
+        """Thread message: route to the existing/new session for that thread.
 
-        project_path = self.project_manager.get_path(parent_id)
-        if project_path is None:
-            log.warning("Parent channel %s bound but has no path", parent_id)
-            return
+        Uses the same bound/$HOME fallback as :meth:`_handle_channel_message`
+        for the parent channel. We deliberately do NOT post the hint here —
+        it already fired when the thread was first opened (or will fire
+        once for the parent channel id if a thread persists across a bot
+        restart and the user posts in it before mentioning the bot in the
+        parent channel).
+        """
+        # v1.11 #110: bound parent → bound path; unbound → $HOME fallback.
+        project_path_obj, is_bound = self.project_manager.get_path_or_default(parent_id)
+
+        if not is_bound:
+            try:
+                home_ok = project_path_obj.is_dir()
+            except (OSError, RuntimeError) as exc:
+                home_ok = False
+                home_err: Exception = exc
+            else:
+                home_err = OSError(f"home directory does not exist: {project_path_obj}")
+            if not home_ok:
+                try:
+                    await message.reply(
+                        f"❌ Couldn't determine your home directory ({home_err}). "
+                        "Run `/project bind <path>` to use this bot."
+                    )
+                except discord.HTTPException:
+                    log.debug("Could not surface broken-home error to thread")
+                return
+
+        project_path = str(project_path_obj)
 
         thread_id = message.channel.id
         # Acquire the per-thread lock for the entire send/render cycle so
