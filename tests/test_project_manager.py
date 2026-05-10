@@ -452,3 +452,55 @@ def test_add_extra_dir_outside_root_raises(tmp_path):
     pm.bind(1, str(root))  # need a binding first
     with pytest.raises(ValueError, match="outside"):
         pm.add_extra_dir(1, str(outside))
+
+
+# ---------------------------------------------------------------------------
+# Unbound-channel fallback helpers (v1.11, #110)
+# ---------------------------------------------------------------------------
+
+
+def test_get_path_or_default_bound(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """A bound channel returns ``(bound_path, True)``."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(100, str(proj))
+
+    path, is_bound = manager.get_path_or_default(100)
+    assert is_bound is True
+    assert path == proj.resolve()
+
+
+def test_get_path_or_default_unbound(manager: ProjectManager) -> None:
+    """An unbound channel returns ``(Path.home().resolve(), False)``."""
+    path, is_bound = manager.get_path_or_default(101)
+    assert is_bound is False
+    assert path == Path.home().resolve()
+
+
+def test_should_hint_unbound_first_call_returns_true(
+    manager: ProjectManager,
+) -> None:
+    """First call for a channel returns True."""
+    assert manager.should_hint_unbound(200) is True
+
+
+def test_should_hint_unbound_second_call_returns_false(
+    manager: ProjectManager,
+) -> None:
+    """Subsequent calls for the same channel return False."""
+    assert manager.should_hint_unbound(201) is True
+    assert manager.should_hint_unbound(201) is False
+    assert manager.should_hint_unbound(201) is False
+
+
+def test_should_hint_unbound_isolated_per_channel(
+    manager: ProjectManager,
+) -> None:
+    """Different channel ids each get their own first-hint."""
+    assert manager.should_hint_unbound(300) is True
+    assert manager.should_hint_unbound(301) is True
+    # And each is now suppressed independently.
+    assert manager.should_hint_unbound(300) is False
+    assert manager.should_hint_unbound(301) is False

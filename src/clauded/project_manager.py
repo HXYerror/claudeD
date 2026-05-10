@@ -11,7 +11,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Set, Tuple
 
 log = logging.getLogger("clauded.project_manager")
 
@@ -34,6 +34,10 @@ class ProjectManager:
         self._path = Path(self.path)
         self._projects: Dict[str, Dict[str, str]] = {}
         self._guild_roots: Dict[str, str] = {}
+        # Channels that have already been shown the "unbound, falling back to
+        # ~" hint this process. In-memory only — a bot restart re-arms the
+        # one-shot hint, which is the desired behavior per PRD R3.1.
+        self._hinted_unbound_channels: Set[int] = set()
         self._load()
         self._load_guild_roots()
 
@@ -141,6 +145,43 @@ class ProjectManager:
     def is_bound(self, channel_id: int) -> bool:
         """Return True if ``channel_id`` has a binding."""
         return str(channel_id) in self._projects
+
+    # ------------------------------------------------------------------
+    # Unbound-channel fallback (v1.11, #110)
+    # ------------------------------------------------------------------
+    def get_path_or_default(self, channel_id: int) -> Tuple[Path, bool]:
+        """Return ``(path, is_bound)`` for ``channel_id``.
+
+        - When the channel is bound, returns ``(Path(bound_path), True)``.
+        - When unbound, returns ``(Path.home().resolve(), False)``.
+
+        The ``.resolve()`` on the home-directory fallback is intentional —
+        macOS ships ``/tmp -> /private/tmp`` and similar symlinked layouts
+        that the v1.0 `#11` fix taught us must be canonicalized at the
+        binding boundary. Applying ``.resolve()`` to ``Path.home()`` here
+        keeps the unbound path subject to the same canonicalization
+        discipline (e.g. ``/Users/x`` vs ``/private/Users/x``) so the cwd
+        we hand to Claude matches whatever it would receive after a
+        ``/project bind``.
+        """
+        if self.is_bound(channel_id):
+            p = self.get_path(channel_id)
+            assert p is not None  # is_bound guarantees this
+            return Path(p), True
+        return Path.home().resolve(), False
+
+    def should_hint_unbound(self, channel_id: int) -> bool:
+        """Return True the FIRST time we should nudge ``channel_id`` about
+        ``/project bind``; False on every subsequent call.
+
+        Atomic: the membership check and insertion happen together, so two
+        concurrent callers can't both receive ``True``. State is in-memory
+        only and resets on bot restart (PRD R3.1).
+        """
+        if channel_id in self._hinted_unbound_channels:
+            return False
+        self._hinted_unbound_channels.add(channel_id)
+        return True
 
     # ------------------------------------------------------------------
     # System prompt
