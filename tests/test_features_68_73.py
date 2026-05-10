@@ -15,7 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from claude_code_sdk import ClaudeCodeOptions, HookContext
+from claude_agent_sdk import ClaudeAgentOptions, HookContext
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.session_config import SessionConfig
@@ -63,7 +63,7 @@ class TestAutoExpiry:
         self, monkeypatch: pytest.MonkeyPatch, cfg: Config
     ) -> None:
         """send_message updates _last_activity."""
-        from claude_code_sdk import ResultMessage
+        from claude_agent_sdk import ResultMessage
 
         rm = ResultMessage(
             subtype="success", duration_ms=10, duration_api_ms=5,
@@ -150,7 +150,7 @@ class TestPostToolUseHook:
     ) -> None:
         """When on_post_tool_use is set, start() registers PostToolUse hook."""
         cb = AsyncMock()
-        captured_options: list[ClaudeCodeOptions] = []
+        captured_options: list[ClaudeAgentOptions] = []
 
         def _capture(options=None):
             captured_options.append(options)
@@ -174,7 +174,7 @@ class TestPostToolUseHook:
     ) -> None:
         """When on_stop is set, start() registers Stop hook."""
         cb = AsyncMock()
-        captured_options: list[ClaudeCodeOptions] = []
+        captured_options: list[ClaudeAgentOptions] = []
 
         def _capture(options=None):
             captured_options.append(options)
@@ -196,7 +196,7 @@ class TestPostToolUseHook:
         self, monkeypatch: pytest.MonkeyPatch, cfg: Config
     ) -> None:
         """When all callbacks set, all hooks are registered."""
-        captured_options: list[ClaudeCodeOptions] = []
+        captured_options: list[ClaudeAgentOptions] = []
 
         def _capture(options=None):
             captured_options.append(options)
@@ -332,7 +332,7 @@ class TestPostToolUseHook:
         self, monkeypatch: pytest.MonkeyPatch, cfg: Config
     ) -> None:
         """When no callbacks are set, hooks is None."""
-        captured_options: list[ClaudeCodeOptions] = []
+        captured_options: list[ClaudeAgentOptions] = []
 
         def _capture(options=None):
             captured_options.append(options)

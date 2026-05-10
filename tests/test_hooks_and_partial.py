@@ -14,8 +14,8 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from claude_code_sdk import ClaudeCodeOptions, ResultMessage
-from claude_code_sdk.types import StreamEvent
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage
+from claude_agent_sdk.types import StreamEvent
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.config import Config
@@ -69,9 +69,9 @@ async def test_bridge_stores_on_pre_tool_use(cfg: Config) -> None:
 async def test_bridge_start_builds_hooks_when_callback_set(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
-    """When on_pre_tool_use is set, start() passes hooks to ClaudeCodeOptions."""
+    """When on_pre_tool_use is set, start() passes hooks to ClaudeAgentOptions."""
     cb = AsyncMock()
-    captured_options: list[ClaudeCodeOptions] = []
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)
@@ -100,7 +100,7 @@ async def test_bridge_start_no_hooks_when_no_callback(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
     """When on_pre_tool_use is NOT set, hooks is None."""
-    captured_options: list[ClaudeCodeOptions] = []
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)
@@ -145,7 +145,7 @@ async def test_pre_tool_hook_invokes_callback(
     # Extract the registered hook function and call it directly
     hook_fn = captured_hooks[0]["PreToolUse"][0].hooks[0]
     input_data = {"tool_name": "Bash", "command": "ls"}
-    from claude_code_sdk import HookContext
+    from claude_agent_sdk import HookContext
     result = await hook_fn(input_data, "tool-use-123", HookContext())
 
     cb.assert_awaited_once_with("Bash", input_data)
@@ -178,7 +178,7 @@ async def test_pre_tool_hook_defaults_to_unknown_tool(
     await bridge.start()
 
     hook_fn = captured_hooks[0]["PreToolUse"][0].hooks[0]
-    from claude_code_sdk import HookContext
+    from claude_agent_sdk import HookContext
     await hook_fn({}, None, HookContext())
 
     assert received == ["unknown"]
@@ -208,7 +208,7 @@ async def test_pre_tool_hook_swallows_callback_errors(
     await bridge.start()
 
     hook_fn = captured_hooks[0]["PreToolUse"][0].hooks[0]
-    from claude_code_sdk import HookContext
+    from claude_agent_sdk import HookContext
     # Should NOT raise
     result = await hook_fn({"tool_name": "Bash"}, None, HookContext())
     assert result == {}
@@ -224,7 +224,7 @@ async def test_bridge_enables_partial_messages(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
     """start() always sets include_partial_messages=True on options."""
-    captured_options: list[ClaudeCodeOptions] = []
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)
@@ -322,7 +322,7 @@ async def test_session_manager_passes_on_pre_tool_use(
 
 
 # ---------------------------------------------------------------------------
-# Feature #92: User passed to ClaudeCodeOptions
+# Feature #92: User passed to ClaudeAgentOptions
 # ---------------------------------------------------------------------------
 
 
@@ -330,8 +330,8 @@ async def test_session_manager_passes_on_pre_tool_use(
 async def test_bridge_passes_user_to_options(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
-    """When user is set in SessionConfig, start() passes it to ClaudeCodeOptions."""
-    captured_options: list[ClaudeCodeOptions] = []
+    """When user is set in SessionConfig, start() passes it to ClaudeAgentOptions."""
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)
@@ -346,7 +346,9 @@ async def test_bridge_passes_user_to_options(
     await bridge.start()
 
     opts = captured_options[0]
-    assert "alice#1234" in (opts.append_system_prompt or "")
+    sp = opts.system_prompt
+    appended = sp.get("append", "") if isinstance(sp, dict) else (sp or "")
+    assert "alice#1234" in appended
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +361,7 @@ async def test_bridge_bare_mode_extra_args(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
     """When bare=True in SessionConfig, start() adds 'bare' to extra_args."""
-    captured_options: list[ClaudeCodeOptions] = []
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)
@@ -388,7 +390,7 @@ async def test_bridge_session_name_extra_args(
     monkeypatch: pytest.MonkeyPatch, cfg: Config
 ) -> None:
     """When session_name is set in SessionConfig, start() adds 'name' to extra_args."""
-    captured_options: list[ClaudeCodeOptions] = []
+    captured_options: list[ClaudeAgentOptions] = []
 
     def _capture_client(options=None):
         captured_options.append(options)

@@ -103,8 +103,8 @@ logging.getLogger("clauded.discord_renderer").addHandler(_capture)
 # Stream debug log for SDK forensics (per repo convention)
 os.environ.setdefault("CLAUDED_STREAM_DEBUG", "1")
 
-from claude_code_sdk import AssistantMessage, ResultMessage, TextBlock  # noqa: E402
-from claude_code_sdk.types import StreamEvent  # noqa: E402
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock  # noqa: E402
+from claude_agent_sdk.types import StreamEvent  # noqa: E402
 
 from clauded.config import load_config  # noqa: E402
 from clauded.claude_bridge import ClaudeBridge  # noqa: E402

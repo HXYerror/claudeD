@@ -32,9 +32,9 @@ def log_event(event: object, buffer_len: int = 0, extra: dict | None = None) -> 
     if not _ENABLED:
         return
     
-    from claude_code_sdk import AssistantMessage, TextBlock, ResultMessage, ToolUseBlock, ToolResultBlock
+    from claude_agent_sdk import AssistantMessage, TextBlock, ResultMessage, ToolUseBlock, ToolResultBlock
     try:
-        from claude_code_sdk.types import StreamEvent
+        from claude_agent_sdk.types import StreamEvent
     except ImportError:
         StreamEvent = None
     

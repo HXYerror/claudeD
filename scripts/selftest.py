@@ -20,10 +20,7 @@ CHANNEL_ID = 1499415074614280234
 
 # Import bot components
 sys.path.insert(0, '/tmp/claudeD/src')
-from clauded.bot import _ensure_cli_path
 from clauded.config import load_config
-
-_ensure_cli_path()
 
 results = []
 
@@ -117,7 +114,7 @@ async def run_tests():
                 try:
                     text_parts = []
                     async for event in bridge.send_message('Reply with exactly: SELFTEST_OK'):
-                        from claude_code_sdk import AssistantMessage, TextBlock, ResultMessage
+                        from claude_agent_sdk import AssistantMessage, TextBlock, ResultMessage
                         if isinstance(event, AssistantMessage):
                             for block in event.content:
                                 if isinstance(block, TextBlock):

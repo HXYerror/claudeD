@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from claude_code_sdk import ResultMessage
+from claude_agent_sdk import ResultMessage
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.config import Config
@@ -270,16 +270,157 @@ async def test_can_use_tool_none_when_no_on_ask_user(monkeypatch):
 
     cfg = Config(discord_bot_token="t", claude_model="sonnet",
                  claude_permission_mode="default", projects_root="/tmp")
-    
+
     captured = []
     class FakeClient:
         def __init__(self, options=None): captured.append(options)
         async def connect(self, prompt=None): pass
-    
+
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
-    
+
     sc = SessionConfig()  # no on_ask_user
     bridge = ClaudeBridge("/tmp", cfg, sc)
     await bridge.start()
-    
+
     assert captured[0].can_use_tool is None
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# setting_sources regression (#111, #117)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_setting_sources_includes_user_project_local(monkeypatch, cfg):
+    """Regression #111/#117: setting_sources must explicitly list all three.
+
+    The v1.10 SDK changed the default for ``setting_sources`` from "load all"
+    to ``None``/``[]`` (load nothing). Without an explicit list, user-level
+    CLAUDE.md, user skills, and project settings are silently dropped. The
+    bridge must pass ``["user", "project", "local"]`` to preserve v1.x
+    behavior.
+
+    We monkey-patch ``ClaudeAgentOptions`` itself with a permissive
+    stand-in that captures all kwargs, so this test is independent of
+    other Wave-2 SDK changes (e.g. ``append_system_prompt`` rename).
+    """
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured_kwargs.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+    await bridge.start()
+
+    assert captured_kwargs, "ClaudeAgentOptions was not constructed"
+    assert captured_kwargs[-1].get("setting_sources") == ["user", "project", "local"]
+
+
+# ---------------------------------------------------------------------------
+# Explicit cli_path resolution (#119, R6)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_claude_cli_uses_shutil_which(monkeypatch):
+    """The resolver returns whatever ``shutil.which('claude')`` finds first."""
+    import shutil
+    import os
+    from pathlib import Path
+    from clauded.cli_paths import resolve_claude_cli
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/sys/bin/claude" if name == "claude" else None
+    )
+    # The which result must pass the executable-file gate.
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(os, "access", lambda p, m: True)
+    assert resolve_claude_cli() == "/sys/bin/claude"
+
+
+def test_resolve_claude_cli_returns_none_when_unfound(monkeypatch):
+    """When neither $PATH nor fallback locations contain claude, return None."""
+    import shutil
+    from pathlib import Path
+    from clauded.cli_paths import resolve_claude_cli
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    assert resolve_claude_cli() is None
+
+
+@pytest.mark.asyncio
+async def test_cli_path_resolved_to_system_claude(monkeypatch, cfg):
+    """When ``shutil.which('claude')`` succeeds, ClaudeAgentOptions gets cli_path."""
+    import shutil
+    import os
+    from pathlib import Path
+    from clauded.claude_bridge import ClaudeBridge
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/fake/claude" if name == "claude" else None
+    )
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(os, "access", lambda p, m: True)
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, options=None):
+            captured.append(options)
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge("/tmp", cfg)
+    await bridge.start()
+
+    assert captured, "ClaudeSDKClient was never constructed"
+    assert captured[0].cli_path == "/fake/claude"
+
+
+@pytest.mark.asyncio
+async def test_cli_path_omitted_when_not_found(monkeypatch, cfg):
+    """When no claude CLI is resolvable, cli_path stays at the SDK default."""
+    import shutil
+    from pathlib import Path
+
+    from clauded.claude_bridge import ClaudeBridge
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    # Force fallback lookups in resolve_claude_cli to fail too, otherwise a
+    # real /opt/homebrew/bin/claude on the dev box would pollute the test.
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, options=None):
+            captured.append(options)
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge("/tmp", cfg)
+    await bridge.start()
+
+    assert captured, "ClaudeSDKClient was never constructed"
+    # The SDK's ClaudeAgentOptions defaults cli_path to None when not passed,
+    # which is exactly the "use bundled" signal we want.
+    assert captured[0].cli_path is None
