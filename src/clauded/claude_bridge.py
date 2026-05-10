@@ -368,6 +368,10 @@ class ClaudeBridge:
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
             settings=self._settings,
+            # v1.10 SDK: setting_sources defaults to [] (no auto-load); pass
+            # all three explicitly to preserve v1.x behavior of loading user
+            # CLAUDE.md, user-level skills, and project settings (#111, #117).
+            setting_sources=["user", "project", "local"],
             # AskUserQuestion: wire can_use_tool when on_ask_user is set
             can_use_tool=self._can_use_tool if self.on_ask_user else None,
             # user= is OS user, not Discord user; pass via system prompt instead
