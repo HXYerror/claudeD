@@ -337,34 +337,43 @@ async def test_setting_sources_includes_user_project_local(monkeypatch, cfg):
 def test_resolve_claude_cli_uses_shutil_which(monkeypatch):
     """The resolver returns whatever ``shutil.which('claude')`` finds first."""
     import shutil
-    from clauded.bot import _resolve_claude_cli
+    import os
+    from pathlib import Path
+    from clauded.cli_paths import resolve_claude_cli
 
     monkeypatch.setattr(
         shutil, "which", lambda name: "/sys/bin/claude" if name == "claude" else None
     )
-    assert _resolve_claude_cli() == "/sys/bin/claude"
+    # The which result must pass the executable-file gate.
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(os, "access", lambda p, m: True)
+    assert resolve_claude_cli() == "/sys/bin/claude"
 
 
 def test_resolve_claude_cli_returns_none_when_unfound(monkeypatch):
     """When neither $PATH nor fallback locations contain claude, return None."""
     import shutil
     from pathlib import Path
-    from clauded.bot import _resolve_claude_cli
+    from clauded.cli_paths import resolve_claude_cli
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    monkeypatch.setattr(Path, "exists", lambda self: False)
-    assert _resolve_claude_cli() is None
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
+    assert resolve_claude_cli() is None
 
 
 @pytest.mark.asyncio
 async def test_cli_path_resolved_to_system_claude(monkeypatch, cfg):
     """When ``shutil.which('claude')`` succeeds, ClaudeAgentOptions gets cli_path."""
     import shutil
+    import os
+    from pathlib import Path
     from clauded.claude_bridge import ClaudeBridge
 
     monkeypatch.setattr(
         shutil, "which", lambda name: "/fake/claude" if name == "claude" else None
     )
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(os, "access", lambda p, m: True)
 
     captured = []
 
@@ -393,10 +402,9 @@ async def test_cli_path_omitted_when_not_found(monkeypatch, cfg):
     from clauded.claude_bridge import ClaudeBridge
 
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    # Force fallback Path.exists() lookups in _resolve_claude_cli to fail too,
-    # otherwise a real /opt/homebrew/bin/claude on the dev box would pollute
-    # the test.
-    monkeypatch.setattr(Path, "exists", lambda self: False)
+    # Force fallback lookups in resolve_claude_cli to fail too, otherwise a
+    # real /opt/homebrew/bin/claude on the dev box would pollute the test.
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
 
     captured = []
 

@@ -20,10 +20,7 @@ CHANNEL_ID = 1499415074614280234
 
 # Import bot components
 sys.path.insert(0, '/tmp/claudeD/src')
-from clauded.bot import _ensure_cli_path
 from clauded.config import load_config
-
-_ensure_cli_path()
 
 results = []
 

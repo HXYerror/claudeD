@@ -412,6 +412,10 @@ async def test_cli_path_set_when_system_claude_resolves(
         shutil, "which",
         lambda name: "/fake/sys/claude" if name == "claude" else None,
     )
+    # `which` result must pass the executable-file gate.
+    import os as _os
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(_os, "access", lambda p, m: True)
 
     captured: list[ClaudeAgentOptions] = []
     monkeypatch.setattr(
@@ -433,7 +437,7 @@ async def test_cli_path_none_when_no_claude_resolvable(
     left at the SDK default (``None`` => use bundled).
     """
     monkeypatch.setattr(shutil, "which", lambda name: None)
-    monkeypatch.setattr(Path, "exists", lambda self: False)
+    monkeypatch.setattr(Path, "is_file", lambda self: False)
 
     captured: list[ClaudeAgentOptions] = []
     monkeypatch.setattr(
@@ -445,3 +449,309 @@ async def test_cli_path_none_when_no_claude_resolvable(
 
     assert captured, "ClaudeSDKClient was never constructed"
     assert captured[0].cli_path is None
+
+
+# ---------------------------------------------------------------------------
+# T1 — All 6 R features survive the 4-way merge in a single bridge.start()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_all_six_r_features_round_trip_in_one_call(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """All 6 R features survive the 4-way merge and coexist in one ClaudeAgentOptions call.
+
+    Pins the integrated state: if a future merge drops one R's contribution,
+    this single test fails loudly even if each isolated R test still passes.
+    """
+    import os as _os
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/fake/claude" if name == "claude" else None
+    )
+    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    monkeypatch.setattr(_os, "access", lambda p, m: True)
+
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    sc = SessionConfig(
+        effort="high",
+        max_budget_usd=5.0,
+        fork_session=True,
+        custom_agents={"a": {"description": "d", "prompt": "p"}},
+        fallback_model="haiku",
+        plugin_dirs=["/tmp/p"],
+        from_pr="42",
+        worktree="wt",
+        agent_name="r",
+        bare=True,
+        session_name="n",
+        user="alice",
+        system_prompt="hello",
+    )
+    bridge = ClaudeBridge("/tmp", cfg, sc)
+    await bridge.start()
+
+    kw = captured[-1]
+    # R3: system_prompt preset dict
+    assert kw["system_prompt"]["type"] == "preset"
+    assert kw["system_prompt"]["preset"] == "claude_code"
+    assert "hello" in kw["system_prompt"]["append"]
+    # R4: explicit setting_sources
+    assert kw["setting_sources"] == ["user", "project", "local"]
+    # R5: native fields
+    assert kw["effort"] == "high"
+    assert kw["max_budget_usd"] == 5.0
+    assert kw["fork_session"] is True
+    assert kw["agents"] == {"a": {"description": "d", "prompt": "p"}}
+    assert kw["fallback_model"] == "haiku"
+    assert len(kw["plugins"]) == 1
+    # R5: retained extra_args
+    assert kw["extra_args"]["from-pr"] == "42"
+    assert kw["extra_args"]["worktree"] == "wt"
+    assert kw["extra_args"]["agent"] == "r"
+    assert kw["extra_args"]["bare"] is None
+    assert kw["extra_args"]["name"] == "n"
+    # R6: cli_path resolved
+    assert kw["cli_path"] == "/fake/claude"
+    # R1+R2: implied — FakeOptions only constructs if claude_agent_sdk imports succeeded
+
+
+# ---------------------------------------------------------------------------
+# T2 — Fallback candidate list + executable check
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_uses_homebrew_fallback_when_path_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When shutil.which returns None, the resolver scans the candidate list."""
+    import os as _os
+    from clauded.cli_paths import resolve_claude_cli
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    real_access = _os.access
+    monkeypatch.setattr(
+        Path, "is_file", lambda self: str(self) == "/opt/homebrew/bin/claude"
+    )
+    monkeypatch.setattr(
+        _os,
+        "access",
+        lambda p, m: True
+        if str(p) == "/opt/homebrew/bin/claude"
+        else real_access(p, m),
+    )
+    assert resolve_claude_cli() == "/opt/homebrew/bin/claude"
+
+
+def test_resolve_skips_non_executable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path that exists but isn't executable is NOT returned."""
+    import os as _os
+    from clauded.cli_paths import resolve_claude_cli
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "is_file", lambda self: True)  # all candidates exist
+    monkeypatch.setattr(_os, "access", lambda p, m: False)  # but none executable
+    assert resolve_claude_cli() is None
+
+
+# ---------------------------------------------------------------------------
+# T3 — Large agents dict (~300KB) round-trip without serialization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_large_agents_dict_round_trips_without_serialization(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """R5 motivation: pre-fix code JSON-stringified agents dict and passed
+    via CLI extra_args, risking ARG_MAX (~131KB) silent truncation.
+
+    Verify a ~300KB dict round-trips natively as a Python object — no
+    JSON serialization, no CLI flag hop.
+    """
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    big_agents = {
+        f"agent_{i}": {"description": "d" * 1000, "prompt": "p" * 5000}
+        for i in range(50)
+    }
+    sc = SessionConfig(custom_agents=big_agents)
+    bridge = ClaudeBridge("/tmp", cfg, sc)
+    await bridge.start()
+
+    kw = captured[-1]
+    # Agents preserved as object identity at dict level
+    assert kw["agents"] == big_agents
+    # Not leaked into extra_args as JSON
+    assert "agents" not in kw["extra_args"]
+    extra_args_size = sum(
+        len(k) + (len(v) if isinstance(v, str) else 0)
+        for k, v in kw["extra_args"].items()
+    )
+    assert extra_args_size < 4096, (
+        f"extra_args too big ({extra_args_size}) — agents may have leaked back"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T5 — Empty-collection guards (default ⇒ omit / None, not empty list)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_empty_plugin_dirs_does_not_pass_plugins_kwarg(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """An empty plugin_dirs list MUST signal "use SDK default" (None), not
+    "clear all plugins" (empty list)."""
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    await ClaudeBridge("/tmp", cfg, SessionConfig(plugin_dirs=[])).start()
+    kw = captured[-1]
+    assert kw.get("plugins") is None, (
+        f"plugins=[] leaked as: {kw.get('plugins')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_custom_agents_does_not_pass_agents_kwarg(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """An empty custom_agents dict MUST signal "use SDK default" (None), not
+    "clear all agents" (empty dict)."""
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    await ClaudeBridge("/tmp", cfg, SessionConfig(custom_agents={})).start()
+    kw = captured[-1]
+    assert kw.get("agents") is None, (
+        f"agents={{}} leaked as: {kw.get('agents')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T6 — system_prompt content + user-injection sanitation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_content_default_includes_channel_mgmt_no_user(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """No user, no system prompt → append still has CREATE_THREAD marker, no Discord-user line."""
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    await ClaudeBridge("/tmp", cfg).start()
+    kw = captured[-1]
+    sp = kw["system_prompt"]
+    appended = sp.get("append", "") if isinstance(sp, dict) else (sp or "")
+    assert "CREATE_THREAD" in appended
+    assert "Discord user" not in appended
+
+
+@pytest.mark.asyncio
+async def test_user_with_newlines_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch, cfg: Config
+) -> None:
+    """A username with \\n / \\r MUST NOT inject extra system prompt lines."""
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    sc = SessionConfig(user="alice\ninjected\rmore")
+    await ClaudeBridge("/tmp", cfg, sc).start()
+    kw = captured[-1]
+    sp = kw["system_prompt"]
+    appended = sp.get("append", "") if isinstance(sp, dict) else (sp or "")
+    marker = "Discord user talking to you is:"
+    assert marker in appended
+    after_marker = appended.split(marker, 1)[1]
+    assert "\n" not in after_marker
+    assert "\r" not in after_marker
+    # And the original injection content shouldn't appear at line start
+    assert "\ninjected" not in appended
+    assert "\rmore" not in appended

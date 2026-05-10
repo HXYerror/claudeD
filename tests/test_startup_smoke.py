@@ -6,7 +6,6 @@ narrowest path that previously prevented the bot from starting on macOS.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -63,38 +62,6 @@ def test_load_config_resolves_projects_root_symlink(
     monkeypatch.setenv("CLAUDED_PROJECTS_ROOT", str(link_root))
     cfg = load_config()
     assert cfg.projects_root == str(real_root.resolve())
-
-
-# ---------------------------------------------------------------------------
-# Bug #12 — common ``claude`` CLI locations are prepended to $PATH at startup.
-# ---------------------------------------------------------------------------
-
-
-def test_ensure_cli_path_prepends_homebrew(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``_ensure_cli_path`` must prepend ``/opt/homebrew/bin`` if absent."""
-    # Import lazily so the monkeypatch on PATH below applies cleanly.
-    from clauded import bot as bot_mod
-
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    bot_mod._ensure_cli_path()
-    parts = os.environ["PATH"].split(os.pathsep)
-    assert "/opt/homebrew/bin" in parts
-    assert "/usr/local/bin" in parts
-    # Original entries must still be present (and preserved in order).
-    assert parts[-2:] == ["/usr/bin", "/bin"]
-
-
-def test_ensure_cli_path_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Running twice should not duplicate entries on PATH."""
-    from clauded import bot as bot_mod
-
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    bot_mod._ensure_cli_path()
-    first = os.environ["PATH"]
-    bot_mod._ensure_cli_path()
-    assert os.environ["PATH"] == first
 
 
 # ---------------------------------------------------------------------------

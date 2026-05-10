@@ -346,7 +346,9 @@ async def test_bridge_passes_user_to_options(
     await bridge.start()
 
     opts = captured_options[0]
-    assert "alice#1234" in (opts.system_prompt["append"] or "")
+    sp = opts.system_prompt
+    appended = sp.get("append", "") if isinstance(sp, dict) else (sp or "")
+    assert "alice#1234" in appended
 
 
 # ---------------------------------------------------------------------------

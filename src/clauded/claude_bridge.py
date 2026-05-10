@@ -5,10 +5,10 @@ project directory. A bridge is created per Discord thread, used until the
 session is stopped (manually or because the thread is unbound), and then
 disconnected.
 
-The bridge intercepts ``AskUserQuestion`` via ``can_use_tool``. A
-monkey-patch corrects the SDK's control protocol serialization (the SDK
-emits ``{"allow": true}`` but the CLI expects
-``{"behavior": "allow", "updatedInput": {...}}``).
+The bridge intercepts ``AskUserQuestion`` via ``can_use_tool``. The
+SDK's native control-protocol handler (v0.1.80+) emits the correct
+``{"behavior": "allow", "updatedInput": {...}}`` envelope, so no
+monkey-patch is needed.
 
 The bridge also supports an ``on_pre_tool_use`` callback that fires *before*
 a tool executes (via SDK PreToolUse hooks). This gives callers early
@@ -41,81 +41,11 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from .cli_paths import resolve_claude_cli
 from .config import Config
 from .session_config import SessionConfig
 
 log = logging.getLogger("clauded.claude_bridge")
-
-
-def _patch_sdk_permission_format() -> None:
-    """Monkey-patch claude-code-sdk to use the correct control protocol format.
-
-    The SDK (v0.0.25) serializes PermissionResultAllow as ``{"allow": true}``,
-    but the CLI expects ``{"behavior": "allow", "updatedInput": {...}}``.
-    This patch intercepts the ``can_use_tool`` path in
-    ``Query._handle_control_request`` and emits the correct format.
-    """
-    try:
-        from claude_agent_sdk._internal import query as _query
-        from claude_agent_sdk.types import (
-            PermissionResultAllow as _Allow,
-            PermissionResultDeny as _Deny,
-            ToolPermissionContext as _Ctx,
-        )
-
-        _original_handle = _query.Query._handle_control_request
-
-        async def _patched_handle(self, request):  # type: ignore[override]
-            request_id = request["request_id"]
-            request_data = request["request"]
-            subtype = request_data.get("subtype")
-
-            if subtype == "can_use_tool" and self.can_use_tool:
-                context = _Ctx(
-                    signal=None,
-                    suggestions=request_data.get("permission_suggestions", []) or [],
-                )
-                response = await self.can_use_tool(
-                    request_data["tool_name"],
-                    request_data["input"],
-                    context,
-                )
-
-                # Use the CORRECT format expected by the CLI
-                if isinstance(response, _Allow):
-                    response_data: dict = {"behavior": "allow"}
-                    if response.updated_input is not None:
-                        response_data["updatedInput"] = response.updated_input
-                elif isinstance(response, _Deny):
-                    response_data = {"behavior": "deny", "message": response.message}
-                else:
-                    raise TypeError(f"Expected PermissionResult, got {type(response)}")
-
-                import json as _json
-
-                control_response = {
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": request_id,
-                        "response": response_data,
-                    },
-                }
-                await self.transport.write(_json.dumps(control_response) + "\n")
-                return
-
-            # For all other control requests, use the original handler
-            return await _original_handle(self, request)
-
-        _query.Query._handle_control_request = _patched_handle
-    except Exception as e:
-        logging.getLogger("clauded.claude_bridge").warning(
-            "Failed to patch SDK permission format: %s", e
-        )
-
-
-# Apply the patch at import time
-_patch_sdk_permission_format()
 
 
 # Type alias for the PreToolUse notification callback. Receives the tool
@@ -223,30 +153,17 @@ class ClaudeBridge:
             safe_user = self._user.replace("\n", " ").replace("\r", " ")
             full_system_prompt += "\nThe Discord user talking to you is: " + safe_user
 
-        # Build extra_args for CLI-level flags (only flags without native equivalents)
-        # plus native kwargs for ClaudeAgentOptions fields introduced in 0.1.x.
+        # extra_args holds CLI-only flags with no native ClaudeAgentOptions
+        # equivalent in claude-agent-sdk 0.1.80. Native fields (effort,
+        # max_budget_usd, fork_session, agents, fallback_model, plugins) are
+        # passed directly below.
         extra_args: dict[str, str | None] = {}
-        native_kwargs: dict[str, Any] = {}
-        if self._effort:
-            native_kwargs["effort"] = self._effort
-        if self._max_budget_usd is not None:
-            native_kwargs["max_budget_usd"] = float(self._max_budget_usd)
-        if self._fork_session:
-            native_kwargs["fork_session"] = True
         if self._from_pr:
             extra_args["from-pr"] = self._from_pr
         if self._worktree:
             extra_args["worktree"] = self._worktree
-        if self._custom_agents:
-            native_kwargs["agents"] = self._custom_agents
         if self._agent_name:
             extra_args["agent"] = self._agent_name
-        if self._fallback_model:
-            native_kwargs["fallback_model"] = self._fallback_model
-        if self._plugin_dirs:
-            native_kwargs["plugins"] = [
-                SdkPluginConfig(type="local", path=d) for d in self._plugin_dirs
-            ]
         if self._bare:
             extra_args["bare"] = None
         if self._session_name:
@@ -350,51 +267,56 @@ class ClaudeBridge:
         hooks = _hooks_dict
 
         # Resolve operator's Claude CLI so the SDK uses the system install
-        # rather than the bundled binary (#119). When unresolved, omit the
-        # kwarg entirely so the SDK falls back to its own bundled CLI.
-        from .bot import _resolve_claude_cli
+        # rather than the bundled binary (#119). When None, the SDK falls
+        # back to its own bundled CLI.
+        cli_path = resolve_claude_cli()
 
-        resolved_cli = _resolve_claude_cli()
-
-        options_kwargs: dict[str, Any] = {
-            "cwd": self.project_path,
-            "env": self._env or {},
-            "permission_mode": self._config.claude_permission_mode,
-            "model": self.model,
-            "resume": self._resume_session_id,
+        options = ClaudeAgentOptions(
+            cwd=self.project_path,
+            env=self._env or {},
+            permission_mode=self._config.claude_permission_mode,
+            model=self.model,
+            resume=self._resume_session_id,
             # R3 (#116): system_prompt preset dict replaces append_system_prompt
-            "system_prompt": {
+            system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
                 "append": full_system_prompt,
             },
-            "allowed_tools": self._allowed_tools,
-            "disallowed_tools": self._disallowed_tools,
-            "extra_args": extra_args,
-            "add_dirs": self._add_dirs,
-            "mcp_servers": self._mcp_servers or {},
-            "max_turns": self._max_turns,
+            allowed_tools=self._allowed_tools,
+            disallowed_tools=self._disallowed_tools,
+            extra_args=extra_args,
+            add_dirs=self._add_dirs,
+            mcp_servers=self._mcp_servers or {},
+            max_turns=self._max_turns,
             # Feature #60: SDK hooks
-            "hooks": hooks,
+            hooks=hooks,
             # Feature #61: partial message streaming for token-level deltas
-            "include_partial_messages": True,
-            "settings": self._settings,
+            include_partial_messages=True,
+            settings=self._settings,
             # R4 (#117): setting_sources defaults to [] in v1.10 SDK (no
             # auto-load); pass all three explicitly to preserve v1.x
             # behavior of loading user CLAUDE.md, user-level skills, and
             # project settings (#111).
-            "setting_sources": ["user", "project", "local"],
+            setting_sources=["user", "project", "local"],
             # AskUserQuestion: wire can_use_tool when on_ask_user is set
-            "can_use_tool": self._can_use_tool if self.on_ask_user else None,
-            # user= is OS user, not Discord user; pass via system prompt instead
-        }
-        # R5 (#118): native fields migrated from extra_args (effort,
-        # max_budget_usd, fork_session, agents, fallback_model, plugins)
-        options_kwargs.update(native_kwargs)
-        if resolved_cli is not None:
-            options_kwargs["cli_path"] = resolved_cli
-
-        options = ClaudeAgentOptions(**options_kwargs)
+            can_use_tool=self._can_use_tool if self.on_ask_user else None,
+            # R6 (#119): explicit cli_path; None ⇒ SDK uses bundled CLI
+            cli_path=cli_path,
+            # R5 (#118): native fields migrated from extra_args
+            effort=self._effort,
+            max_budget_usd=(
+                float(self._max_budget_usd) if self._max_budget_usd is not None else None
+            ),
+            fork_session=self._fork_session or None,
+            agents=self._custom_agents or None,
+            fallback_model=self._fallback_model,
+            plugins=(
+                [SdkPluginConfig(type="local", path=d) for d in self._plugin_dirs]
+                if self._plugin_dirs
+                else None
+            ),
+        )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client
