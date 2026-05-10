@@ -734,6 +734,34 @@ def _ensure_cli_path() -> None:
         )
 
 
+def _resolve_claude_cli() -> str | None:
+    """Resolve the operator's Claude CLI path.
+
+    The ``claude-agent-sdk`` ships with a bundled ``claude`` binary, but we
+    prefer the operator's system-installed CLI so updates to the CLI flow
+    through to the bot without re-installing the SDK package. Returns the
+    absolute path on success, or ``None`` to let the SDK fall back to its
+    bundled binary.
+
+    Resolution order:
+
+    1. ``shutil.which("claude")`` against the active ``$PATH``.
+    2. Common install locations (Homebrew, ``/usr/local/bin``, npm-global).
+    """
+    p = shutil.which("claude")
+    if p is not None:
+        return p
+    for candidate in (
+        "/opt/homebrew/bin/claude",
+        "/usr/local/bin/claude",
+        str(Path.home() / ".npm-global" / "bin" / "claude"),
+    ):
+        cp = Path(candidate)
+        if cp.exists():
+            return str(cp)
+    return None
+
+
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
     logging.basicConfig(
@@ -743,6 +771,10 @@ def main() -> None:
 
     # Ensure the Claude CLI is discoverable before we touch the SDK.
     _ensure_cli_path()
+
+    # Resolve and log the operator's Claude CLI so it's visible at boot time.
+    resolved_cli = _resolve_claude_cli()
+    log.info("Using Claude CLI at: %s", resolved_cli or "(SDK bundled fallback)")
 
     config = load_config()
     bot = ClaudedBot(config)

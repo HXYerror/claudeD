@@ -286,6 +286,7 @@ async def test_can_use_tool_none_when_no_on_ask_user(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # setting_sources regression (#111, #117)
 # ---------------------------------------------------------------------------
 
@@ -326,3 +327,92 @@ async def test_setting_sources_includes_user_project_local(monkeypatch, cfg):
 
     assert captured_kwargs, "ClaudeAgentOptions was not constructed"
     assert captured_kwargs[-1].get("setting_sources") == ["user", "project", "local"]
+
+
+# ---------------------------------------------------------------------------
+# Explicit cli_path resolution (#119, R6)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_claude_cli_uses_shutil_which(monkeypatch):
+    """The resolver returns whatever ``shutil.which('claude')`` finds first."""
+    import shutil
+    from clauded.bot import _resolve_claude_cli
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/sys/bin/claude" if name == "claude" else None
+    )
+    assert _resolve_claude_cli() == "/sys/bin/claude"
+
+
+def test_resolve_claude_cli_returns_none_when_unfound(monkeypatch):
+    """When neither $PATH nor fallback locations contain claude, return None."""
+    import shutil
+    from pathlib import Path
+    from clauded.bot import _resolve_claude_cli
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+    assert _resolve_claude_cli() is None
+
+
+@pytest.mark.asyncio
+async def test_cli_path_resolved_to_system_claude(monkeypatch, cfg):
+    """When ``shutil.which('claude')`` succeeds, ClaudeAgentOptions gets cli_path."""
+    import shutil
+    from clauded.claude_bridge import ClaudeBridge
+
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/fake/claude" if name == "claude" else None
+    )
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, options=None):
+            captured.append(options)
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge("/tmp", cfg)
+    await bridge.start()
+
+    assert captured, "ClaudeSDKClient was never constructed"
+    assert captured[0].cli_path == "/fake/claude"
+
+
+@pytest.mark.asyncio
+async def test_cli_path_omitted_when_not_found(monkeypatch, cfg):
+    """When no claude CLI is resolvable, cli_path stays at the SDK default."""
+    import shutil
+    from pathlib import Path
+
+    from clauded.claude_bridge import ClaudeBridge
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    # Force fallback Path.exists() lookups in _resolve_claude_cli to fail too,
+    # otherwise a real /opt/homebrew/bin/claude on the dev box would pollute
+    # the test.
+    monkeypatch.setattr(Path, "exists", lambda self: False)
+
+    captured = []
+
+    class FakeClient:
+        def __init__(self, options=None):
+            captured.append(options)
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge("/tmp", cfg)
+    await bridge.start()
+
+    assert captured, "ClaudeSDKClient was never constructed"
+    # The SDK's ClaudeAgentOptions defaults cli_path to None when not passed,
+    # which is exactly the "use bundled" signal we want.
+    assert captured[0].cli_path is None

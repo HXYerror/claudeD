@@ -346,36 +346,49 @@ class ClaudeBridge:
         # Always assign hooks dict (we now unconditionally register PreCompact etc.)
         hooks = _hooks_dict
 
-        options = ClaudeAgentOptions(
-            cwd=self.project_path,
-            env=self._env or {},
-            permission_mode=self._config.claude_permission_mode,
-            model=self.model,
-            resume=self._resume_session_id,
-            system_prompt={
+        # Resolve operator's Claude CLI so the SDK uses the system install
+        # rather than the bundled binary (#119). When unresolved, omit the
+        # kwarg entirely so the SDK falls back to its own bundled CLI.
+        from .bot import _resolve_claude_cli
+
+        resolved_cli = _resolve_claude_cli()
+
+        options_kwargs: dict[str, Any] = {
+            "cwd": self.project_path,
+            "env": self._env or {},
+            "permission_mode": self._config.claude_permission_mode,
+            "model": self.model,
+            "resume": self._resume_session_id,
+            # R3 (#116): system_prompt preset dict replaces append_system_prompt
+            "system_prompt": {
                 "type": "preset",
                 "preset": "claude_code",
                 "append": full_system_prompt,
             },
-            allowed_tools=self._allowed_tools,
-            disallowed_tools=self._disallowed_tools,
-            extra_args=extra_args,
-            add_dirs=self._add_dirs,
-            mcp_servers=self._mcp_servers or {},
-            max_turns=self._max_turns,
+            "allowed_tools": self._allowed_tools,
+            "disallowed_tools": self._disallowed_tools,
+            "extra_args": extra_args,
+            "add_dirs": self._add_dirs,
+            "mcp_servers": self._mcp_servers or {},
+            "max_turns": self._max_turns,
             # Feature #60: SDK hooks
-            hooks=hooks,
+            "hooks": hooks,
             # Feature #61: partial message streaming for token-level deltas
-            include_partial_messages=True,
-            settings=self._settings,
-            # v1.10 SDK: setting_sources defaults to [] (no auto-load); pass
-            # all three explicitly to preserve v1.x behavior of loading user
-            # CLAUDE.md, user-level skills, and project settings (#111, #117).
-            setting_sources=["user", "project", "local"],
+            "include_partial_messages": True,
+            "settings": self._settings,
+            # R4 (#117): setting_sources defaults to [] in v1.10 SDK (no
+            # auto-load); pass all three explicitly to preserve v1.x
+            # behavior of loading user CLAUDE.md, user-level skills, and
+            # project settings (#111).
+            "setting_sources": ["user", "project", "local"],
             # AskUserQuestion: wire can_use_tool when on_ask_user is set
-            can_use_tool=self._can_use_tool if self.on_ask_user else None,
+            "can_use_tool": self._can_use_tool if self.on_ask_user else None,
             # user= is OS user, not Discord user; pass via system prompt instead
-        )
+        }
+        if resolved_cli is not None:
+            options_kwargs["cli_path"] = resolved_cli
+
+        options = ClaudeAgentOptions(**options_kwargs)
         client = ClaudeSDKClient(options=options)
         await client.connect()
         self._client = client
