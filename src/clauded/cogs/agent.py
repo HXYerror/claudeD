@@ -7,6 +7,7 @@ import logging
 import discord
 from discord import app_commands
 
+from ._unbound import reject_if_unbound
 from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
@@ -27,6 +28,8 @@ async def agent_create(
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     bot.agent_manager.create(name, prompt, description)
     embed = discord.Embed(
@@ -92,6 +95,8 @@ async def agent_delete(interaction: discord.Interaction, name: str) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     if bot.agent_manager.delete(name):
         embed = discord.Embed(

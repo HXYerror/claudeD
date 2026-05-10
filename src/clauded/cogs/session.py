@@ -7,6 +7,7 @@ import logging
 import discord
 from discord import app_commands
 
+from ._unbound import reject_if_unbound
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -105,6 +106,8 @@ async def session_resume(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     thread_id = interaction.channel_id
     if thread_id is None:
         await interaction.response.send_message("No thread context.", ephemeral=True)
@@ -196,6 +199,8 @@ async def session_fork(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     thread_id = interaction.channel_id
     if thread_id is None:
         await interaction.response.send_message("Use this command inside a thread.", ephemeral=True)
@@ -229,6 +234,8 @@ async def session_worktree(interaction: discord.Interaction, name: str) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     bridge = await bot._recreate_session(interaction, worktree=name)
     if bridge:
@@ -280,6 +287,8 @@ async def session_security_review(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     thread_id = interaction.channel_id
     if thread_id is None:
         await interaction.response.send_message("Use this in a thread.", ephemeral=True)
@@ -309,6 +318,8 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     bridge = await bot._recreate_session(interaction, settings=json_str)
     if bridge:

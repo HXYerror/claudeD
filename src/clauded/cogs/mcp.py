@@ -7,6 +7,7 @@ import logging
 import discord
 from discord import app_commands
 
+from ._unbound import reject_if_unbound
 from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
@@ -29,6 +30,8 @@ async def mcp_add(
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
     config: dict = {"type": "stdio", "command": command}
@@ -50,6 +53,8 @@ async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> 
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
@@ -96,6 +101,8 @@ async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
