@@ -29,7 +29,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from claude_code_sdk import (
+from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
     TextBlock,
@@ -37,7 +37,7 @@ from claude_code_sdk import (
     ToolUseBlock,
     ToolResultBlock,
 )
-from claude_code_sdk.types import StreamEvent
+from claude_agent_sdk.types import StreamEvent
 
 from clauded.config import load_config
 from clauded.claude_bridge import ClaudeBridge
