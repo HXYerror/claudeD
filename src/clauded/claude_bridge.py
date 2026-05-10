@@ -22,9 +22,9 @@ import logging
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
-from claude_code_sdk import (
+from claude_agent_sdk import (
     AssistantMessage,
-    ClaudeCodeOptions,
+    ClaudeAgentOptions,
     ClaudeSDKClient,
     HookContext,
     HookMatcher,
@@ -34,7 +34,7 @@ from claude_code_sdk import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_code_sdk.types import (
+from claude_agent_sdk.types import (
     PermissionResultAllow,
     PermissionResultDeny,
     StreamEvent,
@@ -56,8 +56,8 @@ def _patch_sdk_permission_format() -> None:
     ``Query._handle_control_request`` and emits the correct format.
     """
     try:
-        from claude_code_sdk._internal import query as _query
-        from claude_code_sdk.types import (
+        from claude_agent_sdk._internal import query as _query
+        from claude_agent_sdk.types import (
             PermissionResultAllow as _Allow,
             PermissionResultDeny as _Deny,
             ToolPermissionContext as _Ctx,
@@ -346,7 +346,7 @@ class ClaudeBridge:
         # Always assign hooks dict (we now unconditionally register PreCompact etc.)
         hooks = _hooks_dict
 
-        options = ClaudeCodeOptions(
+        options = ClaudeAgentOptions(
             cwd=self.project_path,
             env=self._env or {},
             permission_mode=self._config.claude_permission_mode,

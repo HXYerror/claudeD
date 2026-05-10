@@ -195,7 +195,7 @@ def test_env_value_masking_bot_style():
 
 
 def test_bridge_passes_user_to_options():
-    """Verify ClaudeBridge stores user for passing to ClaudeCodeOptions."""
+    """Verify ClaudeBridge stores user for passing to ClaudeAgentOptions."""
     from clauded.claude_bridge import ClaudeBridge
     from clauded.config import Config
 

@@ -46,7 +46,7 @@ from .claude_bridge import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_code_sdk.types import StreamEvent
+from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
 
 if TYPE_CHECKING:

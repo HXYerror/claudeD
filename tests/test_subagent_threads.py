@@ -31,7 +31,7 @@ from clauded.claude_bridge import (
     ToolResultBlock,
     ResultMessage,
 )
-from claude_code_sdk.types import AssistantMessage, StreamEvent
+from claude_agent_sdk.types import AssistantMessage, StreamEvent
 
 
 # ---------------------------------------------------------------------------

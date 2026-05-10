@@ -16,7 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from claude_code_sdk import ResultMessage
+from claude_agent_sdk import ResultMessage
 
 from clauded.claude_bridge import ClaudeBridge
 from clauded.config import Config
