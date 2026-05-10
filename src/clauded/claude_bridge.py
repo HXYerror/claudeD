@@ -17,7 +17,6 @@ notification — e.g. to post a "Preparing: ToolName…" message in Discord.
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -29,6 +28,7 @@ from claude_agent_sdk import (
     HookContext,
     HookMatcher,
     ResultMessage,
+    SdkPluginConfig,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -223,27 +223,30 @@ class ClaudeBridge:
             safe_user = self._user.replace("\n", " ").replace("\r", " ")
             full_system_prompt += "\nThe Discord user talking to you is: " + safe_user
 
-        # Build extra_args for CLI-level flags
+        # Build extra_args for CLI-level flags (only flags without native equivalents)
+        # plus native kwargs for ClaudeAgentOptions fields introduced in 0.1.x.
         extra_args: dict[str, str | None] = {}
+        native_kwargs: dict[str, Any] = {}
         if self._effort:
-            extra_args["effort"] = self._effort
+            native_kwargs["effort"] = self._effort
         if self._max_budget_usd is not None:
-            extra_args["max-budget-usd"] = str(self._max_budget_usd)
+            native_kwargs["max_budget_usd"] = float(self._max_budget_usd)
         if self._fork_session:
-            extra_args["fork-session"] = None
+            native_kwargs["fork_session"] = True
         if self._from_pr:
             extra_args["from-pr"] = self._from_pr
         if self._worktree:
             extra_args["worktree"] = self._worktree
         if self._custom_agents:
-            extra_args["agents"] = json.dumps(self._custom_agents)
+            native_kwargs["agents"] = self._custom_agents
         if self._agent_name:
             extra_args["agent"] = self._agent_name
         if self._fallback_model:
-            extra_args["fallback-model"] = self._fallback_model
+            native_kwargs["fallback_model"] = self._fallback_model
         if self._plugin_dirs:
-            # Pass the first plugin dir; CLI supports --plugin-dir
-            extra_args["plugin-dir"] = self._plugin_dirs[0]
+            native_kwargs["plugins"] = [
+                SdkPluginConfig(type="local", path=d) for d in self._plugin_dirs
+            ]
         if self._bare:
             extra_args["bare"] = None
         if self._session_name:
@@ -385,6 +388,9 @@ class ClaudeBridge:
             "can_use_tool": self._can_use_tool if self.on_ask_user else None,
             # user= is OS user, not Discord user; pass via system prompt instead
         }
+        # R5 (#118): native fields migrated from extra_args (effort,
+        # max_budget_usd, fork_session, agents, fallback_model, plugins)
+        options_kwargs.update(native_kwargs)
         if resolved_cli is not None:
             options_kwargs["cli_path"] = resolved_cli
 
