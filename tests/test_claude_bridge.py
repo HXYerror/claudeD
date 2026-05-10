@@ -270,16 +270,59 @@ async def test_can_use_tool_none_when_no_on_ask_user(monkeypatch):
 
     cfg = Config(discord_bot_token="t", claude_model="sonnet",
                  claude_permission_mode="default", projects_root="/tmp")
-    
+
     captured = []
     class FakeClient:
         def __init__(self, options=None): captured.append(options)
         async def connect(self, prompt=None): pass
-    
+
     monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
-    
+
     sc = SessionConfig()  # no on_ask_user
     bridge = ClaudeBridge("/tmp", cfg, sc)
     await bridge.start()
-    
+
     assert captured[0].can_use_tool is None
+
+
+# ---------------------------------------------------------------------------
+# setting_sources regression (#111, #117)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_setting_sources_includes_user_project_local(monkeypatch, cfg):
+    """Regression #111/#117: setting_sources must explicitly list all three.
+
+    The v1.10 SDK changed the default for ``setting_sources`` from "load all"
+    to ``None``/``[]`` (load nothing). Without an explicit list, user-level
+    CLAUDE.md, user skills, and project settings are silently dropped. The
+    bridge must pass ``["user", "project", "local"]`` to preserve v1.x
+    behavior.
+
+    We monkey-patch ``ClaudeAgentOptions`` itself with a permissive
+    stand-in that captures all kwargs, so this test is independent of
+    other Wave-2 SDK changes (e.g. ``append_system_prompt`` rename).
+    """
+    captured_kwargs: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured_kwargs.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+    await bridge.start()
+
+    assert captured_kwargs, "ClaudeAgentOptions was not constructed"
+    assert captured_kwargs[-1].get("setting_sources") == ["user", "project", "local"]
