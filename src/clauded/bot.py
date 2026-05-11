@@ -162,6 +162,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.tools import tools_group, budget_group
         from .cogs.agent import agent_group
         from .cogs.mcp import mcp_group
+        from .cogs.skill import skill_group
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
@@ -179,6 +180,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(review_pr)
         self.tree.add_command(agent_group)
         self.tree.add_command(mcp_group)
+        self.tree.add_command(skill_group)
         self.tree.add_command(max_turns_cmd)
         self.tree.add_command(fallback_model_cmd)
         self.tree.add_command(plugin_group)
