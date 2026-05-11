@@ -399,6 +399,22 @@ class ClaudedBot(commands.Bot):
                     log.exception("Could not refetch after thread-race")
                     return
                 if message.thread is not None:
+                    # Gate: if a session is *already active* on this
+                    # thread, this dispatch is a duplicate MESSAGE_CREATE
+                    # for the same user message — the race winner has
+                    # already started the bridge and rendered. Suppress
+                    # the second render to avoid a duplicate Claude turn
+                    # (and double API cost). See issue #140.
+                    existing_session = self.session_manager.get_session(
+                        message.thread.id
+                    )
+                    if existing_session is not None and existing_session.is_active:
+                        log.info(
+                            "Thread-race: ignoring duplicate MESSAGE_CREATE "
+                            "(session already active on thread %d)",
+                            message.thread.id,
+                        )
+                        return
                     log.info(
                         "Thread-race: reusing existing thread %d",
                         message.thread.id,
