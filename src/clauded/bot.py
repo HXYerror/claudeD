@@ -14,6 +14,7 @@ import tempfile
 import time
 import sys
 import asyncio
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import discord
@@ -146,6 +147,7 @@ class ClaudedBot(commands.Bot):
         except Exception:
             self._claude_version = "unknown"
         self._cleanup_task.start()
+        self._heartbeat_task.start()
 
         # PRD R3.3 — register the persistent Copy-as-text button view so
         # the button keeps working after a bot restart.
@@ -230,6 +232,17 @@ class ClaudedBot(commands.Bot):
 
     @_cleanup_task.before_loop
     async def _before_cleanup(self) -> None:
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=30)
+    async def _heartbeat_task(self) -> None:
+        """Write a heartbeat file every 30s for the external health checker."""
+        heartbeat_path = Path.home() / "Library" / "Caches" / "clauded" / "heartbeat"
+        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+        heartbeat_path.touch()
+
+    @_heartbeat_task.before_loop
+    async def _before_heartbeat(self) -> None:
         await self.wait_until_ready()
 
     async def on_ready(self) -> None:  # type: ignore[override]
@@ -846,12 +859,43 @@ class ClaudedBot(commands.Bot):
 # Entrypoint
 # ---------------------------------------------------------------------------
 
+def _configure_logging() -> None:
+    """Set up app logging — RotatingFileHandler in production, stderr-only in tests.
+
+    Detects pytest via ``PYTEST_CURRENT_TEST`` so test runs don't pollute
+    ``~/Library/Logs/clauded/``. In production, attaches a 10 MB × 7 rotating
+    file handler plus a stderr handler so launchd's ``StandardErrorPath`` still
+    captures boot diagnostics. Falls back to ``basicConfig`` on ``OSError`` (e.g.
+    Linux dev box with no ``~/Library/``).
+    """
+    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return
+    log_dir = Path.home() / "Library" / "Logs" / "clauded"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return
+    handler = RotatingFileHandler(
+        log_dir / "clauded.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=7,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter(fmt))
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(logging.Formatter(fmt))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    root.addHandler(stderr_handler)
+
+
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _configure_logging()
 
     # Resolve and log the operator's Claude CLI so it's visible at boot time.
     from .cli_paths import resolve_claude_cli
