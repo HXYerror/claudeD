@@ -327,6 +327,55 @@ User @mentions bot in #my-project channel
 
 ---
 
+## Run as macOS service
+
+claudeD ships with a user-level LaunchAgent so the bot starts at login, auto-restarts on crash, rotates its log file, and surfaces a desktop notification if it crash-loops. macOS only — Linux/Windows users should run `clauded` under their own service manager (systemd, NSSM, etc.).
+
+### Prerequisites
+
+- `.env` exists at the repo root with `DISCORD_BOT_TOKEN` set
+- `.venv` is built and `pip install -e .` has been run so `.venv/bin/clauded` exists and is executable
+
+### Install
+
+```bash
+./scripts/install-launchagent.sh
+```
+
+The script renders the plist templates with absolute paths for your `$HOME` and repo, drops them under `~/Library/LaunchAgents/`, and bootstraps both agents (`com.hxy.clauded` and `com.hxy.clauded.healthcheck`) into your launchd user domain. The bot should be online in Discord within 30 seconds.
+
+### Status & logs
+
+```bash
+# Is launchd running it?
+launchctl print gui/$(id -u)/com.hxy.clauded
+
+# Live app log (rotates at 10 MB × 7 backups)
+tail -f ~/Library/Logs/clauded/clauded.log
+
+# launchd stdout/stderr (boot diagnostics)
+tail -f ~/Library/Logs/clauded/out.log ~/Library/Logs/clauded/err.log
+
+# Crash-loop alerts (≥3 restarts in 5 min)
+tail -f ~/Library/Logs/clauded/alerts.log
+```
+
+### Uninstall
+
+```bash
+./scripts/uninstall-launchagent.sh
+```
+
+Removes the plists and unloads both agents. Logs under `~/Library/Logs/clauded/` are preserved for audit; delete that directory manually if you want them gone.
+
+### Notes
+
+- macOS only. The plist templates use `launchctl bootstrap` (modern, macOS 10.10+).
+- Re-run `./scripts/install-launchagent.sh` after upgrading Python or recreating `.venv` to refresh the plist's absolute path.
+- The bot writes a heartbeat to `~/Library/Caches/clauded/heartbeat` every 30 s; the helper agent polls every 5 min and `launchctl kickstart`s the main agent if the heartbeat is stale (>120 s) — covering silent Discord-gateway hangs that `KeepAlive` alone won't catch.
+
+---
+
 ## Development
 
 Install with development dependencies:
