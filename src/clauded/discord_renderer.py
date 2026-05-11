@@ -49,13 +49,24 @@ from .claude_bridge import (
 )
 from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
-from .table_png import render_table_png
 from .cogs._table_view import CopyTableTextView
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
 
 log = logging.getLogger("clauded.discord_renderer")
+
+# Pillow defensive fallback (#135 / PRD R6 + acceptance E).
+# If Pillow (or .table_png's other deps) cannot be imported, fall back to the
+# legacy code-fence wrap in ``DiscordRenderer._format_tables`` rather than
+# crashing the renderer. ``PILLOW_AVAILABLE`` is consulted at the top of
+# :meth:`DiscordRenderer._extract_and_render_tables` for a fast-fail.
+try:
+    from .table_png import render_table_png, MAX_COLS, MAX_ROWS, MAX_TABLE_PIXELS
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+    log.warning("Pillow not installed; tables fall back to code-fence rendering")
 
 
 # ---------------------------------------------------------------------------
@@ -1542,6 +1553,14 @@ class DiscordRenderer:
         endswith("|")``; Claude sometimes emits ``Name | Score`` form
         (review I5).
         """
+        # Pillow defensive fallback (#135 / PRD R6 + acceptance E).
+        # If the import at module load failed, we never had a working PNG
+        # path — return the legacy code-fence formatting and an empty
+        # render list. Caller branches on ``not renders`` and continues
+        # down its no-table path (no PNG follow-ups will be attempted).
+        if not PILLOW_AVAILABLE:
+            return DiscordRenderer._format_tables(text), []
+
         lines_in = text.split("\n")
         result: list[str] = []
         renders: list[TableRender] = []

@@ -451,3 +451,80 @@ async def test_cost_footer_attaches_to_png_message():
     ok = await renderer._safe_edit(renderer._last_msg, content=footer)
     assert ok is True
     assert renderer._last_msg.content == footer
+
+
+# ---------------------------------------------------------------------------
+# 9. Pillow defensive fallback (#135 / PRD R6 + acceptance E)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_pillow_falls_back_to_code_fence(monkeypatch):
+    """If Pillow is unavailable, ``_extract_and_render_tables`` short-circuits
+    to the legacy ``_format_tables`` code-fence wrap and returns zero
+    :class:`TableRender` instances. Bot must not crash; user sees the
+    table inside a ``` fence rather than as a PNG attachment
+    (PRD R6 + acceptance E).
+    """
+    from clauded import discord_renderer as dr_mod
+
+    # Simulate Pillow / table_png import failure at module load time.
+    monkeypatch.setattr(dr_mod, "PILLOW_AVAILABLE", False)
+
+    buffer = (
+        "Before.\n"
+        "| Name | Score |\n"
+        "|------|-------|\n"
+        "| Alpha | 10 |\n"
+        "| Beta | 7 |\n"
+        "After."
+    )
+
+    text, renders = await DiscordRenderer._extract_and_render_tables(buffer)
+
+    # No PNG renders produced — caller falls through to its text-only path.
+    assert renders == []
+
+    # Legacy code-fence wrap: the table lines survive verbatim sandwiched
+    # between a pair of ``` fences (the format produced by
+    # ``DiscordRenderer._format_tables``).
+    assert "```" in text
+    assert "| Name | Score |" in text
+    assert "| Alpha | 10 |" in text
+    assert "| Beta | 7 |" in text
+    # Surrounding prose is preserved.
+    assert "Before." in text
+    assert "After." in text
+    # No placeholder ever emitted on the fallback path.
+    assert "[TABLE_PNG_" not in text
+
+
+@pytest.mark.asyncio
+async def test_png_render_oversized_falls_back_to_verbatim():
+    """A 25-column table trips the ``MAX_COLS=20`` guard in
+    :func:`table_png.render_table_png` → ``ValueError``. The existing
+    per-table ``except Exception`` in ``_extract_and_render_tables``
+    (C2) catches it and emits the original lines verbatim — the
+    placeholder must NOT leak into the returned text and no
+    :class:`TableRender` is produced (#135).
+    """
+    # Build a 25-column table — exceeds MAX_COLS (20).
+    n_cols = 25
+    header = "| " + " | ".join(f"H{i}" for i in range(n_cols)) + " |"
+    sep = "|" + "|".join(["---"] * n_cols) + "|"
+    row = "| " + " | ".join(str(i) for i in range(n_cols)) + " |"
+    buffer = f"Intro.\n{header}\n{sep}\n{row}\nOutro."
+
+    text, renders = await DiscordRenderer._extract_and_render_tables(buffer)
+
+    # No renders — the oversize guard tripped, caught by C2 try/except.
+    assert renders == []
+    # Table lines are emitted verbatim (NOT replaced by a placeholder).
+    assert header in text
+    assert sep in text
+    assert row in text
+    # Surrounding prose preserved.
+    assert "Intro." in text
+    assert "Outro." in text
+    # Placeholder never appears in the returned text.
+    assert "[TABLE_PNG_" not in text
