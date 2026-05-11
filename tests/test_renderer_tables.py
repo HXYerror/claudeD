@@ -643,3 +643,95 @@ async def test_safe_edit_skips_empty_content():
     # if the streaming msg kept its raw-table text.
     assert msg.content == "\u200b"
 
+
+# ---------------------------------------------------------------------------
+# 12. #141 — D2 streaming-race: a mid-stream ``_finalize_typewriter`` call
+# (triggered by a ToolUseBlock interleave) sees a PARTIAL buffer where the
+# outer 4-backtick fence hasn't all arrived. Running table extraction on
+# that partial buffer misclassifies the inner table as outside-fence and
+# emits a stray PNG. Fix: when ``is_final=False``, skip extraction and dump
+# the raw buffer verbatim — any table content will be picked up on the
+# eventual ``is_final=True`` end-of-turn flush.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mid_stream_finalize_with_partial_quad_backtick_skips_extraction(
+    monkeypatch,
+):
+    """#141: a ToolUseBlock interleave triggers finalize on a partial
+    buffer where the outer 4-backtick fence hasn't all arrived yet.
+    Extraction must NOT fire (it would misclassify the inner table as
+    outside-fence and emit a stray PNG). Live_msg should hold the raw
+    buffer verbatim — re-extraction happens at the eventual final flush.
+    """
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Build a partial buffer: outer ```` opened, inner ``` opened, table
+    # rows present, but outer 4-backtick fence not yet closed (mid-stream).
+    partial = "Here you go: ````\n```\n| col |\n|---|\n| v |\n```"
+    live_msg = FakeMessage(content="")
+
+    # Spy on _extract_and_render_tables — it must NOT be called on the
+    # is_final=False path.
+    calls: list[str] = []
+
+    async def _spy(_self_or_cls, _buffer=None, *_a, **_kw):
+        calls.append("called")
+        return ("", [])
+
+    # _extract_and_render_tables is a staticmethod on the class — replace
+    # on the class so it's seen by `self._extract_and_render_tables` too.
+    monkeypatch.setattr(
+        DiscordRenderer, "_extract_and_render_tables", staticmethod(
+            lambda buf: _spy(None, buf)
+        )
+    )
+
+    await renderer._finalize_typewriter(live_msg, partial, is_final=False)
+
+    assert calls == [], (
+        "is_final=False must skip table extraction; got "
+        f"{len(calls)} call(s)"
+    )
+
+    # live_msg should carry the raw partial buffer verbatim — no PNG
+    # follow-up should have been sent.
+    assert live_msg.content == partial, (
+        "is_final=False must dump buffer verbatim into live_msg"
+    )
+    png_calls = [c for c in target.calls if c.get("files")]
+    assert png_calls == [], "no PNG follow-up on is_final=False"
+
+
+@pytest.mark.asyncio
+async def test_final_finalize_still_extracts(monkeypatch):
+    """is_final=True (default + end-of-turn behavior) runs table
+    extraction normally — the #141 fix must not regress the v1.12 happy
+    path.
+    """
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Real markdown table — would normally produce one TableRender.
+    final_buffer = "| col |\n|---|\n| v |"
+    live_msg = FakeMessage(content="")
+
+    calls: list[str] = []
+
+    async def _spy(_buffer):
+        calls.append("called")
+        return ("", [])
+
+    monkeypatch.setattr(
+        DiscordRenderer, "_extract_and_render_tables", staticmethod(_spy)
+    )
+
+    # Default is_final=True.
+    await renderer._finalize_typewriter(live_msg, final_buffer)
+
+    assert calls == ["called"], (
+        "is_final=True (default) must invoke _extract_and_render_tables"
+    )
+

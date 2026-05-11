@@ -436,8 +436,14 @@ class DiscordRenderer:
                             # Finalize any pending typewriter message before
                             # interleaving a tool-status message, so the order
                             # in the channel matches the order of events.
+                            # #141 — pass ``is_final=False``: the buffer here
+                            # is PARTIAL (Claude may still be streaming the
+                            # outer markdown fence). Running table extraction
+                            # on a partial buffer misclassifies inner tables
+                            # as outside-fence and emits stray PNGs (D2
+                            # streaming-race seen in v1.12 R3 smoke 8e5af6c).
                             if live_msg is not None:
-                                await self._finalize_typewriter(live_msg, buffer)
+                                await self._finalize_typewriter(live_msg, buffer, is_final=False)
                                 live_msg = None
                                 buffer = ""
                                 typewriter = False
@@ -1089,16 +1095,52 @@ class DiscordRenderer:
                     self._last_msg_text = chunk
 
     async def _finalize_typewriter(
-        self, live_msg: discord.Message, buffer: str
+        self,
+        live_msg: discord.Message,
+        buffer: str,
+        *,
+        is_final: bool = True,
     ) -> None:
         """Replace the cursor in ``live_msg`` and emit any overflow as new messages.
 
         If the in-place edit fails permanently we fall back to sending a
         fresh message; otherwise the entire ``buffer`` content would be
         silently lost (see truncation root-cause analysis 5/9).
+
+        Parameters
+        ----------
+        is_final:
+            When ``True`` (default — end-of-turn flush), runs the v1.12
+            extraction + PNG-interleaving path. When ``False``
+            (mid-stream finalize triggered by a ``ToolUseBlock``
+            interleave), the buffer is PARTIAL — outer fence backticks
+            may not all have arrived yet. Running
+            :meth:`_extract_and_render_tables` on a partial buffer
+            misclassifies an inner markdown table as outside-fence and
+            emits a stray PNG (#141: D2 streaming-race). On
+            ``is_final=False`` we therefore skip extraction entirely
+            and dump the raw buffer verbatim into ``live_msg`` — any
+            table content will be re-rendered correctly at the
+            eventual ``is_final=True`` call once the full fence is
+            settled.
         """
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
+
+        if not is_final:
+            # Streaming-race guard (#141) — partial buffer; skip table
+            # extraction, treat as raw text. Mirrors the pre-v1.12
+            # typewriter-finalize simple path. Any table content will
+            # be picked up by the end-of-turn ``is_final=True`` call.
+            if not buffer:
+                return
+            content = buffer[:DISCORD_MAX_LEN]
+            if live_msg is not None:
+                await self._safe_edit(live_msg, content=content)
+            else:
+                await self._safe_send(content=content)
+            return
+
         # v1.12 — extract tables → PNG follow-ups (PRD R2). On the first
         # text-bearing chunk we still drive the typewriter via in-place
         # edit; if tables exist the remaining text is interleaved with
