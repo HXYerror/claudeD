@@ -31,6 +31,12 @@ from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
 from .cogs._unbound import UNBOUND_HINT_MESSAGE
 from .cogs._table_view import CopyTableTextView
+from ._errors import is_transient_discord_error
+from ._http_retry import (
+    safe_send_message,
+    safe_remove_reaction,
+    safe_add_reaction,
+)
 
 # Re-export SystemPromptModal so existing ``from clauded.bot import
 # SystemPromptModal`` continues to work (tests rely on this).
@@ -204,10 +210,23 @@ class ClaudedBot(commands.Bot):
             last = getattr(bridge, '_last_activity', getattr(bridge, '_start_time', now))
             if now - last > timeout:
                 to_remove.append(thread_id)
-        for tid in to_remove:
-            self.session_manager.save_session_state(tid)
-            await self.session_manager.stop_session(tid)
-            log.info("Auto-expired session for thread %s", tid)
+
+        async def _stop_one(tid: int) -> None:
+            try:
+                self.session_manager.save_session_state(tid)
+                await self.session_manager.stop_session(tid)
+                log.info("Auto-expired session for thread %s", tid)
+            except Exception:
+                log.exception("Auto-expire failed for thread %s", tid)
+
+        if to_remove:
+            # #146: stop sessions concurrently so one stuck bridge doesn't
+            # block healthy peers. `return_exceptions=True` is belt-and-
+            # suspenders — `_stop_one` already swallows.
+            await asyncio.gather(
+                *[_stop_one(tid) for tid in to_remove],
+                return_exceptions=True,
+            )
 
     @_cleanup_task.before_loop
     async def _before_cleanup(self) -> None:
@@ -438,11 +457,10 @@ class ClaudedBot(commands.Bot):
                 )
                 _render_ok = True
             except Exception:
-                try:
-                    await message.remove_reaction("⏳", self.user)
-                    await message.add_reaction("❌")
-                except discord.HTTPException:
-                    pass
+                # #147: wrap reaction ops so a Discord blip doesn't bury the
+                # real exception. Safe helpers swallow transient failures.
+                await safe_remove_reaction(message, "⏳", self.user)
+                await safe_add_reaction(message, "❌")
                 raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
@@ -452,11 +470,8 @@ class ClaudedBot(commands.Bot):
                     self.cost_tracker.record(channel.id, response_cost)
                 self.session_manager.save_session_state(thread.id)
                 if _render_ok:
-                    try:
-                        await message.remove_reaction("⏳", self.user)
-                        await message.add_reaction("✅")
-                    except discord.HTTPException:
-                        pass
+                    await safe_remove_reaction(message, "⏳", self.user)
+                    await safe_add_reaction(message, "✅")
 
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
@@ -572,11 +587,10 @@ class ClaudedBot(commands.Bot):
                 )
                 _render_ok = True
             except Exception:
-                try:
-                    await message.remove_reaction("⏳", self.user)
-                    await message.add_reaction("❌")
-                except discord.HTTPException:
-                    pass
+                # #147: wrap reaction ops so a Discord blip doesn't bury the
+                # real exception. Safe helpers swallow transient failures.
+                await safe_remove_reaction(message, "⏳", self.user)
+                await safe_add_reaction(message, "❌")
                 raise
             finally:
                 _cleanup_tmp_dir(tmp_dir)
@@ -586,11 +600,8 @@ class ClaudedBot(commands.Bot):
                     self.cost_tracker.record(parent_id, response_cost)
                 self.session_manager.save_session_state(thread_id)
                 if _render_ok:
-                    try:
-                        await message.remove_reaction("⏳", self.user)
-                        await message.add_reaction("✅")
-                    except discord.HTTPException:
-                        pass
+                    await safe_remove_reaction(message, "⏳", self.user)
+                    await safe_add_reaction(message, "✅")
 
     # ------------------------------------------------------------------
     # Helpers used by both channel- and thread-message handlers
@@ -739,7 +750,19 @@ class ClaudedBot(commands.Bot):
         try:
             await renderer.render_response(bridge, user_text)
         except Exception as exc:
-            log.exception("Renderer failed; offering retry button")
+            if is_transient_discord_error(exc):
+                # Render gave up (rare — _retry_http exhausted), but bridge is
+                # healthy. Leave session alive; user can send another message
+                # to resume. No retry button — bridge isn't dead.
+                log.warning(
+                    "Render paused after exhausted retries; bridge kept",
+                    extra={
+                        "thread_id": getattr(thread, "id", None),
+                        "exc_class": type(exc).__name__,
+                    },
+                )
+                return
+            log.exception("Renderer fatal; offering retry button")
             thread_id = getattr(thread, "id", None)
             if thread_id is not None:
                 await self.session_manager.stop_session(thread_id)

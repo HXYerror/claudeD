@@ -17,7 +17,9 @@ notification — e.g. to post a "Preparing: ToolName…" message in Discord.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -407,11 +409,23 @@ class ClaudeBridge:
             return False
 
     async def stop(self) -> None:
-        """Disconnect the underlying client (idempotent)."""
+        """Stop the bridge, force-dropping after CLAUDED_BRIDGE_STOP_TIMEOUT (default 30s).
+
+        #146: ``client.disconnect()`` is anyio-fragile and can hang. We bound
+        it with ``asyncio.wait_for``; on timeout we force-drop the reference
+        and log a WARN. The subprocess may leak but the cleanup task no
+        longer deadlocks.
+        """
         if self._client is None:
             return
+        timeout = float(os.environ.get("CLAUDED_BRIDGE_STOP_TIMEOUT", "30"))
         try:
-            await self._client.disconnect()
+            await asyncio.wait_for(self._client.disconnect(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.warning(
+                "Bridge stop timed out; force-dropping reference (subprocess may leak)",
+                extra={"timeout_s": timeout, "active": self._active},
+            )
         except Exception:  # pragma: no cover - defensive
             log.exception("Error while disconnecting ClaudeSDKClient")
         finally:
