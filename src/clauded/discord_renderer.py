@@ -1426,17 +1426,21 @@ class DiscordRenderer:
         """
         kwargs: dict = {}
         if content is not None:
-            # v1.12 bug D — Discord rejects ``content=""`` with HTTP 400
-            # code 50006 "Cannot send an empty message". This bites the
-            # streaming-cursor cleanup path in ``_finalize_typewriter``
-            # where the buffer is entirely a table placeholder and the
-            # pre-table segment is empty. Substitute a single space so
-            # the edit succeeds and the user no longer sees the leaked
-            # raw markdown table text alongside the PNG follow-up
-            # (Bug C symptom in the v1.12 smoke run).
+            # v1.12 bug D-2 — Discord rejects both ``content=""`` AND
+            # ``content=" "`` (single space) with HTTP 400 code 50006
+            # "Cannot send an empty message" — whitespace-only content
+            # is treated as empty by Discord's validator. This bites
+            # the streaming-cursor cleanup path in
+            # ``_finalize_typewriter`` where the buffer is entirely a
+            # table placeholder and the pre-table segment is empty.
+            # Substitute U+200B (zero-width space): Discord accepts it
+            # as non-empty content and it renders invisibly so the
+            # user sees the live_msg as "cleared" rather than
+            # retaining the leaked raw markdown table text alongside
+            # the PNG follow-up (Bug C symptom in the v1.12 smoke run).
             if not content.strip():
-                log.debug("_safe_edit: empty content; substituting space to avoid Discord 50006")
-                content = " "
+                log.debug("_safe_edit: empty content; substituting U+200B to clear cursor msg without Discord 50006")
+                content = "\u200b"
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed

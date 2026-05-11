@@ -534,10 +534,10 @@ async def test_png_render_oversized_falls_back_to_verbatim():
 # 10. Bug C (v1.12 smoke): streaming msg must not retain raw table markdown
 # after finalize emits the PNG follow-up. Pre-fix, D1/D3 threads showed
 # ``[1]=raw markdown table text`` then ``[2]=PNG`` — user saw duplicated
-# content. Fix: ``_safe_edit`` substitutes a single space for empty
-# content (avoids Discord 50006), so ``_finalize_typewriter`` actually
-# manages to clear the streaming cursor msg of the table text before
-# the PNG is sent.
+# content. Fix: ``_safe_edit`` substitutes U+200B (zero-width space) for
+# empty content (avoids Discord 50006 which also rejects ``" "``), so
+# ``_finalize_typewriter`` actually manages to clear the streaming cursor
+# msg of the table text before the PNG is sent.
 # ---------------------------------------------------------------------------
 
 
@@ -548,7 +548,8 @@ async def test_finalize_typewriter_clears_streaming_msg_of_leaked_table():
     held the raw table text while streaming. After ``_finalize_typewriter``
     runs, the cursor msg's final ``content`` must NOT contain the raw
     ``|---|---|`` separator or data rows — those belong only in the PNG
-    follow-up message.
+    follow-up message. The user-visible state is "cleared" via U+200B
+    (zero-width space), which Discord accepts as non-empty.
     """
     target = FakeTarget()
     renderer = DiscordRenderer(target)
@@ -577,6 +578,15 @@ async def test_finalize_typewriter_clears_streaming_msg_of_leaked_table():
     assert "| Alpha | 10 |" not in live_msg.content, "raw data row leaked"
     assert "| Beta | 7 |" not in live_msg.content, "raw data row leaked"
 
+    # Positive assertion: live_msg.content is U+200B (zero-width space),
+    # the substitute used by ``_safe_edit`` for empty content. Discord
+    # rejects both "" and " " with 50006; U+200B renders invisibly so
+    # the user sees the msg as cleared.
+    assert live_msg.content == "\u200b", (
+        "expected U+200B substitute; got "
+        f"{live_msg.content!r}"
+    )
+
     # And the PNG follow-up went out as a separate message.
     png_calls = [c for c in target.calls if c.get("files")]
     assert len(png_calls) == 1
@@ -585,18 +595,20 @@ async def test_finalize_typewriter_clears_streaming_msg_of_leaked_table():
 
 
 # ---------------------------------------------------------------------------
-# 11. Bug D-2 (v1.12 smoke): _safe_edit must not pass content="" to
-# Discord — that returns HTTP 400 code 50006. Substitute a single space
-# so the edit succeeds and the streaming cursor msg actually gets cleared.
+# 11. Bug D-2 (v1.12 smoke): _safe_edit must not pass content="" — or
+# content=" " — to Discord; both return HTTP 400 code 50006 ("Cannot
+# send an empty message"). Substitute U+200B (zero-width space) so the
+# edit succeeds and the streaming cursor msg actually gets cleared.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_safe_edit_skips_empty_content():
-    """Calling ``_safe_edit(msg, content="")`` must not send ``content=""``
-    to Discord (avoids 50006). The fix substitutes a single space so the
-    edit goes through and the streaming msg gets cleared rather than
-    stuck at its prior content.
+    """Calling ``_safe_edit(msg, content="")`` must substitute U+200B
+    (zero-width space) before edit — Discord rejects both ``""`` and
+    ``" "`` (single space) with HTTP 400 code 50006. U+200B is the
+    canonical non-empty-but-invisible substitute so the streaming msg
+    gets cleared rather than stuck at its prior content.
     """
     target = FakeTarget()
     renderer = DiscordRenderer(target)
@@ -616,19 +628,18 @@ async def test_safe_edit_skips_empty_content():
     ok = await renderer._safe_edit(msg, content="")
     assert ok is True
 
-    # Exactly one edit happened — and the content sent to Discord was
-    # NOT the empty string. Either it's been substituted with a non-empty
-    # fallback (space) or the call was skipped entirely; both satisfy
-    # "never send content=''" to Discord.
+    # Exactly one edit happened, and the content sent to Discord was
+    # the U+200B zero-width space — NOT empty, NOT a plain space.
     edit_calls = [r for r in recorded if r.get("content") is not None]
-    if edit_calls:
-        # Substitute path: content is non-empty.
-        for r in edit_calls:
-            assert r["content"] != "", "must not send content='' to Discord"
-            assert len(r["content"]) > 0
-    # No matter which path, the prior content must NOT survive (Bug C
-    # would re-emerge if the streaming msg kept its raw-table text).
-    # The fallback-space path clears it; the skip path leaves it. Both
-    # are acceptable per the v1.12 spec — but the streaming-msg test
-    # above pins the user-visible behaviour.
+    assert len(edit_calls) == 1, (
+        f"expected exactly one edit call; got {len(edit_calls)}"
+    )
+    sent = edit_calls[0]["content"]
+    assert sent == "\u200b", (
+        "must substitute U+200B (not '' and not ' '); "
+        f"got {sent!r}"
+    )
+    # And the prior content did NOT survive — Bug C would re-emerge
+    # if the streaming msg kept its raw-table text.
+    assert msg.content == "\u200b"
 
