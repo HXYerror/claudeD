@@ -52,6 +52,7 @@ from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
+from ._http_retry import safe_send_message
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -165,9 +166,6 @@ class DiscordRenderer:
         # Message.edit() is not in-place; reading msg.content post-edit returns
         # stale text. See docs/investigations/stale-message-content.md (#113).
         self._last_msg_text: str = ""
-        # #147: track the message currently bearing the 🌐 network-paused
-        # reaction so we can remove it on recovery.
-        self._network_reaction_msg: discord.Message | None = None
 
     # ------------------------------------------------------------------
     # Helper: build a tool embed from a ToolUseBlock
@@ -825,13 +823,12 @@ class DiscordRenderer:
                                 await self._safe_edit(orig_msg, embed=result_embed)
         except Exception as exc:
             if is_transient_discord_error(exc):
-                # Discord blip — bridge is fine, just couldn't render. Pause
-                # and let the next edit retry. The render_response loop's own
-                # _retry_http on individual edits already handles short blips
-                # invisibly; if we reach here it means the blip outlasted the
-                # retry budget. Don't tear down the bridge — caller will keep
-                # streaming, eventually an edit will succeed and the buffer
-                # catches up.
+                # Discord blip — bridge is fine, just couldn't render. The
+                # individual edit/send wrappers already do their own
+                # ``_retry_http`` so reaching here means the blip outlasted
+                # one operation's retry budget. Don't tear down the bridge;
+                # caller will keep streaming, eventually an edit will
+                # succeed and the buffer catches up.
                 log.warning(
                     "Discord-transient error during render; bridge stays alive",
                     extra={
@@ -839,8 +836,17 @@ class DiscordRenderer:
                         "thread_id": getattr(self.target, "id", None),
                     },
                 )
-                if live_msg is not None:
-                    await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN] or "…")
+                # #147 R2 (C2): best-effort flush of whatever is buffered so
+                # the user doesn't lose tail text on a blip. ``_flush`` wraps
+                # Discord ops in their own ``_safe_*`` retry budget, so a
+                # continuing blip won't crash this recovery path. Cost
+                # footer is intentionally skipped on transient: the next
+                # user turn naturally won't try to footer this dead turn,
+                # and attempting it here doubles the failure surface.
+                try:
+                    await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
+                except Exception:  # noqa: BLE001
+                    log.debug("transient-recovery flush also failed; deferring", exc_info=True)
                 # Don't re-raise — caller (_render_with_retry) won't stop_session.
                 return
             log.exception("Renderer fatal error; tearing down bridge")
@@ -1294,7 +1300,6 @@ class DiscordRenderer:
             if time.monotonic() - attempt_start_time < 10.0:
                 return
             network_reaction_added = True
-            self._network_reaction_msg = reaction_target
             try:
                 await reaction_target.add_reaction("🌐")
             except Exception:  # noqa: BLE001
@@ -1314,7 +1319,6 @@ class DiscordRenderer:
                 log.debug("🌐 remove_reaction failed (best-effort)", exc_info=True)
             finally:
                 network_reaction_added = False
-                self._network_reaction_msg = None
 
         for attempt in range(MAX_HTTP_RETRIES + 1):
             try:
@@ -1478,6 +1482,16 @@ class DiscordRenderer:
         async def _op() -> discord.Message | None:
             return await self.target.send(**kwargs)
 
+        # #147 R2 (C1): send has no natural "user is watching this" message
+        # to react on (the new message doesn't exist until ``_op`` returns).
+        # Fall back to ``self._last_msg`` — the most recent typewriter cursor
+        # in the same channel — so the user still gets a 🌐 signal when a
+        # blip stalls the *next* send. When ``_last_msg`` is None (very first
+        # send of a fresh renderer), ``_retry_http`` short-circuits the
+        # reaction lifecycle silently — the long retry budget still applies.
+        prior = self._last_msg
+        guild = getattr(prior, "guild", None) if prior is not None else None
+        bot_user = getattr(guild, "me", None) if guild is not None else None
         msg = await self._retry_http(
             _op,
             label="send",
@@ -1485,6 +1499,8 @@ class DiscordRenderer:
             between_attempts=(
                 _reset_file if ("file" in kwargs or "files" in kwargs) else None
             ),
+            reaction_target=prior,
+            bot_user=bot_user,
         )
         # Only advance the shadow on content-bearing sends. Embed-only and
         # file-only sends do NOT touch _last_msg here — callers that want
@@ -1548,10 +1564,20 @@ class DiscordRenderer:
             await msg.edit(**kwargs)
             return msg
 
+        # #147 R2 (C1): wire 🌐 reaction into the production edit path.
+        # The reaction is attached to ``msg`` itself — the live cursor /
+        # typewriter message the user is watching. ``msg.guild.me`` is the
+        # bot's Member object in the guild; thread/channel ``Messageable``
+        # without a guild (DM) is rare but handled by ``bot_user=None``,
+        # which causes ``_retry_http`` to fall back to ``clear_reaction``.
+        guild = getattr(msg, "guild", None)
+        bot_user = getattr(guild, "me", None) if guild is not None else None
         result = await self._retry_http(
             _op,
             label="edit",
             content_len=len(content) if content else 0,
+            reaction_target=msg,
+            bot_user=bot_user,
         )
         # Sync shadow on success — see #113 / docs/investigations/stale-message-content.md.
         if result is not None and content is not None and msg is self._last_msg:
@@ -1976,10 +2002,21 @@ class DiscordRenderer:
             color=COLOR_TOOL_FAILURE,
         )
         view = RetryView(on_retry=on_retry)
-        try:
-            await self.target.send(embed=embed, view=view)
-        except discord.HTTPException:
-            log.exception("Failed to post crash-with-retry embed")
+        # #147 R2 (C3 / PRD §Decision 6 closure): the original incident chain
+        # was "Discord blip → render crash → retry-embed posted on the SAME
+        # blip → embed post crashes too, no retry button visible". Route the
+        # crash-with-retry embed through ``safe_send_message`` so the same
+        # transient that caused the crash doesn't also eat the recovery UI.
+        # ``safe_send_message`` returns None on giveup (logged at ERROR
+        # inside ``safe_http``); the embed simply doesn't appear and the
+        # user can re-send their message manually — strictly better than
+        # the previous "single attempt, swallowed exception" behavior.
+        sent = await safe_send_message(self.target, embed=embed, view=view)
+        if sent is None:
+            log.warning(
+                "Crash-with-retry embed did not post (transient exhaustion)",
+                extra={"target_id": getattr(self.target, "id", None)},
+            )
 
 
 # ---------------------------------------------------------------------------

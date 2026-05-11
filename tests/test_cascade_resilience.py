@@ -111,27 +111,42 @@ async def test_runtime_error_during_render_tears_down():
 
 
 async def test_network_reaction_added_after_10s_then_removed_on_recovery():
-    """During a sustained blip, 🌐 is added once; on recovery it's removed."""
+    """During a sustained blip, 🌐 is added once; on recovery it's removed.
+
+    R2 (C1 pinning): exercise the PRODUCTION path via ``_safe_edit`` rather
+    than ``_retry_http`` directly. The R1 engineer review caught that
+    ``_safe_edit`` / ``_safe_send`` weren't passing ``reaction_target`` so
+    the entire 🌐 feature was dead in production — fixed in C1 by deriving
+    ``reaction_target`` from the message being edited. Driving the test
+    through ``_safe_edit`` ensures any future regression of that wiring
+    breaks this test.
+    """
     from clauded.discord_renderer import DiscordRenderer
 
     target = MagicMock()
     target.send = AsyncMock()
     renderer = DiscordRenderer(target)
 
-    # The reaction-bearing message
-    msg = MagicMock(spec=discord.Message)
-    msg.add_reaction = AsyncMock()
-    msg.remove_reaction = AsyncMock()
-
-    # First 3 attempts fail with ClientConnectorError, then succeed.
+    # First 3 edits fail with ClientConnectorError, then the 4th succeeds.
     call_count = {"n": 0}
-    success_msg = MagicMock(spec=discord.Message)
 
-    async def _op():
+    async def _edit(*args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] <= 3:
             raise aiohttp.ClientConnectorError(MagicMock(), OSError("blip"))
-        return success_msg
+        return None  # discord.Message.edit returns None on success
+
+    # The reaction-bearing message: ``_safe_edit`` will pass this as
+    # ``reaction_target`` automatically. ``msg.guild.me`` is what the new
+    # wiring uses for ``bot_user``.
+    msg = MagicMock(spec=discord.Message)
+    msg.edit = AsyncMock(side_effect=_edit)
+    msg.add_reaction = AsyncMock()
+    msg.remove_reaction = AsyncMock()
+    bot_user = MagicMock()
+    bot_user.id = 999
+    msg.guild = MagicMock()
+    msg.guild.me = bot_user
 
     # Patch time.monotonic to advance 5s per call (so by attempt 3 we've exceeded 10s).
     t = {"v": 0.0}
@@ -141,23 +156,22 @@ async def test_network_reaction_added_after_10s_then_removed_on_recovery():
         t["v"] += 5.0
         return cur
 
-    bot_user = MagicMock()
-    bot_user.id = 999
-
     with patch("clauded.discord_renderer.time.monotonic", side_effect=_fake_monotonic), \
          patch("clauded.discord_renderer.asyncio.sleep", new=AsyncMock()):
-        result = await renderer._retry_http(
-            _op,
-            label="edit",
-            content_len=10,
-            reaction_target=msg,
-            bot_user=bot_user,
-        )
+        ok = await renderer._safe_edit(msg, content="recovered content")
 
-    assert result is success_msg
-    # 🌐 added once after 10s elapsed
+    assert ok is True, "edit should eventually succeed"
+    # 🌐 added once after 10s elapsed, on the same message being edited
     add_calls = [c for c in msg.add_reaction.call_args_list if "🌐" in str(c)]
-    assert len(add_calls) == 1, f"expected exactly one 🌐 add_reaction, got {msg.add_reaction.call_args_list}"
-    # 🌐 removed once after recovery
+    assert len(add_calls) == 1, (
+        f"expected exactly one 🌐 add_reaction, got {msg.add_reaction.call_args_list}"
+    )
+    # 🌐 removed once after recovery, via the bot_user resolved from msg.guild.me
     remove_calls = [c for c in msg.remove_reaction.call_args_list if "🌐" in str(c)]
-    assert len(remove_calls) == 1, f"expected exactly one 🌐 remove_reaction, got {msg.remove_reaction.call_args_list}"
+    assert len(remove_calls) == 1, (
+        f"expected exactly one 🌐 remove_reaction, got {msg.remove_reaction.call_args_list}"
+    )
+    # Pin that the bot_user passed in is what _safe_edit derived from msg.guild.me
+    assert remove_calls[0].args[1] is bot_user, (
+        "remove_reaction should be called with msg.guild.me as the member arg"
+    )

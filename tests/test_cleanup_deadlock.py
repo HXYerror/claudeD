@@ -57,10 +57,30 @@ async def test_stuck_disconnect_force_drops_after_timeout(
 async def test_cleanup_concurrent_one_stuck_two_healthy(
     cfg: Config, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """One stuck bridge must not block concurrent cleanup of two healthy peers."""
+    """One stuck bridge must not block concurrent cleanup of two healthy peers.
+
+    R2 (C1 from tester R1): the original assertion only checked that all
+    three sessions were drained — it would pass even under serial execution
+    because the two healthy mocks returned instantly. Strengthen the test
+    by:
+
+    1. Making the two healthy bridges each ``await asyncio.sleep(HEALTHY)``
+       so a serial implementation would total ``STUCK + HEALTHY + HEALTHY``
+       wall-time, but the concurrent gather should be ~``STUCK``.
+    2. Measuring elapsed wall-time and asserting it stays under 1.5×
+       ``STUCK`` (the cap is the stuck timeout, not the sum).
+
+    Serial budget under the regression: 0.3 + 0.2 + 0.2 = 0.7s (FAIL the
+    < 0.45s bound). Concurrent: max(0.3, 0.2, 0.2) = 0.3s (PASS).
+    """
     from clauded.bot import ClaudedBot
 
-    monkeypatch.setenv("CLAUDED_BRIDGE_STOP_TIMEOUT", "0.3")
+    STUCK_TIMEOUT = 0.3
+    HEALTHY_DELAY = 0.2
+    # Concurrent cap: 1.5 × stuck timeout. Serial would need ≥ 0.7s.
+    CONCURRENCY_BOUND = STUCK_TIMEOUT * 1.5
+
+    monkeypatch.setenv("CLAUDED_BRIDGE_STOP_TIMEOUT", str(STUCK_TIMEOUT))
     monkeypatch.setenv("CLAUDED_SESSION_TIMEOUT", "1")  # immediate eligibility
 
     # Build a bot without going through full init: we only exercise `_cleanup_task`.
@@ -80,9 +100,13 @@ async def test_cleanup_concurrent_one_stuck_two_healthy(
     async def _never_returns() -> None:
         await asyncio.sleep(999)
 
+    async def _healthy_slow() -> None:
+        # Genuine delay so serial execution would compound.
+        await asyncio.sleep(HEALTHY_DELAY)
+
     sessions[102].stop = AsyncMock(side_effect=_never_returns)
-    sessions[101].stop = AsyncMock()
-    sessions[103].stop = AsyncMock()
+    sessions[101].stop = AsyncMock(side_effect=_healthy_slow)
+    sessions[103].stop = AsyncMock(side_effect=_healthy_slow)
 
     bot.session_manager.list_sessions = MagicMock(return_value=sessions)
     bot.session_manager.save_session_state = MagicMock()
@@ -109,8 +133,19 @@ async def test_cleanup_concurrent_one_stuck_two_healthy(
     # Invoke the cleanup body. tasks.loop wraps it; call the underlying coroutine.
     cleanup = ClaudedBot._cleanup_task
     coro_fn = getattr(cleanup, "coro", None) or getattr(cleanup, "callback", None) or cleanup
+
+    elapsed_start = time.monotonic()
     await asyncio.wait_for(coro_fn(bot), timeout=5.0)
+    elapsed = time.monotonic() - elapsed_start
 
     # All three should have been processed; sessions dict drained.
     assert sorted(stopped) == [101, 102, 103]
     assert sessions == {}
+    # Concurrency assertion: if `_cleanup_task` regressed to serial
+    # `for tid in to_remove: await _stop_one(tid)`, the wall time would be
+    # roughly STUCK_TIMEOUT + 2 × HEALTHY_DELAY = 0.7s, far above the cap.
+    assert elapsed < CONCURRENCY_BOUND, (
+        f"cleanup took {elapsed:.3f}s; expected concurrent execution under "
+        f"{CONCURRENCY_BOUND:.3f}s (serial would be "
+        f"~{STUCK_TIMEOUT + 2 * HEALTHY_DELAY:.3f}s)"
+    )

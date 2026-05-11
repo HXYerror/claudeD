@@ -3,9 +3,9 @@
 `safe_http` runs a coroutine factory under exponential backoff, catching only
 the transient classes per `_errors.is_transient_discord_error`. On final
 exhaustion it returns ``None`` instead of raising — callers can decide whether
-to log or surface the failure. Specialized wrappers (`safe_edit_message`,
-`safe_send_message`, `safe_remove_reaction`, `safe_add_reaction`) capture the
-common Discord operations bot.py and discord_renderer.py both need.
+to log or surface the failure. Specialized wrappers (`safe_send_message`,
+`safe_remove_reaction`, `safe_add_reaction`) capture the common Discord
+operations bot.py and discord_renderer.py both need.
 """
 from __future__ import annotations
 
@@ -78,14 +78,12 @@ async def safe_http(
     return None
 
 
-async def safe_edit_message(msg: "discord.Message", **kwargs: Any) -> bool:
-    """Edit a Discord message under retry. Returns True on success."""
-    result = await safe_http(lambda: msg.edit(**kwargs), label="edit")
-    return result is not None
-
-
 async def safe_send_message(channel_or_thread: Any, **kwargs: Any) -> "discord.Message | None":
-    """Send a Discord message under retry. Returns the sent Message or None."""
+    """Send a Discord message under retry. Returns the sent Message or None.
+
+    Used by ``discord_renderer.send_error_with_retry`` (#147 R2 C3) so the
+    crash-with-retry embed survives the very transient that caused the crash.
+    """
     return await safe_http(lambda: channel_or_thread.send(**kwargs), label="send")
 
 
