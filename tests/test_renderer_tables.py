@@ -595,20 +595,22 @@ async def test_finalize_typewriter_clears_streaming_msg_of_leaked_table():
 
 
 # ---------------------------------------------------------------------------
-# 11. Bug D-2 (v1.12 smoke): _safe_edit must not pass content="" — or
-# content=" " — to Discord; both return HTTP 400 code 50006 ("Cannot
-# send an empty message"). Substitute U+200B (zero-width space) so the
-# edit succeeds and the streaming cursor msg actually gets cleared.
+# 11. Bug D-2 (v1.12 smoke) / v1.16 #142 §A3 — clearing a cursor msg must
+# substitute U+200B (zero-width space). Discord rejects both ``""`` and
+# ``" "`` with HTTP 400 code 50006 ("Cannot send an empty message"); the
+# ZWS is the canonical invisible-but-non-empty substitute. v1.16 moved
+# the substitution out of ``_safe_edit`` (pure transport) and into
+# ``_clear_cursor_msg``; this test now pins the new helper.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_safe_edit_skips_empty_content():
-    """Calling ``_safe_edit(msg, content="")`` must substitute U+200B
-    (zero-width space) before edit — Discord rejects both ``""`` and
-    ``" "`` (single space) with HTTP 400 code 50006. U+200B is the
-    canonical non-empty-but-invisible substitute so the streaming msg
-    gets cleared rather than stuck at its prior content.
+async def test_clear_cursor_msg_substitutes_zws():
+    """Calling ``_clear_cursor_msg(msg)`` must edit ``msg`` to U+200B —
+    Discord rejects both ``""`` and ``" "`` (single space) with HTTP
+    400 code 50006. U+200B is the canonical non-empty-but-invisible
+    substitute so the streaming msg gets cleared rather than stuck at
+    its prior content (#142 §A3).
     """
     target = FakeTarget()
     renderer = DiscordRenderer(target)
@@ -625,7 +627,7 @@ async def test_safe_edit_skips_empty_content():
 
     msg = RecordingMessage("prior content")
 
-    ok = await renderer._safe_edit(msg, content="")
+    ok = await renderer._clear_cursor_msg(msg)
     assert ok is True
 
     # Exactly one edit happened, and the content sent to Discord was
