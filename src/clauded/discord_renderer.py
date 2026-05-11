@@ -35,6 +35,7 @@ import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
+import aiohttp
 import discord
 
 import re
@@ -50,6 +51,8 @@ from .claude_bridge import (
 from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
 from .cogs._table_view import CopyTableTextView
+from ._errors import is_transient_discord_error
+from ._http_retry import safe_send_message
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -818,8 +821,35 @@ class DiscordRenderer:
                                         color=COLOR_TOOL_SUCCESS,
                                     )
                                 await self._safe_edit(orig_msg, embed=result_embed)
-        except Exception:
-            log.exception("ClaudeBridge stream failed")
+        except Exception as exc:
+            if is_transient_discord_error(exc):
+                # Discord blip — bridge is fine, just couldn't render. The
+                # individual edit/send wrappers already do their own
+                # ``_retry_http`` so reaching here means the blip outlasted
+                # one operation's retry budget. Don't tear down the bridge;
+                # caller will keep streaming, eventually an edit will
+                # succeed and the buffer catches up.
+                log.warning(
+                    "Discord-transient error during render; bridge stays alive",
+                    extra={
+                        "exc_class": type(exc).__name__,
+                        "thread_id": getattr(self.target, "id", None),
+                    },
+                )
+                # #147 R2 (C2): best-effort flush of whatever is buffered so
+                # the user doesn't lose tail text on a blip. ``_flush`` wraps
+                # Discord ops in their own ``_safe_*`` retry budget, so a
+                # continuing blip won't crash this recovery path. Cost
+                # footer is intentionally skipped on transient: the next
+                # user turn naturally won't try to footer this dead turn,
+                # and attempting it here doubles the failure surface.
+                try:
+                    await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
+                except Exception:  # noqa: BLE001
+                    log.debug("transient-recovery flush also failed; deferring", exc_info=True)
+                # Don't re-raise — caller (_render_with_retry) won't stop_session.
+                return
+            log.exception("Renderer fatal error; tearing down bridge")
             # Best-effort: clean up the live cursor. Don't try to surface a
             # plain-text error here — callers (bot.py) wrap render_response
             # in the crash-notification flow which posts a richer embed
@@ -1244,6 +1274,8 @@ class DiscordRenderer:
         label: str,
         content_len: int,
         between_attempts: Callable[[], None] | None = None,
+        reaction_target: discord.Message | None = None,
+        bot_user: discord.abc.User | None = None,
     ) -> discord.Message | None:
         """Run ``op()`` with retry/backoff.
 
@@ -1253,10 +1285,46 @@ class DiscordRenderer:
         permanent failure; if non-zero we emit an ``ERROR`` log on giveup.
         ``between_attempts`` is invoked just before each retry sleep
         (used by ``_safe_send`` to ``seek(0)`` a file stream between tries).
+        ``reaction_target`` is the message on which a 🌐 reaction is added
+        when cumulative retries exceed 10s, and removed on recovery (#147).
+        ``bot_user`` is the bot member used to remove its own reaction.
         """
+        attempt_start_time = time.monotonic()
+        network_reaction_added = False
+
+        async def _ensure_network_reaction() -> None:
+            """Fire-and-forget: add 🌐 if 10s elapsed and not already added."""
+            nonlocal network_reaction_added
+            if network_reaction_added or reaction_target is None:
+                return
+            if time.monotonic() - attempt_start_time < 10.0:
+                return
+            network_reaction_added = True
+            try:
+                await reaction_target.add_reaction("🌐")
+            except Exception:  # noqa: BLE001
+                log.debug("🌐 add_reaction failed (best-effort)", exc_info=True)
+
+        async def _clear_network_reaction() -> None:
+            """Fire-and-forget: remove 🌐 on recovery."""
+            nonlocal network_reaction_added
+            if not network_reaction_added or reaction_target is None:
+                return
+            try:
+                if bot_user is not None:
+                    await reaction_target.remove_reaction("🌐", bot_user)
+                else:
+                    await reaction_target.clear_reaction("🌐")
+            except Exception:  # noqa: BLE001
+                log.debug("🌐 remove_reaction failed (best-effort)", exc_info=True)
+            finally:
+                network_reaction_added = False
+
         for attempt in range(MAX_HTTP_RETRIES + 1):
             try:
-                return await op()
+                result = await op()
+                await _clear_network_reaction()
+                return result
             except discord.RateLimited as exc:
                 try:
                     retry_after = float(getattr(exc, "retry_after", 1.0) or 1.0)
@@ -1275,6 +1343,7 @@ class DiscordRenderer:
                 )
                 if between_attempts is not None:
                     between_attempts()
+                await _ensure_network_reaction()
                 await asyncio.sleep(wait)
             except discord.HTTPException as exc:
                 try:
@@ -1296,6 +1365,7 @@ class DiscordRenderer:
                             "Discord %s failed after %d attempts (status=%s)",
                             label, attempt + 1, status, exc_info=True,
                         )
+                    await _clear_network_reaction()
                     return None
                 log.warning(
                     "Discord %s transient failure (attempt %d/%d, status=%s); "
@@ -1305,6 +1375,35 @@ class DiscordRenderer:
                 )
                 if between_attempts is not None:
                     between_attempts()
+                await _ensure_network_reaction()
+                await asyncio.sleep(_BACKOFF[attempt])
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                # #147: Discord network blip (TCP/SSL handshake, server reset).
+                # Treat as retriable like 5xx.
+                if attempt == MAX_HTTP_RETRIES:
+                    if content_len:
+                        verb = "DROPPED" if label == "send" else "UNDELIVERED"
+                        log.error(
+                            "Discord %s network-failed after %d attempts (%s); "
+                            "%s %d chars",
+                            label, attempt + 1, type(exc).__name__, verb, content_len,
+                            exc_info=True,
+                        )
+                    else:
+                        log.warning(
+                            "Discord %s network-failed after %d attempts (%s)",
+                            label, attempt + 1, type(exc).__name__, exc_info=True,
+                        )
+                    await _clear_network_reaction()
+                    return None
+                log.warning(
+                    "Discord %s network blip (attempt %d/%d, %s); sleeping %.2fs",
+                    label, attempt + 1, MAX_HTTP_RETRIES + 1,
+                    type(exc).__name__, _BACKOFF[attempt],
+                )
+                if between_attempts is not None:
+                    between_attempts()
+                await _ensure_network_reaction()
                 await asyncio.sleep(_BACKOFF[attempt])
 
         # Loop fell through — every attempt was a RateLimited (HTTPException
@@ -1383,6 +1482,16 @@ class DiscordRenderer:
         async def _op() -> discord.Message | None:
             return await self.target.send(**kwargs)
 
+        # #147 R2 (C1): send has no natural "user is watching this" message
+        # to react on (the new message doesn't exist until ``_op`` returns).
+        # Fall back to ``self._last_msg`` — the most recent typewriter cursor
+        # in the same channel — so the user still gets a 🌐 signal when a
+        # blip stalls the *next* send. When ``_last_msg`` is None (very first
+        # send of a fresh renderer), ``_retry_http`` short-circuits the
+        # reaction lifecycle silently — the long retry budget still applies.
+        prior = self._last_msg
+        guild = getattr(prior, "guild", None) if prior is not None else None
+        bot_user = getattr(guild, "me", None) if guild is not None else None
         msg = await self._retry_http(
             _op,
             label="send",
@@ -1390,6 +1499,8 @@ class DiscordRenderer:
             between_attempts=(
                 _reset_file if ("file" in kwargs or "files" in kwargs) else None
             ),
+            reaction_target=prior,
+            bot_user=bot_user,
         )
         # Only advance the shadow on content-bearing sends. Embed-only and
         # file-only sends do NOT touch _last_msg here — callers that want
@@ -1453,10 +1564,20 @@ class DiscordRenderer:
             await msg.edit(**kwargs)
             return msg
 
+        # #147 R2 (C1): wire 🌐 reaction into the production edit path.
+        # The reaction is attached to ``msg`` itself — the live cursor /
+        # typewriter message the user is watching. ``msg.guild.me`` is the
+        # bot's Member object in the guild; thread/channel ``Messageable``
+        # without a guild (DM) is rare but handled by ``bot_user=None``,
+        # which causes ``_retry_http`` to fall back to ``clear_reaction``.
+        guild = getattr(msg, "guild", None)
+        bot_user = getattr(guild, "me", None) if guild is not None else None
         result = await self._retry_http(
             _op,
             label="edit",
             content_len=len(content) if content else 0,
+            reaction_target=msg,
+            bot_user=bot_user,
         )
         # Sync shadow on success — see #113 / docs/investigations/stale-message-content.md.
         if result is not None and content is not None and msg is self._last_msg:
@@ -1881,10 +2002,21 @@ class DiscordRenderer:
             color=COLOR_TOOL_FAILURE,
         )
         view = RetryView(on_retry=on_retry)
-        try:
-            await self.target.send(embed=embed, view=view)
-        except discord.HTTPException:
-            log.exception("Failed to post crash-with-retry embed")
+        # #147 R2 (C3 / PRD §Decision 6 closure): the original incident chain
+        # was "Discord blip → render crash → retry-embed posted on the SAME
+        # blip → embed post crashes too, no retry button visible". Route the
+        # crash-with-retry embed through ``safe_send_message`` so the same
+        # transient that caused the crash doesn't also eat the recovery UI.
+        # ``safe_send_message`` returns None on giveup (logged at ERROR
+        # inside ``safe_http``); the embed simply doesn't appear and the
+        # user can re-send their message manually — strictly better than
+        # the previous "single attempt, swallowed exception" behavior.
+        sent = await safe_send_message(self.target, embed=embed, view=view)
+        if sent is None:
+            log.warning(
+                "Crash-with-retry embed did not post (transient exhaustion)",
+                extra={"target_id": getattr(self.target, "id", None)},
+            )
 
 
 # ---------------------------------------------------------------------------
