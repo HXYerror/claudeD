@@ -706,32 +706,177 @@ async def test_mid_stream_finalize_with_partial_quad_backtick_skips_extraction(
 
 
 @pytest.mark.asyncio
-async def test_final_finalize_still_extracts(monkeypatch):
-    """is_final=True (default + end-of-turn behavior) runs table
-    extraction normally — the #141 fix must not regress the v1.12 happy
-    path.
+async def test_mid_stream_finalize_long_buffer_no_truncation(monkeypatch):
+    """#141 R2 (engineer C1): mid-stream finalize on a buffer > DISCORD_MAX_LEN
+    must multi-chunk via ``_smart_split``, not silently truncate. Previous
+    impl did ``buffer[:DISCORD_MAX_LEN]`` and the caller reset ``buffer = ""``
+    immediately — losing everything past byte 1900. Asserts:
+    1) every character of the original buffer lands somewhere (edit or send),
+    2) chunk count > 1 (multi-chunk path exercised),
+    3) no extraction was triggered (is_final=False path).
     """
     target = FakeTarget()
     renderer = DiscordRenderer(target)
-
-    # Real markdown table — would normally produce one TableRender.
-    final_buffer = "| col |\n|---|\n| v |"
     live_msg = FakeMessage(content="")
 
-    calls: list[str] = []
+    # Build a ~4500 char buffer: long prose with paragraph breaks so
+    # _smart_split has clean split points. No backticks → table extraction
+    # would be a no-op anyway, but we still want to prove it isn't called.
+    para = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 6
+    buffer = "\n\n".join([para] * 14)
+    assert len(buffer) > 4000, f"test fixture too small: {len(buffer)}"
+
+    # Spy on _extract_and_render_tables — must NOT be called.
+    extract_calls: list[str] = []
 
     async def _spy(_buffer):
-        calls.append("called")
+        extract_calls.append("called")
         return ("", [])
 
     monkeypatch.setattr(
         DiscordRenderer, "_extract_and_render_tables", staticmethod(_spy)
     )
 
-    # Default is_final=True.
-    await renderer._finalize_typewriter(live_msg, final_buffer)
+    await renderer._finalize_typewriter(live_msg, buffer, is_final=False)
 
-    assert calls == ["called"], (
-        "is_final=True (default) must invoke _extract_and_render_tables"
+    # No extraction on mid-stream path.
+    assert extract_calls == [], "is_final=False must not extract"
+
+    # Chunk 1 lands via edit on live_msg; chunks 2+ via target.send().
+    sent_chunks = [c["content"] for c in target.calls if c.get("content")]
+    # Multi-chunk path must have fired — at least one new send beyond live_msg.
+    assert len(sent_chunks) >= 1, (
+        "long-buffer path must send chunks 2+ as new messages; "
+        f"got {len(sent_chunks)} new sends"
+    )
+
+    # Reassemble: live_msg content (chunk 1) + sent chunks (chunks 2+).
+    reassembled = live_msg.content + "".join(sent_chunks)
+    # All characters of the original buffer must be preserved across chunks.
+    # _smart_split may insert at paragraph boundaries; concat must equal source.
+    assert reassembled == buffer, (
+        "silent truncation regression — characters lost between chunks. "
+        f"orig_len={len(buffer)} reassembled_len={len(reassembled)}"
+    )
+
+    # Every individual chunk must fit within Discord's per-message cap.
+    from clauded.discord_renderer import DISCORD_MAX_LEN
+    for i, chunk in enumerate([live_msg.content, *sent_chunks]):
+        assert len(chunk) <= DISCORD_MAX_LEN, (
+            f"chunk {i} exceeds DISCORD_MAX_LEN: {len(chunk)} > {DISCORD_MAX_LEN}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_render_response_passes_is_final_false_on_tool_interleave(
+    monkeypatch,
+):
+    """#141 R2 (engineer C2): integration-style guard pinning the *call
+    site* at discord_renderer.py:~442. A future regression that drops the
+    ``is_final=False`` kwarg there would silently re-introduce the v1.12
+    D2 streaming-race bug. Spies on ``_finalize_typewriter`` while driving
+    ``render_response`` through a scripted SDK event sequence:
+
+        text_delta → ToolUseBlock → text_delta → ResultMessage
+
+    Asserts the spy was invoked with ``is_final=False`` from the
+    ToolUseBlock-interleave path. (The end-of-turn flush uses a different
+    code path — ``_flush`` — so the spy only needs to catch the
+    interleave call.)
+    """
+    from clauded.claude_bridge import (
+        AssistantMessage,
+        ResultMessage,
+        ToolUseBlock,
+    )
+    from claude_agent_sdk.types import StreamEvent
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Drive time.time() so typewriter mode engages (>FAST_PATH_SECONDS).
+    fake_now = [1_000_000.0]
+
+    def _fake_time():
+        fake_now[0] += 5.0  # > FAST_PATH_SECONDS=3.0 each call
+        return fake_now[0]
+
+    monkeypatch.setattr("clauded.discord_renderer.time.time", _fake_time)
+
+    # Spy on _finalize_typewriter — record every call's is_final value.
+    finalize_calls: list[dict] = []
+    original = renderer._finalize_typewriter
+
+    async def _spy(live_msg, buffer, *, is_final=True):
+        finalize_calls.append({"is_final": is_final, "buffer_len": len(buffer)})
+        return await original(live_msg, buffer, is_final=is_final)
+
+    monkeypatch.setattr(renderer, "_finalize_typewriter", _spy)
+
+    # Scripted event sequence: two text deltas (so typewriter mode engages
+    # after FAST_PATH_SECONDS on the 2nd) → tool use → continuation → end.
+    # The 2nd text_delta enters typewriter mode and sets ``live_msg``;
+    # the ToolUseBlock then triggers the ``is_final=False`` finalize call.
+    events = [
+        StreamEvent(
+            uuid="u1",
+            session_id="s1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Pre-tool prose ````\n```\n"},
+            },
+        ),
+        StreamEvent(
+            uuid="u2",
+            session_id="s1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "| a | b |\n|---|---|\n| 1 | 2 |\n"},
+            },
+        ),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "echo hi"})],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        StreamEvent(
+            uuid="u3",
+            session_id="s1",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "post-tool prose"},
+            },
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=1000,
+            duration_api_ms=900,
+            is_error=False,
+            num_turns=1,
+            session_id="s1",
+            total_cost_usd=0.01,
+        ),
+    ]
+
+    class _Bridge:
+        async def send_message(self, _text):
+            for ev in events:
+                yield ev
+
+    await renderer.render_response(_Bridge(), "hello")
+
+    # The ToolUseBlock interleave must have triggered exactly one
+    # _finalize_typewriter call with is_final=False. If a future refactor
+    # drops the kwarg, is_final defaults to True and extraction would fire
+    # on the partial buffer — this assertion catches that.
+    mid_stream = [c for c in finalize_calls if c["is_final"] is False]
+    assert len(mid_stream) == 1, (
+        f"expected exactly one is_final=False call from the ToolUseBlock "
+        f"interleave; got finalize_calls={finalize_calls}"
+    )
+    # Pre-tool buffer must be non-empty (proves we actually exercised the
+    # finalize path, not a no-op early return).
+    assert mid_stream[0]["buffer_len"] > 0, (
+        "mid-stream finalize fired on empty buffer — test fixture broken"
     )
 
