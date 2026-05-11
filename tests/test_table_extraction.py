@@ -287,3 +287,57 @@ async def test_no_separator_mismatched_cells_falls_back_verbatim():
     # Both lines survive in the output unchanged.
     assert "| a | b | c |" in out
     assert "| 1 | 2 |" in out
+
+
+# ---------------------------------------------------------------------------
+# v1.12 Bug D — quad-backtick outer fence preserves inner table verbatim.
+# CommonMark §4.5: a fence opens with N≥3 backticks and only closes on a
+# line whose backtick run length is ≥N. The pre-fix tracker toggled on any
+# ``startswith("```")`` line so an inner triple-backtick boundary inside a
+# quad-backtick outer fence closed the fence prematurely, letting the
+# inner markdown table leak out to PNG extraction (violates PRD R5).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_quad_backtick_outer_fence_preserves_inner_table():
+    """Outer ````` ```` ````` fence wrapping a triple-backtick block that
+    wraps a markdown table → 0 TableRenders, returned text equals input.
+
+    User-facing intent: "show me literally this markdown, don't render it".
+    The extractor must not touch a single character inside the quad fence.
+    """
+    text = (
+        "Before.\n"
+        "````\n"
+        "```\n"
+        "| h |\n"
+        "|---|\n"
+        "| v |\n"
+        "```\n"
+        "````\n"
+        "After."
+    )
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert renders == [], "quad-fence inner table must NOT be extracted"
+    assert out == text, "returned text must equal input verbatim"
+
+
+@pytest.mark.asyncio
+async def test_triple_backtick_fence_still_works():
+    """Regression pin: simple ``` fence around a markdown table still
+    suppresses extraction (pre-existing R5 behaviour unchanged by the
+    quad-fence fix).
+    """
+    text = (
+        "Before.\n"
+        "```\n"
+        "| h |\n"
+        "|---|\n"
+        "| v |\n"
+        "```\n"
+        "After."
+    )
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert renders == [], "triple-fence inner table must NOT be extracted"
+    assert out == text, "returned text must equal input verbatim"

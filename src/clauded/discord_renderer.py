@@ -1426,6 +1426,17 @@ class DiscordRenderer:
         """
         kwargs: dict = {}
         if content is not None:
+            # v1.12 bug D — Discord rejects ``content=""`` with HTTP 400
+            # code 50006 "Cannot send an empty message". This bites the
+            # streaming-cursor cleanup path in ``_finalize_typewriter``
+            # where the buffer is entirely a table placeholder and the
+            # pre-table segment is empty. Substitute a single space so
+            # the edit succeeds and the user no longer sees the leaked
+            # raw markdown table text alongside the PNG follow-up
+            # (Bug C symptom in the v1.12 smoke run).
+            if not content.strip():
+                log.debug("_safe_edit: empty content; substituting space to avoid Discord 50006")
+                content = " "
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed
@@ -1579,12 +1590,26 @@ class DiscordRenderer:
         lines_in = text.split("\n")
         result: list[str] = []
         renders: list[TableRender] = []
-        in_code_fence = False
+        # v1.12 bug D — fence depth tracker per CommonMark §4.5. A fence
+        # opens with N≥3 consecutive backticks and only closes on a line
+        # whose backtick run length is ≥N. Tracking just a bool with
+        # ``startswith("```")`` mis-parsed quad-backtick outer fences:
+        # the inner ``\u0060\u0060\u0060`` line was treated as a fence
+        # toggle and the markdown table inside leaked back out to PNG
+        # extraction, violating PRD R5 (code fences preserved verbatim).
+        fence_count = 0  # 0 ⇒ not in a fence; otherwise the opener's backtick run
         i = 0
         n = len(lines_in)
 
         def _is_table_line(s: str) -> bool:
             return s.startswith("|") and s.endswith("|")
+
+        def _leading_backtick_run(s: str) -> int:
+            """Return the count of leading backticks on ``s`` (already stripped)."""
+            j = 0
+            while j < len(s) and s[j] == "`":
+                j += 1
+            return j
 
         def _is_separator_line(s: str) -> bool:
             # e.g. ``|---|---|`` or ``| :--- | ---: |`` — only ``|``, ``-``,
@@ -1608,13 +1633,27 @@ class DiscordRenderer:
             stripped = line.strip()
 
             # Track code fences first — anything inside is opaque.
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
+            # CommonMark §4.5: a fence opens with N≥3 consecutive backticks
+            # at line start; it only closes on a line whose backtick run
+            # length is ≥N (so a ``\u0060\u0060\u0060\u0060`` outer fence
+            # is NOT closed by an inner ``\u0060\u0060\u0060``). v1.12
+            # bug D — see comment block above.
+            ticks = _leading_backtick_run(stripped)
+            if fence_count == 0:
+                if ticks >= 3:
+                    fence_count = ticks
+                    result.append(line)
+                    i += 1
+                    continue
+            else:
+                # Currently inside a fence — only a ≥fence_count run closes it.
+                if ticks >= fence_count:
+                    fence_count = 0
                 result.append(line)
                 i += 1
                 continue
 
-            if in_code_fence or not _is_table_line(stripped):
+            if not _is_table_line(stripped):
                 result.append(line)
                 i += 1
                 continue
