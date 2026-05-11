@@ -35,11 +35,16 @@ class CopyTableTextView(ui.View):
         interaction: discord.Interaction,
         button: ui.Button,
     ) -> None:
+        # Filename must start with ``table_`` AND end with ``.md`` — this
+        # prevents collision with the long-upload fallback message which is
+        # named ``claude-response.md`` (review I7). Without the prefix
+        # guard, a Copy button on a multi-attachment message could fire
+        # against the wrong sidecar.
         md_attachment = next(
             (
                 a
                 for a in interaction.message.attachments
-                if a.filename.endswith(".md")
+                if a.filename.startswith("table_") and a.filename.endswith(".md")
             ),
             None,
         )

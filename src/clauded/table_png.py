@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import io
 import re
-from typing import Iterable
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -45,6 +44,13 @@ ACCENT_W = 4
 MAX_CELL_CHARS = 120
 ELLIPSIS = "…"
 
+# DoS guards (review I4). Caller catches the ValueError and falls back to
+# emitting the original markdown verbatim — see C2 try/except in
+# DiscordRenderer._extract_and_render_tables.
+MAX_COLS = 20
+MAX_ROWS = 200
+MAX_TABLE_PIXELS = 8000 * 4000  # ~96 MB at 3 bytes/pixel
+
 # Matches markdown links ``[name](url)``. Conservative — no nested brackets.
 _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
@@ -52,10 +58,13 @@ _LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 # --- Font resolution -----------------------------------------------------
 
 # Module-level so tests can monkeypatch the candidate list.
+# PingFang first: it has good Latin coverage AND CJK glyphs, so it works as
+# the primary font on the happy path while preventing tofu boxes for Chinese
+# text (PRD R4.2 — review I6).
 FONT_CANDIDATES = (
-    "/System/Library/Fonts/Menlo.ttc",
-    "/System/Library/Fonts/PingFang.ttc",
-    "Arial Unicode.ttf",
+    "/System/Library/Fonts/PingFang.ttc",                      # CJK first (PRD R4.2)
+    "/System/Library/Fonts/Menlo.ttc",                         # mono fallback
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",    # broad fallback
 )
 
 
@@ -126,9 +135,25 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
     - Empty cells render blank (no crash).
 
     Returns PNG bytes parseable by ``PIL.Image.open(BytesIO(b))``.
+
+    Raises
+    ------
+    ValueError
+        If ``headers`` / ``rows`` exceed :data:`MAX_COLS` / :data:`MAX_ROWS`
+        or the computed image area exceeds :data:`MAX_TABLE_PIXELS`. The
+        caller is expected to catch and fall back to verbatim markdown.
     """
     headers = list(headers) if headers else [""]
     ncols = len(headers)
+
+    if ncols > MAX_COLS:
+        raise ValueError(
+            f"table too wide: {ncols} cols (max {MAX_COLS})"
+        )
+    if rows is not None and len(rows) > MAX_ROWS:
+        raise ValueError(
+            f"table too tall: {len(rows)} rows (max {MAX_ROWS})"
+        )
 
     # Normalise rows: pad/truncate to ``ncols``.
     norm_rows: list[list[str]] = []
@@ -164,6 +189,11 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
     total_w = sum(col_w) if col_w else 0
     W = max(total_w + PAD * 2, PAD * 2 + 8)
     H = PAD * 2 + HEAD_H + sum(row_heights)
+
+    if W * H > MAX_TABLE_PIXELS:
+        raise ValueError(
+            f"table pixel budget exceeded: {W}×{H} > {MAX_TABLE_PIXELS}"
+        )
 
     img = Image.new("RGB", (W, H), BG)
     draw = ImageDraw.Draw(img)
@@ -210,4 +240,10 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
     return buf.getvalue()
 
 
-__all__ = ["render_table_png"]
+__all__ = [
+    "render_table_png",
+    "MAX_CELL_CHARS",
+    "MAX_COLS",
+    "MAX_ROWS",
+    "MAX_TABLE_PIXELS",
+]

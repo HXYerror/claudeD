@@ -34,8 +34,8 @@ def _make_interaction(attachments: list) -> MagicMock:
 @pytest.mark.asyncio
 async def test_copy_returns_ephemeral_text_for_short_table() -> None:
     md_source = "| a | b |\n|---|---|\n| 1 | 2 |"
-    png = _make_attachment("table.png", b"\x89PNG...")
-    md = _make_attachment("table.md", md_source.encode("utf-8"))
+    png = _make_attachment("table_0.png", b"\x89PNG...")
+    md = _make_attachment("table_0.md", md_source.encode("utf-8"))
     inter = _make_interaction([png, md])
 
     view = CopyTableTextView()
@@ -55,8 +55,8 @@ async def test_copy_returns_ephemeral_text_for_short_table() -> None:
 async def test_copy_returns_file_for_long_table() -> None:
     # > 1900 chars triggers the file path
     md_source = "x" * 2000
-    png = _make_attachment("table.png", b"\x89PNG...")
-    md = _make_attachment("table.md", md_source.encode("utf-8"))
+    png = _make_attachment("table_0.png", b"\x89PNG...")
+    md = _make_attachment("table_0.md", md_source.encode("utf-8"))
     inter = _make_interaction([png, md])
 
     view = CopyTableTextView()
@@ -72,7 +72,7 @@ async def test_copy_returns_file_for_long_table() -> None:
 
 @pytest.mark.asyncio
 async def test_copy_handles_missing_attachment_gracefully() -> None:
-    png = _make_attachment("table.png", b"\x89PNG...")
+    png = _make_attachment("table_0.png", b"\x89PNG...")
     inter = _make_interaction([png])  # no .md sidecar
 
     view = CopyTableTextView()
@@ -85,3 +85,33 @@ async def test_copy_handles_missing_attachment_gracefully() -> None:
     sent_content = args[0] if args else kwargs.get("content")
     assert "Couldn't find" in sent_content or "couldn't find" in sent_content.lower()
     assert kwargs.get("ephemeral") is True
+
+
+# ---------------------------------------------------------------------------
+# Review I7: filename prefix-match — only ``table_*.md`` sidecars match.
+# A ``claude-response.md`` (long-upload fallback) on the same message
+# must NOT trigger the Copy button against the wrong file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_copy_ignores_non_table_md_attachments() -> None:
+    """``claude-response.md`` is the long-upload fallback name; it must
+    not satisfy the Copy-as-text view's attachment lookup (review I7)."""
+    long_upload = _make_attachment(
+        "claude-response.md", b"this is the long-upload, not a table sidecar"
+    )
+    inter = _make_interaction([long_upload])
+
+    view = CopyTableTextView()
+    button = MagicMock()
+    await view.copy.callback.callback(view, inter, button)
+
+    inter.response.send_message.assert_awaited_once()
+    args = inter.response.send_message.call_args.args
+    kwargs = inter.response.send_message.call_args.kwargs
+    sent_content = args[0] if args else kwargs.get("content")
+    # Falls through to the "couldn't find" branch — never reads the
+    # claude-response.md by mistake.
+    assert "Couldn't find" in sent_content or "couldn't find" in sent_content.lower()
+    long_upload.read.assert_not_awaited()

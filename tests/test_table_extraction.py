@@ -1,15 +1,21 @@
-"""Tests for ``DiscordRenderer._extract_and_render_tables`` (v1.12 / #132).
+"""Tests for ``DiscordRenderer._extract_and_render_tables`` (v1.12).
 
-Spec: docs/prd/v1.12-table-rendering.md R1 and issue #132.
+Spec: docs/prd/v1.12-table-rendering.md R1.
 
-Six tests covering well-formed extraction, code-fence preservation, malformed
-input, ordering across multiple tables, single-column rejection, and verbatim
-preservation of ``markdown_source`` for the Copy-as-text button (#133).
+Tests cover well-formed extraction, code-fence preservation, malformed
+input, ordering across multiple tables, single-column rejection, verbatim
+preservation of ``markdown_source`` for the Copy-as-text button, header-only
+rejection (R1.4), empty-body cell preservation (R6.4), and current
+"no escape" semantics for ``\\|`` inside cells.
+
+``_extract_and_render_tables`` is async (dispatches PNG render through
+``asyncio.to_thread`` — review I3), so tests run under ``pytest.mark.asyncio``.
 """
 from __future__ import annotations
 
 import io
 
+import pytest
 from PIL import Image
 
 from clauded.discord_renderer import DiscordRenderer, TableRender
@@ -20,7 +26,8 @@ def _is_png(b: bytes) -> bool:
     return img.format == "PNG"
 
 
-def test_simple_table_extracted():
+@pytest.mark.asyncio
+async def test_simple_table_extracted():
     """A plain markdown table → 1 TableRender + text-with-placeholder."""
     text = (
         "Here is a table:\n"
@@ -30,7 +37,7 @@ def test_simple_table_extracted():
         "| Bob | 25 |\n"
         "End."
     )
-    out, renders = DiscordRenderer._extract_and_render_tables(text)
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert len(renders) == 1
     r = renders[0]
     assert isinstance(r, TableRender)
@@ -45,7 +52,8 @@ def test_simple_table_extracted():
     assert "End." in out
 
 
-def test_table_in_code_fence_left_alone():
+@pytest.mark.asyncio
+async def test_table_in_code_fence_left_alone():
     """Tables inside ``` fences are passed through verbatim, no extraction."""
     text = (
         "Output:\n"
@@ -56,13 +64,14 @@ def test_table_in_code_fence_left_alone():
         "```\n"
         "Done."
     )
-    out, renders = DiscordRenderer._extract_and_render_tables(text)
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert renders == []
     # Text comes back unchanged.
     assert out == text
 
 
-def test_malformed_table_not_extracted():
+@pytest.mark.asyncio
+async def test_malformed_table_not_extracted():
     """Header row with no separator row → not a table, verbatim."""
     text = (
         "Heading:\n"
@@ -70,14 +79,15 @@ def test_malformed_table_not_extracted():
         "| Alice | 30 |\n"
         "End."
     )
-    out, renders = DiscordRenderer._extract_and_render_tables(text)
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert renders == []
     # The pipe lines survive untouched.
     assert "| Name | Age |" in out
     assert "| Alice | 30 |" in out
 
 
-def test_multiple_tables_each_rendered():
+@pytest.mark.asyncio
+async def test_multiple_tables_each_rendered():
     """Two well-formed tables separated by prose → 2 TableRenders, in order."""
     text = (
         "First:\n"
@@ -91,7 +101,7 @@ def test_multiple_tables_each_rendered():
         "| 9 | 8 |\n"
         "End."
     )
-    out, renders = DiscordRenderer._extract_and_render_tables(text)
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert len(renders) == 2
     assert renders[0].placeholder == "\n[TABLE_PNG_0]\n"
     assert renders[1].placeholder == "\n[TABLE_PNG_1]\n"
@@ -102,7 +112,8 @@ def test_multiple_tables_each_rendered():
     assert "Middle paragraph." in out
 
 
-def test_single_column_table_not_extracted():
+@pytest.mark.asyncio
+async def test_single_column_table_not_extracted():
     """``| Header |`` style single-column tables are emitted verbatim."""
     text = (
         "Single column:\n"
@@ -111,19 +122,93 @@ def test_single_column_table_not_extracted():
         "| only |\n"
         "End."
     )
-    out, renders = DiscordRenderer._extract_and_render_tables(text)
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert renders == []
     assert "| Header |" in out
     assert "| only |" in out
 
 
-def test_markdown_source_preserved():
+@pytest.mark.asyncio
+async def test_markdown_source_preserved():
     """``TableRender.markdown_source`` equals the original table text verbatim."""
     header = "| Col1 | Col2 |"
     sep = "|------|------|"
     row1 = "| a    | b    |"
     row2 = "| c    | d    |"
     text = "Prelude.\n" + "\n".join([header, sep, row1, row2]) + "\nEpilogue."
-    _, renders = DiscordRenderer._extract_and_render_tables(text)
+    _, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert len(renders) == 1
     assert renders[0].markdown_source == "\n".join([header, sep, row1, row2])
+
+
+# ---------------------------------------------------------------------------
+# Coverage additions (PR #137 round-1 review).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_header_only_table_not_extracted():
+    """PRD R1.4 — a header row + separator row with NO body rows must be
+    emitted verbatim (no TableRender, no placeholder). Pins the extractor
+    against a future refactor that would render an empty-body table.
+    """
+    text = (
+        "Heading:\n"
+        "| Name | Age |\n"
+        "|------|-----|\n"
+        "End of section."
+    )
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert renders == []
+    # All three original lines survive verbatim.
+    assert "| Name | Age |" in out
+    assert "|------|-----|" in out
+    assert "End of section." in out
+
+
+@pytest.mark.asyncio
+async def test_empty_body_cells_preserved():
+    """PRD R6.4 — cells that are empty between pipes (``| | x |``) must be
+    preserved as empty strings in the parsed row data so PNG rendering
+    keeps the column count consistent with the header.
+    """
+    text = (
+        "Mixed:\n"
+        "| A | B | C |\n"
+        "|---|---|---|\n"
+        "|   | x |   |\n"
+        "| y |   | z |\n"
+        "Done."
+    )
+    _, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert len(renders) == 1
+    r = renders[0]
+    assert r.headers == ["A", "B", "C"]
+    # Empty cells survive as empty strings (not dropped, not None).
+    assert r.rows == [["", "x", ""], ["y", "", "z"]]
+
+
+@pytest.mark.asyncio
+async def test_escaped_pipe_in_cell():
+    """Document current "no escape" semantics: ``\\|`` inside a cell is
+    treated like any other ``|`` and splits the cell. Pinning behaviour so
+    a future "support escaped pipes" change is a deliberate decision.
+    """
+    text = (
+        "| Name | Value |\n"
+        "|------|-------|\n"
+        "| a\\|b | c |\n"
+    )
+    _, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert len(renders) == 1
+    r = renders[0]
+    # ``a\|b`` splits at the backslash-pipe → the cell becomes 3 fragments,
+    # producing a 3-column row even though headers have 2 columns. Pin the
+    # observed "no escape" behaviour: PNG renderer's normalisation
+    # (truncate/pad to header count) happens later — at extraction we
+    # simply split on every ``|``.
+    assert r.headers == ["Name", "Value"]
+    assert len(r.rows) == 1
+    # 3 split fragments — confirms the escape was NOT honoured.
+    assert len(r.rows[0]) == 3
+    assert r.rows[0] == ["a\\", "b", "c"]

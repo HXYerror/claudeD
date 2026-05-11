@@ -141,11 +141,18 @@ class ClaudedBot(commands.Bot):
             self._claude_version = "unknown"
         self._cleanup_task.start()
 
-        # v1.12 / #134 / PRD R3.3: register the persistent Copy-as-text
-        # button view. One stateless instance handles every PNG-table
-        # button click in the process — the markdown source lives in the
-        # ``.md`` sidecar attached to the message, not in the view.
-        # Required so the button keeps working after a bot restart.
+        # PRD R3.3 — register the persistent Copy-as-text button view so
+        # the button keeps working after a bot restart.
+        #
+        # Why both registrations:
+        # - This ``add_view(CopyTableTextView())`` at startup registers a
+        #   global handler for ``custom_id="copy_table_text"`` so clicks
+        #   are dispatched even on messages whose original view object is
+        #   long gone (post-restart).
+        # - ``DiscordRenderer._send_table_renders`` also instantiates a
+        #   fresh ``CopyTableTextView()`` on each PNG send, because
+        #   discord.py needs a view object on the initial send to inject
+        #   the button components into the Discord message.
         self.add_view(CopyTableTextView())
 
         # ----- Import command objects from cog modules -----

@@ -687,3 +687,75 @@ async def test_shadow_survives_embed_send_between_text_edits(_no_sleep):
     # Cost-footer-equivalent read MUST see the long content, not "".
     current = r._last_msg_text.rstrip(CURSOR)
     assert current.startswith("hi there, here is a long response")
+
+
+# ---------------------------------------------------------------------------
+# Review I1 — files= retry must seek(0) every stream before re-attempting.
+# Without this, a transient HTTP error mid-send would leave the BytesIO at
+# EOF on retry and Discord would receive a 0-byte attachment.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_safe_send_files_list_resets_streams_on_retry(_no_sleep):
+    """``_safe_send(files=[f1, f2])`` with one retryable 503 → both file
+    streams are rewound to position 0 before the successful attempt, and
+    a read after retry returns the original sentinel bytes."""
+    import io as _io
+    import discord
+
+    f1_bytes = b"alpha\n"
+    f2_bytes = b"png-sentinel-0123456789"
+
+    f1 = discord.File(_io.BytesIO(f1_bytes), filename="table_0.md")
+    f2 = discord.File(_io.BytesIO(f2_bytes), filename="table_0.png")
+
+    # Snapshot tell() positions when send is invoked. The first attempt
+    # will be at (0, 0) — fresh BytesIO. We then advance both streams to
+    # EOF inside the first call (mimicking discord.py reading the buffer)
+    # and raise. The renderer's between_attempts hook MUST seek(0) before
+    # the second attempt — that's the I1 contract.
+    snapshots: list[tuple[int, int]] = []
+
+    target = FakeTarget()
+
+    async def _send_with_snapshot(content=None, **kw):
+        target.send_calls += 1
+        fs = kw.get("files") or ([kw["file"]] if kw.get("file") else [])
+        snapshots.append(tuple(f.fp.tell() for f in fs))  # type: ignore[arg-type]
+        if target.send_raises:
+            exc = target.send_raises.pop(0)
+            if exc is not None:
+                # Simulate discord.py reading the buffer to EOF before
+                # the HTTP failure surfaces.
+                for f in fs:
+                    f.fp.read()
+                raise exc
+        msg = FakeMessage(content or "")
+        target.messages.append(msg)
+        return msg
+
+    target.send = _send_with_snapshot  # type: ignore[method-assign]
+    target.send_raises = [_http(503), None]
+
+    renderer = DiscordRenderer(target)
+    result = await renderer._safe_send(files=[f1, f2])
+
+    assert result is not None
+    assert target.send_calls == 2
+    # First attempt entered at (0, 0) — fresh streams.
+    assert snapshots[0] == (0, 0), f"first attempt positions: {snapshots[0]}"
+    # CRITICAL pin (I1): the second attempt also saw (0, 0) — i.e.
+    # _reset_file rewound both streams that the first attempt drained.
+    # Without the I1 fix, snapshots[1] would equal (len(f1_bytes),
+    # len(f2_bytes)).
+    assert snapshots[1] == (0, 0), (
+        f"second (retry) attempt positions: {snapshots[1]} — "
+        "_reset_file did not rewind both streams"
+    )
+    # Sentinel bytes still readable after retry succeeds.
+    f1.fp.seek(0)
+    f2.fp.seek(0)
+    assert f1.fp.read() == f1_bytes
+    assert f2.fp.read() == f2_bytes
+

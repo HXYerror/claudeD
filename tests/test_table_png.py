@@ -9,7 +9,10 @@ from PIL import Image
 from clauded import table_png
 from clauded.table_png import (
     MAX_CELL_CHARS,
+    MAX_COLS,
+    MAX_ROWS,
     _format_cell,
+    _load_font,
     render_table_png,
 )
 
@@ -37,7 +40,12 @@ def test_simple_table_renders_valid_png():
 
 
 def test_cjk_table_renders_no_crash():
-    """CJK cells render without exception and produce valid PNG."""
+    """CJK cells render without exception and produce valid PNG.
+
+    Also pins review I6: ``_load_font`` selects a real system font (not
+    the bitmap ``ImageFont.load_default`` fallback) on macOS, so CJK
+    glyphs are rendered rather than tofu boxes.
+    """
     headers = ["项目", "状态", "说明"]
     rows = [
         ["你好", "完成", "测试中文"],
@@ -45,6 +53,17 @@ def test_cjk_table_renders_no_crash():
     ]
     out = render_table_png(headers, rows)
     _parse(out)
+
+    # I6 pin: a TrueType font was loaded (PingFang first), not the
+    # bitmap default. ``load_default`` returns an ImageFont (no ``.path``);
+    # truetype fonts expose ``.path`` pointing at the file.
+    font = _load_font(13)
+    assert hasattr(font, "path"), (
+        f"_load_font fell back to bitmap default (font={font!r}); "
+        "FONT_CANDIDATES order may be regressed"
+    )
+    # On macOS the first candidate should resolve.
+    assert "PingFang" in font.path or "Menlo" in font.path or "Arial" in font.path
 
 
 def test_emoji_table_renders_no_crash():
@@ -99,3 +118,37 @@ def test_empty_rows_does_not_crash():
     # No rows at all (header-only — still valid output).
     out = render_table_png(["A", "B"], [])
     _parse(out)
+
+
+# ---------------------------------------------------------------------------
+# Review I4: DoS guards — oversize tables raise ValueError so the caller
+# (DiscordRenderer._extract_and_render_tables) can fall back to verbatim
+# emit via its C2 try/except.
+# ---------------------------------------------------------------------------
+
+
+def test_render_table_png_rejects_oversized_columns():
+    """A table with > MAX_COLS columns raises ``ValueError`` before
+    allocating any image memory."""
+    too_wide_headers = [f"c{i}" for i in range(MAX_COLS + 1)]
+    too_wide_row = ["x"] * (MAX_COLS + 1)
+    with pytest.raises(ValueError, match="too wide"):
+        render_table_png(too_wide_headers, [too_wide_row])
+
+
+def test_render_table_png_rejects_oversized_rows():
+    """A table with > MAX_ROWS body rows raises ``ValueError``."""
+    headers = ["A", "B"]
+    rows = [["x", "y"] for _ in range(MAX_ROWS + 1)]
+    with pytest.raises(ValueError, match="too tall"):
+        render_table_png(headers, rows)
+
+
+def test_render_table_png_rejects_oversized_pixel_budget(monkeypatch):
+    """If the computed image area exceeds the per-table pixel budget,
+    raise ``ValueError`` rather than allocate hundreds of MB."""
+    # Shrink the budget so a normal small table trips it.
+    monkeypatch.setattr(table_png, "MAX_TABLE_PIXELS", 100)
+    with pytest.raises(ValueError, match="pixel budget"):
+        render_table_png(["A", "B"], [["1", "2"]])
+

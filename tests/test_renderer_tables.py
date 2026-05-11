@@ -1,26 +1,25 @@
-"""Integration tests for v1.12 table PNG rendering (#134 / PRD R2 + R3.3).
+"""Integration tests for v1.12 table PNG rendering (PRD R2 + R3.3).
 
-These tests pin the wiring between the renderer pipeline and the new
-table-extraction path:
+These tests pin the wiring between the renderer pipeline and the table-
+extraction path:
 
-1. ``_flush`` with a buffer containing prose + a markdown table sends the
-   prose text first, then a follow-up message bearing a PNG attachment +
-   the ``.md`` sidecar + a :class:`CopyTableTextView` instance.
+1. ``_flush`` with a buffer containing prose-before + a table + prose-after
+   sends three messages in order: text-before, PNG follow-up, text-after.
+   This is the PRD R2.2 interleaving contract (review C1).
 2. ``_flush`` with a buffer that has no tables sends a single text
    message and never invokes the PNG follow-up path.
 3. A markdown table nested inside a ``` code fence is NOT extracted —
    it's left intact in the text body, and no PNG message is emitted.
-4. ``ClaudedBot.setup_hook`` registers the persistent
-   :class:`CopyTableTextView` via ``self.add_view`` so that button
-   clicks keep working across bot restarts (PRD R3.3).
+4. ``CopyTableTextView`` is a persistent view with the right custom_id
+   (review simplicity: lightweight replacement for the prior heavy
+   ``setup_hook`` integration test).
 """
 
 from __future__ import annotations
 
 import io
-from unittest.mock import AsyncMock, MagicMock, patch
+import logging
 
-import discord
 import pytest
 from PIL import Image
 
@@ -97,13 +96,19 @@ def _png_bytes_signature_ok(b: bytes) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 1. Buffer with a table → text-then-PNG follow-up
+# 1. Buffer with a table → interleaved text-before, PNG, text-after
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_buffer_with_table_sends_text_then_png_followup():
-    """Buffer = prose + table → 2 sends: text first, then PNG + view + .md."""
+    """Buffer = prose-before + table + prose-after → 3 sends in PRD R2.2 order.
+
+    Pre-fix the call sequence was [text-with-placeholder, PNG] and the
+    user saw ``[TABLE_PNG_0]`` literally in the text body (review C1).
+    Post-fix it's [text-before, PNG, text-after] with no placeholder text
+    in any user-visible content.
+    """
     target = FakeTarget()
     renderer = DiscordRenderer(target)
 
@@ -124,22 +129,20 @@ async def test_buffer_with_table_sends_text_then_png_followup():
         tool_msgs={},
     )
 
-    # Exactly two messages: text body, then PNG follow-up.
-    assert len(target.calls) == 2
+    # PRD R2.2 — three messages: text-before, PNG, text-after.
+    assert len(target.calls) == 3
+    pre_text_call, png_call, post_text_call = target.calls
 
-    text_call, png_call = target.calls
-
-    # ----- Text message -----
-    text_content = text_call.get("content") or ""
-    assert "Here is a comparison" in text_content
-    assert "Pick whichever fits." in text_content
-    # The raw markdown table is NOT present in the text body — it was
-    # extracted out (a placeholder may remain).
-    assert "| Alpha | 10 |" not in text_content
-    assert "| Beta | 7 |" not in text_content
-    # The text call carries no PNG attachments.
-    assert "files" not in text_call or text_call.get("files") is None
-    assert "view" not in text_call or text_call.get("view") is None
+    # ----- Pre-table text -----
+    pre_content = pre_text_call.get("content") or ""
+    assert "Here is a comparison" in pre_content
+    # No placeholder leak (review C1 assertion).
+    assert "[TABLE_PNG_" not in pre_content, "placeholder leaked to Discord"
+    # No raw table rows in the prose body.
+    assert "| Alpha | 10 |" not in pre_content
+    assert "| Beta | 7 |" not in pre_content
+    assert pre_text_call.get("files") is None
+    assert pre_text_call.get("view") is None
 
     # ----- PNG follow-up -----
     files = png_call.get("files")
@@ -159,10 +162,19 @@ async def test_buffer_with_table_sends_text_then_png_followup():
     # Persistent view attached.
     view = png_call.get("view")
     assert isinstance(view, CopyTableTextView)
-    # _last_msg points at the PNG follow-up; shadow reset to "" so the
-    # cost-footer splicer can't reach into the attachment-only message.
+
+    # ----- Post-table text -----
+    post_content = post_text_call.get("content") or ""
+    assert "Pick whichever fits." in post_content
+    assert "[TABLE_PNG_" not in post_content, "placeholder leaked to Discord"
+    assert post_text_call.get("files") is None
+    assert post_text_call.get("view") is None
+
+    # ``_last_msg`` ends pointing at the final text send (the prose tail).
     assert renderer._last_msg is target.messages[-1]
-    assert renderer._last_msg_text == ""
+    # Shadow tracks the final text content so the cost-footer splicer can
+    # safely append onto the prose tail.
+    assert renderer._last_msg_text == post_content
 
 
 # ---------------------------------------------------------------------------
@@ -232,59 +244,210 @@ async def test_table_in_code_fence_not_replaced():
     assert "| id | label |" in text
     assert "| 1  | one   |" in text
     assert "End of example." in text
+    assert "[TABLE_PNG_" not in text, "placeholder leaked to Discord"
     # And no follow-up attachment / view was sent.
     assert only.get("files") is None
     assert only.get("view") is None
 
 
 # ---------------------------------------------------------------------------
-# 4. setup_hook registers the persistent CopyTableTextView
+# 4. CopyTableTextView has persistent custom_id
+# ---------------------------------------------------------------------------
+
+
+def test_copy_view_has_persistent_custom_id():
+    """Lightweight pin for PRD R3.3: the Copy-as-text view is persistent
+    (``timeout=None``) and its button uses the stable ``custom_id`` that
+    ``bot.setup_hook``'s ``add_view`` global handler dispatches against.
+
+    Replaces the heavier ``test_persistent_view_registered_at_startup``
+    which had to drive a half-initialised ``ClaudedBot`` instance.
+    """
+    view = CopyTableTextView()
+    assert view.timeout is None  # persistent across restarts
+    custom_ids = [getattr(c, "custom_id", None) for c in view.children]
+    assert "copy_table_text" in custom_ids
+
+
+# ---------------------------------------------------------------------------
+# 5. Long-upload .md path re-splices markdown source (review C3)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_persistent_view_registered_at_startup():
-    """``ClaudedBot.setup_hook`` must call ``add_view(CopyTableTextView())``.
-
-    Required by PRD R3.3 so the Copy-as-text button keeps responding to
-    clicks after a bot restart (custom_id=``copy_table_text`` persistent).
+async def test_long_upload_md_contains_table_source_not_placeholder(monkeypatch):
+    """When ``_flush`` falls back to ``claude-response.md`` upload, the
+    file body must contain the original markdown table — NOT a leaked
+    ``[TABLE_PNG_N]`` placeholder (review C3).
     """
-    from clauded.bot import ClaudedBot
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
 
-    # Build a bot instance without going through ``commands.Bot.__init__``
-    # (it wants a running event loop + token). We only need the
-    # ``setup_hook`` method bound to a real instance so the
-    # ``self.add_view(...)`` call exercised below dispatches correctly.
-    bot = ClaudedBot.__new__(ClaudedBot)
-
-    add_view_calls: list = []
-    bot.add_view = MagicMock(side_effect=lambda v, **kw: add_view_calls.append(v))
-    bot._cleanup_task = MagicMock()
-    bot._cleanup_task.start = MagicMock()
-    # NB: ``ClaudedBot.tree`` is a property inherited from ``commands.Bot``
-    # — we can't replace it on a ``__new__``-built instance, but that's
-    # fine: the ``add_view`` call we care about runs BEFORE the
-    # ``self.tree.add_command(...)`` block, so any failure further down
-    # is caught by the ``try/except`` below without falsifying the assert.
-
-    # Side-step the ``claude --version`` subprocess.
-    with patch("asyncio.create_subprocess_exec", new=AsyncMock(side_effect=Exception("no claude"))):
-        try:
-            await ClaudedBot.setup_hook(bot)
-        except Exception:
-            # The later slash-command registration / tree.sync block
-            # fails on a half-initialised bot; the ``add_view`` invariant
-            # is verified BEFORE that block, which is the only thing we
-            # care about pinning here.
-            pass
-
-    # Exactly one ``add_view`` call, with a CopyTableTextView instance.
-    assert len(add_view_calls) == 1, (
-        f"expected 1 add_view call, got {len(add_view_calls)}"
+    # Force the >4-chunk long-upload branch.
+    monkeypatch.setattr(
+        DiscordRenderer,
+        "_smart_split",
+        staticmethod(lambda *a, **kw: ["c1", "c2", "c3", "c4", "c5"]),
     )
-    assert isinstance(add_view_calls[0], CopyTableTextView)
-    # The view's button uses the persistent custom_id required by R3.3.
-    custom_ids = [
-        getattr(c, "custom_id", None) for c in add_view_calls[0].children
-    ]
-    assert "copy_table_text" in custom_ids
+
+    buffer = (
+        "Intro.\n"
+        "| A | B |\n"
+        "|---|---|\n"
+        "| 1 | 2 |\n"
+        "Outro."
+    )
+
+    await renderer._flush(
+        live_msg=None,
+        buffer=buffer,
+        typewriter=False,
+        saw_text=True,
+        tool_msgs={},
+    )
+
+    # First send is the upload (content + file), follow-up is the PNG.
+    upload_call = next(c for c in target.calls if c.get("file") is not None)
+    f = upload_call["file"]
+    f.fp.seek(0)
+    body = f.fp.read().decode()
+    # The .md must NOT carry placeholders.
+    assert "[TABLE_PNG_" not in body, "placeholder leaked into .md upload"
+    # And the original table markdown is back in the file body.
+    assert "| A | B |" in body
+    assert "| 1 | 2 |" in body
+    # PNG follow-up still went out.
+    assert any(c.get("files") for c in target.calls)
+
+
+# ---------------------------------------------------------------------------
+# 6. Render exception falls back to verbatim emit (review C2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_render_exception_emits_table_verbatim(monkeypatch):
+    """If ``render_table_png`` raises, the original table lines must come
+    back in the text body (no exception propagates, no silent drop).
+    """
+    from clauded import discord_renderer as dr_mod
+
+    def _boom(_headers, _rows):
+        raise RuntimeError("simulated Pillow failure")
+
+    monkeypatch.setattr(dr_mod, "render_table_png", _boom)
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    buffer = (
+        "Before.\n"
+        "| A | B |\n"
+        "|---|---|\n"
+        "| 1 | 2 |\n"
+        "After."
+    )
+
+    await renderer._flush(
+        live_msg=None,
+        buffer=buffer,
+        typewriter=False,
+        saw_text=True,
+        tool_msgs={},
+    )
+
+    # Exactly one text message — no PNG follow-up was sent.
+    assert all(c.get("files") is None for c in target.calls)
+    # The table source survives verbatim in the user-visible text.
+    text = " ".join((c.get("content") or "") for c in target.calls)
+    assert "Before." in text
+    assert "After." in text
+    assert "| A | B |" in text
+    assert "| 1 | 2 |" in text
+    assert "[TABLE_PNG_" not in text, "placeholder leaked on render failure"
+
+
+# ---------------------------------------------------------------------------
+# 7. _send_table_renders logs on permanent drop (review I2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_table_renders_logs_on_permanent_drop(_no_sleep, caplog):
+    """If ``_safe_send`` returns ``None`` (permanent failure), the loop
+    must log ``ERROR`` so the silent drop becomes visible (review I2).
+    """
+    from clauded.discord_renderer import TableRender
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Stub _safe_send to permanently fail (returns None).
+    async def _always_none(*_a, **_kw):
+        return None
+    renderer._safe_send = _always_none  # type: ignore[assignment]
+
+    fake_render = TableRender(
+        headers=["A", "B"],
+        rows=[["1", "2"]],
+        png_bytes=b"\x89PNGfake",
+        markdown_source="| A | B |\n|---|---|\n| 1 | 2 |",
+        placeholder="\n[TABLE_PNG_0]\n",
+    )
+
+    with caplog.at_level(logging.ERROR, logger="clauded.discord_renderer"):
+        await renderer._send_table_renders([fake_render])
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    msg = errors[0].getMessage()
+    assert "Table 0" in msg
+    assert "PNG send permanently failed" in msg
+
+
+# ---------------------------------------------------------------------------
+# 8. Cost-footer × PNG message contract (review I8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cost_footer_attaches_to_png_message():
+    """Contract pin (manager pick (a)): the cost footer rides the PNG
+    message — after ``_flush`` finishes for a buffer that ends in a table,
+    ``renderer._last_msg`` is the PNG message and a subsequent
+    ``_safe_edit`` of ``_last_msg`` with the footer content overwrites
+    that PNG message's content (attachments survive, per discord.py).
+    """
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+
+    # Buffer ENDS with a table — no prose tail follows.
+    buffer = (
+        "Compare:\n"
+        "| A | B |\n"
+        "|---|---|\n"
+        "| 1 | 2 |\n"
+    )
+    await renderer._flush(
+        live_msg=None,
+        buffer=buffer,
+        typewriter=False,
+        saw_text=True,
+        tool_msgs={},
+    )
+
+    # Last call must be the PNG send (files= present).
+    last_call = target.calls[-1]
+    assert last_call.get("files") is not None, "PNG must be last send"
+    assert renderer._last_msg is target.messages[-1]
+    # Shadow reset to "" — see _send_table_renders docstring + #113.
+    assert renderer._last_msg_text == ""
+
+    # Simulate the cost-footer write path: edit the current _last_msg
+    # (a PNG) with the footer string. ``Message.edit(content=…)`` does
+    # NOT strip attachments — the test pins that the renderer's shadow
+    # tracks the new content for any subsequent splice.
+    footer = "-# 💰 $0.10 │ ⏱️ 5.0s"
+    ok = await renderer._safe_edit(renderer._last_msg, content=footer)
+    assert ok is True
+    assert renderer._last_msg.content == footer
