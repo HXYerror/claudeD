@@ -2,6 +2,10 @@
 
 # Environment
 .env
+*.env
+.testbot.env.txt
+testbot.env
+testbot.env.txt
 
 # Python
 __pycache__/
