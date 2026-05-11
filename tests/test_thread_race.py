@@ -291,3 +291,81 @@ async def test_thread_race_160004_reuses_existing_thread(
     # 4) ``create_thread`` was called exactly once (the failing attempt);
     #    we did NOT loop or retry.
     assert msg._create_thread_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Test: 160004 → existing thread already has an ACTIVE session → skip render.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_thread_race_160004_with_active_session_skips_render(
+    bot: ClaudedBot,
+    captured_sessions: list[dict[str, Any]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Duplicate MESSAGE_CREATE arrives at OUR PROCESS twice.
+
+    The race winner has already created the thread *and* started a
+    bridge session for it. The losing dispatch hits 160004, refetches
+    the message, sees ``message.thread`` populated — and must observe
+    that a session is *already active* on that thread, then return
+    WITHOUT calling ``_render_with_retry``. Otherwise we double-render
+    the same user turn and double the API cost (issue #140).
+    """
+    existing_thread = FakeThread(thread_id=99999, name="race-winner-thread")
+    channel = FakeChannel(channel_id=9001)
+    msg = FakeRaceMessage(
+        channel=channel,
+        content="<@42> hello",
+        bot_user_id=42,
+        existing_thread=existing_thread,
+    )
+
+    # Pre-seed the session manager with an ACTIVE bridge for the
+    # already-existing thread — this is what the race winner left behind.
+    active_bridge = MagicMock()
+    active_bridge.is_active = True
+    bot.session_manager._sessions[existing_thread.id] = active_bridge
+
+    refetched = MagicMock()
+    refetched.id = msg.id
+    refetched.thread = existing_thread
+    refetched.content = msg.content
+    refetched.attachments = []
+    refetched.author = msg.author
+    refetched.add_reaction = AsyncMock(return_value=None)
+    refetched.remove_reaction = AsyncMock(return_value=None)
+    channel.fetch_message.return_value = refetched
+
+    import logging
+
+    caplog.set_level(logging.INFO, logger="clauded.bot")
+    await bot._handle_channel_message(msg)
+
+    # ----- Duplicate-suppression assertions -----
+    # 1) Refetch happened once with the original message id (we still
+    #    need the refetch to *discover* the existing-thread state).
+    channel.fetch_message.assert_awaited_once_with(msg.id)
+
+    # 2) No NEW session was created — ``create_session`` must NOT have
+    #    been invoked by this dispatch (the race winner already did it).
+    assert not captured_sessions, (
+        f"Expected no create_session for duplicate dispatch, got: {captured_sessions!r}"
+    )
+
+    # 3) The active bridge we pre-seeded is still the registered one —
+    #    we did not stomp on it.
+    assert bot.session_manager._sessions[existing_thread.id] is active_bridge
+
+    # 4) No error message surfaced into the channel.
+    assert not any(
+        "Failed to create a thread" in (s.get("content") or "")
+        for s in channel.sent
+    ), f"Unexpected error surfaced into channel: {channel.sent!r}"
+
+    # 5) Suppression was logged.
+    assert any(
+        "ignoring duplicate MESSAGE_CREATE" in rec.getMessage()
+        for rec in caplog.records
+    ), f"Expected duplicate-suppression log entry, got: {[r.getMessage() for r in caplog.records]!r}"
