@@ -65,11 +65,65 @@ log = logging.getLogger("clauded.discord_renderer")
 # crashing the renderer. ``PILLOW_AVAILABLE`` is consulted at the top of
 # :meth:`DiscordRenderer._extract_and_render_tables` for a fast-fail.
 try:
-    from .table_png import render_table_png, MAX_COLS, MAX_ROWS, MAX_TABLE_PIXELS
+    from .table_png import render_table_png
     PILLOW_AVAILABLE = True
 except ImportError:
     PILLOW_AVAILABLE = False
     log.warning("Pillow not installed; tables fall back to code-fence rendering")
+
+
+# ---------------------------------------------------------------------------
+# CommonMark §4.5 fenced code-block state machine (v1.16 #142 §A2).
+# ---------------------------------------------------------------------------
+
+
+def _advance_fence_state(line: str, fence_count: int) -> int:
+    """Return the new fence depth after consuming ``line``.
+
+    Implements the CommonMark §4.5 fence rule: a fence opens with a run of
+    N≥3 backticks at the start of an otherwise unindented line; it only
+    closes on a line whose leading backtick run is ≥N. Inner runs shorter
+    than the opener do NOT close the fence (this is the v1.12 bug-D
+    regression case — an inner ```` ``` ```` inside a ```` ```` ```` outer
+    fence must be preserved verbatim).
+
+    Args:
+        line: the input line (not yet stripped — leading whitespace ignored).
+        fence_count: ``0`` if we are not currently inside a fence, otherwise
+            the opener's backtick run length (so a ≥N closer is recognised).
+
+    Returns:
+        The new fence_count. ``0`` means we are not in a fence after this
+        line; any positive value means we are. The caller decides how to
+        emit ``line`` (typically: if either the new or old count is >0,
+        the line is "fence-owned" — emit verbatim and skip parsing).
+
+    The helper is intentionally pure / module-level so both the legacy
+    :meth:`DiscordRenderer._format_tables` path (no-Pillow fallback) and
+    the production :meth:`DiscordRenderer._extract_and_render_tables`
+    path share one state machine. Before the v1.16 extraction these
+    paths used *different* trackers (legacy used a bool toggle that was
+    wrong for quad-backtick fences); routing both through this helper
+    closes that latent gap now that the fallback is reachable via the
+    Pillow-missing branch (#135 / PRD R6).
+    """
+    stripped = line.lstrip()
+    if not stripped.startswith("`"):
+        return fence_count
+    j = 0
+    while j < len(stripped) and stripped[j] == "`":
+        j += 1
+    ticks = j
+    if ticks < 3:
+        return fence_count
+    if fence_count == 0:
+        # Opens a fence whose closer must be ≥``ticks`` backticks.
+        return ticks
+    # Already inside a fence — only a ≥fence_count run closes it.
+    if ticks >= fence_count:
+        return 0
+    # Inner shorter run — fence remains open (CommonMark §4.5).
+    return fence_count
 
 
 # ---------------------------------------------------------------------------
@@ -1150,22 +1204,33 @@ class DiscordRenderer:
         # placeholders. The first text segment (before the first table)
         # replaces the cursor in ``live_msg``; subsequent segments and PNG
         # follow-ups are sent fresh. If the first segment is empty (table
-        # at the very start of the buffer), edit the cursor away with the
-        # empty string so the cursor is gone before the PNG arrives.
+        # at the very start of the buffer), clear the cursor to a U+200B
+        # placeholder via ``_clear_cursor_msg`` so the cursor is visibly
+        # gone before the PNG arrives (Discord rejects ``content=""`` with
+        # HTTP 50006; #142 §A3).
         first_seg, _, rest_text = stripped_text.partition(table_renders[0].placeholder)
         if first_seg.strip():
             first_chunks = self._smart_split(first_seg, limit=DISCORD_MAX_LEN) or [first_seg[:DISCORD_MAX_LEN]]
+            first = await self._typewriter_apply(live_msg, first_chunks[0])
+            if first is not None:
+                self._last_msg = first
+                self._last_msg_text = first_chunks[0]
+            for chunk in first_chunks[1:]:
+                sent = await self._safe_send(content=chunk)
+                if sent is not None:
+                    self._last_msg = sent
+                    self._last_msg_text = chunk
         else:
-            first_chunks = [""]
-        first = await self._typewriter_apply(live_msg, first_chunks[0])
-        if first is not None:
-            self._last_msg = first
-            self._last_msg_text = first_chunks[0]
-        for chunk in first_chunks[1:]:
-            sent = await self._safe_send(content=chunk)
-            if sent is not None:
-                self._last_msg = sent
-                self._last_msg_text = chunk
+            # Empty first segment — keep the existing cursor msg identity
+            # but replace its content with ZWS. If the edit fails the
+            # cursor stays with its previous (raw-markdown) content; we
+            # accept that degraded outcome rather than send a fresh empty
+            # message (which would itself fail with 50006).
+            if live_msg is not None:
+                ok = await self._clear_cursor_msg(live_msg)
+                if ok:
+                    self._last_msg = live_msg
+                    self._last_msg_text = "\u200b"
 
         # First PNG, then the rest of the interleave (text-then-PNG pairs +
         # final tail). ``_send_text_and_tables`` handles the residual.
@@ -1558,24 +1623,18 @@ class DiscordRenderer:
         on a stale message fails permanently — otherwise the live cursor
         message is forever stuck at its previous content while the buffer
         keeps growing in memory.
+
+        v1.16 (#142 §A3) — pure transport. The empty-content → U+200B
+        substitution previously inlined here was a single-caller concern
+        (cursor-clear from ``_finalize_typewriter``); callers that need
+        to "clear" a message with Discord-acceptable content must call
+        :meth:`_clear_cursor_msg` instead. Passing ``content=""`` or
+        whitespace-only content to this method will now hit Discord
+        50006 ("Cannot send an empty message") as the underlying API
+        always intended.
         """
         kwargs: dict = {}
         if content is not None:
-            # v1.12 bug D-2 — Discord rejects both ``content=""`` AND
-            # ``content=" "`` (single space) with HTTP 400 code 50006
-            # "Cannot send an empty message" — whitespace-only content
-            # is treated as empty by Discord's validator. This bites
-            # the streaming-cursor cleanup path in
-            # ``_finalize_typewriter`` where the buffer is entirely a
-            # table placeholder and the pre-table segment is empty.
-            # Substitute U+200B (zero-width space): Discord accepts it
-            # as non-empty content and it renders invisibly so the
-            # user sees the live_msg as "cleared" rather than
-            # retaining the leaked raw markdown table text alongside
-            # the PNG follow-up (Bug C symptom in the v1.12 smoke run).
-            if not content.strip():
-                log.debug("_safe_edit: empty content; substituting U+200B to clear cursor msg without Discord 50006")
-                content = "\u200b"
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed
@@ -1608,6 +1667,27 @@ class DiscordRenderer:
             self._last_msg_text = content
         return result is not None
 
+    async def _clear_cursor_msg(self, msg: discord.Message) -> bool:
+        """Edit ``msg`` to U+200B so it renders as invisible whitespace.
+
+        Used when the cursor message is now logically empty — typically
+        the v1.12 streaming-cursor cleanup path in ``_finalize_typewriter``
+        where the entire buffer was a table placeholder and the
+        pre-table segment is empty. Discord rejects ``content=""`` and
+        any all-whitespace string with HTTP 400 code 50006
+        ("Cannot send an empty message"); U+200B (zero-width space) is
+        accepted as non-empty content and renders invisibly so the
+        user sees the cursor as cleared rather than retaining the raw
+        markdown text alongside the PNG follow-up (Bug C symptom in
+        the v1.12 smoke run).
+
+        v1.16 (#142 §A3) — extracted from ``_safe_edit`` so that
+        method stays pure transport. ``_safe_edit`` no longer performs
+        the empty → ZWS substitution; callers that need cursor-clear
+        semantics must call this helper explicitly.
+        """
+        return await self._safe_edit(msg, content="\u200b")
+
     # ------------------------------------------------------------------
     # Markdown table → code block conversion (legacy) / PNG extraction
     # ------------------------------------------------------------------
@@ -1629,25 +1709,30 @@ class DiscordRenderer:
         lines_in = text.split("\n")
         result: list[str] = []
         in_table = False
-        in_code_fence = False
+        # v1.16 (#142 §A2) — share the CommonMark §4.5 fence tracker with
+        # the production extractor. The pre-refactor bool toggle here was
+        # latent-wrong for quad-backtick outer fences (an inner triple
+        # toggled it off prematurely) — never reached in practice because
+        # this method was the legacy-only path, but the Pillow-missing
+        # fallback (#135 / PRD R6) now routes real traffic through it.
+        fence_count = 0
         table_lines: list[str] = []
 
         for line in lines_in:
             stripped = line.strip()
 
-            # Track existing code fences
-            if stripped.startswith("```"):
-                in_code_fence = not in_code_fence
-                if in_table and table_lines:
+            prev_fence = fence_count
+            fence_count = _advance_fence_state(line, fence_count)
+            if fence_count > 0 or prev_fence > 0:
+                # Either we just opened a fence, are inside one, or just
+                # closed one — emit verbatim and never table-parse the line.
+                # On a fence-open line we also flush any pending table.
+                if prev_fence == 0 and fence_count > 0 and in_table and table_lines:
                     result.append("```")
                     result.extend(table_lines)
                     result.append("```")
                     in_table = False
                     table_lines = []
-                result.append(line)
-                continue
-
-            if in_code_fence:
                 result.append(line)
                 continue
 
@@ -1746,19 +1831,14 @@ class DiscordRenderer:
         # the inner ``\u0060\u0060\u0060`` line was treated as a fence
         # toggle and the markdown table inside leaked back out to PNG
         # extraction, violating PRD R5 (code fences preserved verbatim).
+        # v1.16 (#142 §A2) — the state-machine is now the module-level
+        # ``_advance_fence_state`` helper, shared with ``_format_tables``.
         fence_count = 0  # 0 ⇒ not in a fence; otherwise the opener's backtick run
         i = 0
         n = len(lines_in)
 
         def _is_table_line(s: str) -> bool:
             return s.startswith("|") and s.endswith("|")
-
-        def _leading_backtick_run(s: str) -> int:
-            """Return the count of leading backticks on ``s`` (already stripped)."""
-            j = 0
-            while j < len(s) and s[j] == "`":
-                j += 1
-            return j
 
         def _is_separator_line(s: str) -> bool:
             # e.g. ``|---|---|`` or ``| :--- | ---: |`` — only ``|``, ``-``,
@@ -1781,23 +1861,15 @@ class DiscordRenderer:
             line = lines_in[i]
             stripped = line.strip()
 
-            # Track code fences first — anything inside is opaque.
-            # CommonMark §4.5: a fence opens with N≥3 consecutive backticks
-            # at line start; it only closes on a line whose backtick run
-            # length is ≥N (so a ``\u0060\u0060\u0060\u0060`` outer fence
-            # is NOT closed by an inner ``\u0060\u0060\u0060``). v1.12
-            # bug D — see comment block above.
-            ticks = _leading_backtick_run(stripped)
-            if fence_count == 0:
-                if ticks >= 3:
-                    fence_count = ticks
-                    result.append(line)
-                    i += 1
-                    continue
-            else:
-                # Currently inside a fence — only a ≥fence_count run closes it.
-                if ticks >= fence_count:
-                    fence_count = 0
+            # Track code fences first — anything inside (or on the fence
+            # boundary line itself) is opaque to table extraction. The
+            # state machine lives in ``_advance_fence_state``; here we
+            # only decide whether the current line is fence-owned.
+            prev_fence = fence_count
+            fence_count = _advance_fence_state(line, fence_count)
+            if fence_count > 0 or prev_fence > 0:
+                # Either we are inside a fence, just opened one, or just
+                # closed one (the closer line itself belongs to the fence).
                 result.append(line)
                 i += 1
                 continue
