@@ -47,6 +47,39 @@ log = logging.getLogger("clauded.bot")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
+# --------------------------------------------------------------------------
+# macOS LaunchAgent paths/labels (v1.15).
+#
+# Mirror of the string literals used by scripts/install-launchagent.sh,
+# scripts/health-check.sh, scripts/com.hxy.clauded.plist.template and
+# README §Status & logs. Bash scripts keep their own literals (cross-language
+# sourcing is overkill for v1.15); when changing any of these, grep the
+# repo for the matching string in those files.
+# --------------------------------------------------------------------------
+_LAUNCHD_LABEL = "com.hxy.clauded"
+_LOG_DIR = Path.home() / "Library" / "Logs" / "clauded"
+_CACHE_DIR = Path.home() / "Library" / "Caches" / "clauded"
+_HEARTBEAT_PATH = _CACHE_DIR / "heartbeat"
+
+
+def _touch_heartbeat() -> None:
+    """Refresh ``_HEARTBEAT_PATH`` mtime so the external healthcheck sees us alive.
+
+    Called once from ``main()`` at process start (so login failures don't strand
+    the healthcheck with a stale file) and again every 30 s from
+    :meth:`ClaudedBot._heartbeat_task` (so a wedged event loop is detected too).
+    macOS-only by design — Linux/Windows dev boxes are no-ops to avoid littering
+    ``~/Library/`` outside Darwin. ``OSError`` is swallowed so a read-only home
+    or unusual test sandbox never crashes startup.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        _HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _HEARTBEAT_PATH.touch()
+    except OSError:
+        pass
+
 
 def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
     """Best-effort cleanup of an attachment temp directory.
@@ -236,14 +269,15 @@ class ClaudedBot(commands.Bot):
 
     @tasks.loop(seconds=30)
     async def _heartbeat_task(self) -> None:
-        """Write a heartbeat file every 30s for the external health checker."""
-        heartbeat_path = Path.home() / "Library" / "Caches" / "clauded" / "heartbeat"
-        heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-        heartbeat_path.touch()
+        """Write a heartbeat file every 30s for the external health checker.
 
-    @_heartbeat_task.before_loop
-    async def _before_heartbeat(self) -> None:
-        await self.wait_until_ready()
+        Proves the asyncio event loop is healthy (a wedged loop wouldn't tick).
+        ``main()`` separately calls :func:`_touch_heartbeat` once at process
+        start so the healthcheck has a fresh file even before Discord login
+        completes (otherwise a bad token → ``wait_until_ready`` hangs → stale
+        heartbeat → kickstart loop bounded only by ``ThrottleInterval``).
+        """
+        _touch_heartbeat()
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -863,23 +897,27 @@ def _configure_logging() -> None:
     """Set up app logging — RotatingFileHandler in production, stderr-only in tests.
 
     Detects pytest via ``PYTEST_CURRENT_TEST`` so test runs don't pollute
-    ``~/Library/Logs/clauded/``. In production, attaches a 10 MB × 7 rotating
-    file handler plus a stderr handler so launchd's ``StandardErrorPath`` still
-    captures boot diagnostics. Falls back to ``basicConfig`` on ``OSError`` (e.g.
-    Linux dev box with no ``~/Library/``).
+    ``~/Library/Logs/clauded/``. In production on macOS, attaches a 10 MB × 7
+    rotating file handler plus a stderr handler so launchd's
+    ``StandardErrorPath`` still captures boot diagnostics. On non-Darwin
+    (Linux/Windows dev boxes) and on ``OSError`` (e.g. read-only ``$HOME``)
+    falls back to ``basicConfig`` to stderr — same path as pytest — to avoid
+    silently creating macOS-shaped junk directories outside macOS.
     """
     fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
     if os.environ.get("PYTEST_CURRENT_TEST"):
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
-    log_dir = Path.home() / "Library" / "Logs" / "clauded"
+    if sys.platform != "darwin":
+        logging.basicConfig(level=logging.INFO, format=fmt)
+        return
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
+        _LOG_DIR.mkdir(parents=True, exist_ok=True)
     except OSError:
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
     handler = RotatingFileHandler(
-        log_dir / "clauded.log",
+        _LOG_DIR / "clauded.log",
         maxBytes=10 * 1024 * 1024,
         backupCount=7,
         encoding="utf-8",
@@ -896,6 +934,13 @@ def _configure_logging() -> None:
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
     _configure_logging()
+    # Claim "process alive" for the external healthcheck BEFORE bot.run() — a
+    # bad token / network outage makes discord.py block in login forever, which
+    # would otherwise leave the heartbeat file un-created and trigger an
+    # infinite quiet kickstart loop (helper agent → launchctl kickstart -k →
+    # rerun → relogin hang → repeat). The in-loop _heartbeat_task takes over
+    # once setup_hook fires and refreshes mtime every 30 s thereafter.
+    _touch_heartbeat()
 
     # Resolve and log the operator's Claude CLI so it's visible at boot time.
     from .cli_paths import resolve_claude_cli
