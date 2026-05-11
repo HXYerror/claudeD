@@ -30,6 +30,7 @@ from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
 from .cogs._unbound import UNBOUND_HINT_MESSAGE
+from .cogs._table_view import CopyTableTextView
 
 # Re-export SystemPromptModal so existing ``from clauded.bot import
 # SystemPromptModal`` continues to work (tests rely on this).
@@ -139,6 +140,13 @@ class ClaudedBot(commands.Bot):
         except Exception:
             self._claude_version = "unknown"
         self._cleanup_task.start()
+
+        # v1.12 / #134 / PRD R3.3: register the persistent Copy-as-text
+        # button view. One stateless instance handles every PNG-table
+        # button click in the process — the markdown source lives in the
+        # ``.md`` sidecar attached to the message, not in the view.
+        # Required so the button keeps working after a bot restart.
+        self.add_view(CopyTableTextView())
 
         # ----- Import command objects from cog modules -----
         from .cogs.project import project_group, env_group

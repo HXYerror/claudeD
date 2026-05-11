@@ -50,6 +50,7 @@ from .claude_bridge import (
 from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
 from .table_png import render_table_png
+from .cogs._table_view import CopyTableTextView
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
@@ -965,6 +966,42 @@ class DiscordRenderer:
         new_live = await self._safe_send(content=tail + CURSOR) if tail else None
         return new_live, tail
 
+    async def _send_table_renders(
+        self, renders: list[TableRender]
+    ) -> None:
+        """Send each :class:`TableRender` as a follow-up PNG message.
+
+        Each render becomes one Discord message carrying two attachments
+        (``table_N.png`` and ``table_N.md`` sidecar with the verbatim
+        markdown source) plus a :class:`CopyTableTextView`. The view is
+        persistent (``custom_id="copy_table_text"``) — see
+        :mod:`clauded.cogs._table_view` and PRD R3.3.
+
+        After each successful send we point ``_last_msg`` at the new
+        message but reset ``_last_msg_text`` to ``""``: a PNG follow-up
+        has no text body for the cost-footer splicer to safely operate
+        on (see #113 — splicing text into an attachment-only message
+        would silently delete the table). The next text send naturally
+        re-populates the shadow.
+        """
+        for i, render in enumerate(renders):
+            png_file = discord.File(
+                io.BytesIO(render.png_bytes),
+                filename=f"table_{i}.png",
+            )
+            md_file = discord.File(
+                io.BytesIO(render.markdown_source.encode()),
+                filename=f"table_{i}.md",
+            )
+            sent = await self._safe_send(
+                files=[png_file, md_file],
+                view=CopyTableTextView(),
+            )
+            if sent is not None:
+                self._last_msg = sent
+                # No text body — block cost-footer splice (#113).
+                self._last_msg_text = ""
+
     async def _finalize_typewriter(
         self, live_msg: discord.Message, buffer: str
     ) -> None:
@@ -976,7 +1013,11 @@ class DiscordRenderer:
         """
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
-        buffer = self._format_tables(buffer)
+        # v1.12 / #134: extract tables → PNG follow-ups (see PRD R2). Text
+        # with placeholders is sent first, then each TableRender is emitted
+        # as its own message with a PNG + .md sidecar + CopyTableTextView.
+        stripped_text, table_renders = self._extract_and_render_tables(buffer)
+        buffer = stripped_text
 
         if len(buffer) <= DISCORD_MAX_LEN:
             chunks = [buffer]
@@ -992,6 +1033,11 @@ class DiscordRenderer:
             if sent is not None:
                 self._last_msg = sent
 
+        # Tables — sent as PNG attachments after the text body so the
+        # in-channel order is text-first → tables-after.
+        if table_renders:
+            await self._send_table_renders(table_renders)
+
     async def _flush(
         self,
         live_msg: discord.Message | None,
@@ -1005,11 +1051,17 @@ class DiscordRenderer:
         # Process channel/thread management markers before sending.
         if buffer:
             buffer = await self._process_markers(buffer)
-        buffer = self._format_tables(buffer)
 
         if typewriter and live_msg is not None:
+            # ``_finalize_typewriter`` runs its own table extraction (#134),
+            # so hand it the markers-processed buffer untouched.
             await self._finalize_typewriter(live_msg, buffer)
             return
+
+        # v1.12 / #134: fast-path also splits text from tables before send.
+        # If buffer is empty the extractor is a no-op (returns ``("", [])``).
+        stripped_text, table_renders = self._extract_and_render_tables(buffer)
+        buffer = stripped_text
 
         if buffer:
             chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN)
@@ -1019,6 +1071,8 @@ class DiscordRenderer:
                 summary = buffer[:200] + "..." if len(buffer) > 200 else buffer
                 f = discord.File(_io.BytesIO(buffer.encode()), filename="claude-response.md")
                 await self._safe_send(content=summary, file=f)
+                if table_renders:
+                    await self._send_table_renders(table_renders)
                 return
             for chunk in chunks:
                 is_file = self._should_upload_as_file(chunk)
@@ -1033,6 +1087,14 @@ class DiscordRenderer:
                     if is_file:
                         # File-only — no text body for the cost footer to splice.
                         self._last_msg_text = ""
+            if table_renders:
+                await self._send_table_renders(table_renders)
+            return
+
+        # No surrounding text but a table can still exist (e.g., Claude
+        # replied with a bare table) — emit the PNG(s) directly.
+        if table_renders:
+            await self._send_table_renders(table_renders)
             return
 
         # No text buffered. If we never showed *anything* (no text, no tools),
@@ -1163,6 +1225,7 @@ class DiscordRenderer:
         *,
         embed: discord.Embed | None = None,
         file: discord.File | None = None,
+        files: list[discord.File] | None = None,
         view: discord.ui.View | None = None,
     ) -> discord.Message | None:
         """Send a message with retry/backoff on transient HTTP errors.
@@ -1173,8 +1236,19 @@ class DiscordRenderer:
         ``MAX_HTTP_RETRIES`` times with the ``_BACKOFF`` schedule before
         giving up. On giveup with a non-empty ``content``, we log at error
         level so the drop shows up in bot.log.
+
+        ``file`` (single) and ``files`` (list) are mutually exclusive — both
+        map onto ``discord.abc.Messageable.send``'s twin kwargs. The list
+        form is used by #134 to attach a PNG table + ``.md`` sidecar in one
+        message together with a :class:`CopyTableTextView` persistent view.
         """
-        if not content and embed is None and file is None and view is None:
+        if (
+            not content
+            and embed is None
+            and file is None
+            and files is None
+            and view is None
+        ):
             return None
 
         kwargs: dict = {}
@@ -1184,18 +1258,28 @@ class DiscordRenderer:
             kwargs["embed"] = embed
         if file is not None:
             kwargs["file"] = file
+        if files is not None:
+            kwargs["files"] = files
         if view is not None:
             kwargs["view"] = view
 
         def _reset_file() -> None:
-            # Reset file stream between attempts so the second send doesn't
-            # see an empty buffer.
+            # Reset file stream(s) between attempts so the second send
+            # doesn't see an empty buffer.
             f = kwargs.get("file")
             if f is not None and hasattr(f, "fp") and hasattr(f.fp, "seek"):
                 try:
                     f.fp.seek(0)
                 except Exception:
                     pass
+            fs = kwargs.get("files")
+            if fs:
+                for entry in fs:
+                    if hasattr(entry, "fp") and hasattr(entry.fp, "seek"):
+                        try:
+                            entry.fp.seek(0)
+                        except Exception:
+                            pass
 
         async def _op() -> discord.Message | None:
             return await self.target.send(**kwargs)
@@ -1204,7 +1288,9 @@ class DiscordRenderer:
             _op,
             label="send",
             content_len=len(content or ""),
-            between_attempts=_reset_file if "file" in kwargs else None,
+            between_attempts=(
+                _reset_file if ("file" in kwargs or "files" in kwargs) else None
+            ),
         )
         # Only advance the shadow on content-bearing sends. Embed-only and
         # file-only sends do NOT touch _last_msg here — callers that want
