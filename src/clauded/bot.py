@@ -316,14 +316,37 @@ class ClaudedBot(commands.Bot):
             except discord.HTTPException:
                 log.debug("Could not surface thread-permission error to channel")
             return
-        except discord.HTTPException:
-            log.exception("Failed to create thread for channel=%s", channel.id)
-            try:
-                if not is_forum:
-                    await channel.send("❌ Failed to create a thread for this message.")
-            except discord.HTTPException:
-                log.debug("Could not surface thread-creation error to channel")
-            return
+        except discord.HTTPException as e:
+            # Discord gateway can duplicate MESSAGE_CREATE → on_message runs
+            # twice → the second ``message.create_thread`` raises 160004
+            # ("a thread has already been created for this message"). The
+            # winning race already created the thread; we just need to
+            # re-fetch the message to see it and reuse it. Forum-channel
+            # thread creation goes through a different path and isn't
+            # subject to this race, so we only handle 160004 here.
+            if getattr(e, "code", None) == 160004 and not is_forum:
+                try:
+                    message = await channel.fetch_message(message.id)
+                except discord.HTTPException:
+                    log.exception("Could not refetch after thread-race")
+                    return
+                if message.thread is not None:
+                    log.info(
+                        "Thread-race: reusing existing thread %d",
+                        message.thread.id,
+                    )
+                    thread = message.thread
+                else:
+                    log.warning("160004 reported but message.thread is None")
+                    return
+            else:
+                log.exception("Failed to create thread for channel=%s", channel.id)
+                try:
+                    if not is_forum:
+                        await channel.send("❌ Failed to create a thread for this message.")
+                except discord.HTTPException:
+                    log.debug("Could not surface thread-creation error to channel")
+                return
 
         # First-time unbound hint, posted before the bridge starts streaming.
         if not is_bound and self.project_manager.should_hint_unbound(channel.id):

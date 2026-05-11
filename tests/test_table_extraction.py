@@ -72,18 +72,24 @@ async def test_table_in_code_fence_left_alone():
 
 @pytest.mark.asyncio
 async def test_malformed_table_not_extracted():
-    """Header row with no separator row → not a table, verbatim."""
+    """Header row with no following ``|...|`` line → not a table, verbatim.
+
+    (Note: a header followed by a same-cell-count ``|...|`` row IS now
+    accepted under the relaxed shape — see
+    ``test_table_without_separator_extracted``. This test pins the case
+    where the next line is plain prose so there's nothing to parse as
+    either a separator or a data row.)
+    """
     text = (
         "Heading:\n"
         "| Name | Age |\n"
-        "| Alice | 30 |\n"
         "End."
     )
     out, renders = await DiscordRenderer._extract_and_render_tables(text)
     assert renders == []
-    # The pipe lines survive untouched.
+    # The pipe line survives untouched.
     assert "| Name | Age |" in out
-    assert "| Alice | 30 |" in out
+    assert "End." in out
 
 
 @pytest.mark.asyncio
@@ -212,3 +218,72 @@ async def test_escaped_pipe_in_cell():
     # 3 split fragments — confirms the escape was NOT honoured.
     assert len(r.rows[0]) == 3
     assert r.rows[0] == ["a\\", "b", "c"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 1 (v1.12): relaxed shape — accept tables without a ``|---|---|``
+# separator row when the next line is another ``|...|`` with matching
+# cell count. Claude SDK frequently emits tables in this shape, so the
+# strict matcher was dropping production tables into the legacy
+# code-fence fallback path.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_table_without_separator_extracted():
+    """Header followed directly by data rows (no ``|---|---|`` separator)
+    with matching cell count → 1 TableRender, headers + rows parsed, and
+    ``markdown_source`` contains a synthesized separator so the ``.md``
+    sidecar stays GFM-valid.
+    """
+    text = "| a | b |\n| 1 | 2 |\n| 3 | 4 |"
+    _, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert len(renders) == 1
+    r = renders[0]
+    assert r.headers == ["a", "b"]
+    assert r.rows == [["1", "2"], ["3", "4"]]
+    # ``markdown_source`` carries a synthesized 2-column GFM separator
+    # so downloads of the ``.md`` sidecar render correctly anywhere
+    # GFM is honoured.
+    assert "|---|---|" in r.markdown_source
+    # And the synthesized separator is positioned between header and rows.
+    lines = r.markdown_source.splitlines()
+    assert lines[0].strip() == "| a | b |"
+    assert lines[1].strip() == "|---|---|"
+    assert lines[2].strip() == "| 1 | 2 |"
+    assert lines[3].strip() == "| 3 | 4 |"
+
+
+@pytest.mark.asyncio
+async def test_separator_still_recognized_when_present():
+    """Strict GFM path (header + separator + rows) is unchanged."""
+    text = (
+        "| Name | Age |\n"
+        "|------|-----|\n"
+        "| Alice | 30 |\n"
+        "| Bob | 25 |"
+    )
+    _, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert len(renders) == 1
+    r = renders[0]
+    assert r.headers == ["Name", "Age"]
+    assert r.rows == [["Alice", "30"], ["Bob", "25"]]
+    # On the strict path the separator is verbatim from input, NOT the
+    # synthesized ``|---|---|`` shape (it has 6-dash spans here).
+    assert "|------|-----|" in r.markdown_source
+
+
+@pytest.mark.asyncio
+async def test_no_separator_mismatched_cells_falls_back_verbatim():
+    """Header + next ``|...|`` row with different cell count → not a table.
+
+    The cell-count guard prevents the relaxed path from gluing two
+    unrelated pipe-shaped lines together. Both lines must survive
+    verbatim in the output.
+    """
+    text = "| a | b | c |\n| 1 | 2 |"
+    out, renders = await DiscordRenderer._extract_and_render_tables(text)
+    assert renders == []
+    # Both lines survive in the output unchanged.
+    assert "| a | b | c |" in out
+    assert "| 1 | 2 |" in out

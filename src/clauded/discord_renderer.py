@@ -1520,11 +1520,25 @@ class DiscordRenderer:
     ) -> tuple[str, list[TableRender]]:
         """Extract markdown tables, render to PNG, return placeholders.
 
-        Walks ``text`` line-by-line. Each *well-formed* markdown table
-        (header row + ``|---|---|`` separator + ≥1 data row, ≥2 columns,
-        not inside a ``` code fence) is replaced in the returned text with
-        a unique placeholder ``\\n[TABLE_PNG_N]\\n`` and yields a
-        :class:`TableRender` carrying:
+        Walks ``text`` line-by-line. Each *well-formed* markdown table is
+        replaced in the returned text with a unique placeholder
+        ``\\n[TABLE_PNG_N]\\n`` and yields a :class:`TableRender` carrying
+        headers/rows/png_bytes/markdown_source.
+
+        Two table shapes are accepted (≥2 columns, not inside a ``` code
+        fence, ≥1 data row in both cases):
+
+        1. **Strict GFM**: header + ``|---|---|`` separator + data rows.
+        2. **Relaxed (no separator)**: header followed directly by data
+           rows where the first data row has the same cell count as the
+           header. Claude's SDK frequently emits tables without a
+           separator row, so the relaxed shape catches production output
+           that the strict matcher would otherwise drop into the legacy
+           code-fence fallback path. On the relaxed path a synthetic
+           ``|---|...|`` line is spliced into ``markdown_source`` only
+           (so the ``.md`` sidecar stays GFM-valid); the PNG renderer
+           and the verbatim-fallback paths see exactly the original
+           input lines.
 
         - ``headers`` / ``rows`` — parsed cell strings (pipe-stripped, trimmed)
         - ``png_bytes`` — output of :func:`table_png.render_table_png`
@@ -1544,7 +1558,8 @@ class DiscordRenderer:
         - Tables inside ``` code fences → left verbatim, no TableRender.
         - Single-column tables (``| Header |``) → re-emitted verbatim.
         - Header-only tables (separator present but no data rows) → verbatim.
-        - Malformed tables (no separator row after the header) → verbatim.
+        - Header line with no following ``|...|`` line → verbatim.
+        - Header + non-separator next row with mismatched cell count → verbatim.
         - PNG render failure (Pillow error, oversize → ``ValueError``) →
           original lines re-emitted verbatim, error logged (review C2).
 
@@ -1604,22 +1619,48 @@ class DiscordRenderer:
                 i += 1
                 continue
 
-            # Candidate header. Need a separator on the next non-empty line.
+            # Candidate header. Two accepted shapes:
+            #   1. Strict GFM: header + ``|---|---|`` separator + ≥1 row.
+            #   2. Relaxed: header followed directly by another ``|...|``
+            #      row with matching cell count (Claude SDK frequently emits
+            #      tables without a separator row). On the relaxed path we
+            #      synthesize a ``|---|...|`` separator solely for
+            #      ``markdown_source`` so the ``.md`` sidecar stays
+            #      GFM-valid; the PNG renderer only ever sees headers+rows.
             header_line = line
             header_stripped = stripped
             j = i + 1
-            if j >= n or not _is_table_line(lines_in[j].strip()) \
-                    or not _is_separator_line(lines_in[j].strip()):
-                # Malformed (no separator) — emit verbatim.
+
+            if j >= n or not _is_table_line(lines_in[j].strip()):
+                # No next table-shaped line — not a table.
                 result.append(header_line)
                 i += 1
                 continue
 
-            sep_line = lines_in[j]
+            next_stripped = lines_in[j].strip()
+            sep_synthesized = False
+            if _is_separator_line(next_stripped):
+                # Strict path — separator row consumes lines_in[j].
+                sep_line = lines_in[j]
+                k = j + 1
+            else:
+                # Relaxed path — no separator row. Require matching cell
+                # count between header and the candidate first data row;
+                # otherwise this is not a table and we fall back verbatim.
+                header_cells = len(_split_cells(header_stripped))
+                next_cells = len(_split_cells(next_stripped))
+                if header_cells != next_cells:
+                    result.append(header_line)
+                    i += 1
+                    continue
+                # Synthesize a GFM separator for ``markdown_source`` only.
+                sep_line = "|" + "|".join(["---"] * header_cells) + "|"
+                sep_synthesized = True
+                # First data row is lines_in[j] — do NOT skip it.
+                k = j
 
             # Collect contiguous data rows.
             data_lines: list[str] = []
-            k = j + 1
             while k < n:
                 ds = lines_in[k].strip()
                 if not _is_table_line(ds) or _is_separator_line(ds):
@@ -1631,9 +1672,13 @@ class DiscordRenderer:
             rows = [_split_cells(dl.strip()) for dl in data_lines]
 
             # PRD R1.4 — single-column / header-only → emit verbatim.
+            # Only emit ``sep_line`` if it actually came from the input
+            # (strict path); the relaxed path synthesizes it for the
+            # markdown_source sidecar only and must not leak into output.
             if len(headers) < 2 or not rows:
                 result.append(header_line)
-                result.append(sep_line)
+                if not sep_synthesized:
+                    result.append(sep_line)
                 for dl in data_lines:
                     result.append(dl)
                 i = k
@@ -1651,7 +1696,8 @@ class DiscordRenderer:
                     len(renders),
                 )
                 result.append(header_line)
-                result.append(sep_line)
+                if not sep_synthesized:
+                    result.append(sep_line)
                 result.extend(data_lines)
                 i = k
                 continue
