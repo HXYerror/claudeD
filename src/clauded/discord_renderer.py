@@ -32,6 +32,7 @@ import io
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
@@ -48,11 +49,51 @@ from .claude_bridge import (
 )
 from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
+from .table_png import render_table_png
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
 
 log = logging.getLogger("clauded.discord_renderer")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableRender:
+    """A markdown table extracted from a renderer buffer for PNG attachment.
+
+    Produced by :meth:`DiscordRenderer._extract_and_render_tables`. Each
+    instance carries the parsed structure plus the rendered PNG bytes and the
+    original markdown source (kept verbatim for the Copy-as-text button).
+
+    Fields
+    ------
+    headers
+        Cell text of the table's header row, one per column.
+    rows
+        Body rows (each a list of cell strings, length matching ``headers``).
+    png_bytes
+        Result of :func:`table_png.render_table_png` — ready to attach to a
+        Discord message via :class:`discord.File`.
+    markdown_source
+        Original markdown table text exactly as it appeared in the input
+        buffer (verbatim, including any leading/trailing whitespace per line).
+        This is the source-of-truth surfaced by the Copy button (#133).
+    placeholder
+        Token inserted into the surrounding text where the table used to be,
+        e.g. ``"\\n[TABLE_PNG_0]\\n"``. Callers (#134) split on these to
+        interleave text messages with PNG follow-ups.
+    """
+
+    headers: list[str]
+    rows: list[list[str]]
+    png_bytes: bytes
+    markdown_source: str
+    placeholder: str
 
 # ---------------------------------------------------------------------------
 # Color scheme for embeds
@@ -1223,12 +1264,17 @@ class DiscordRenderer:
         return result is not None
 
     # ------------------------------------------------------------------
-    # Markdown table → code block conversion
+    # Markdown table → code block conversion (legacy) / PNG extraction
     # ------------------------------------------------------------------
 
     @staticmethod
     def _format_tables(text: str) -> str:
-        """Convert markdown tables to code blocks for Discord.
+        """Legacy: wrap markdown tables in code-fence blocks for Discord.
+
+        Kept intact for backward compatibility during the incremental
+        v1.12 PNG migration (#112). Subtask #134 will switch callers to
+        :meth:`_extract_and_render_tables` and this method may then be
+        removed.
 
         Discord does not render markdown tables, so we wrap them in
         code blocks where at least the column alignment is preserved.
@@ -1281,6 +1327,130 @@ class DiscordRenderer:
             result.append("```")
 
         return "\n".join(result)
+
+    @staticmethod
+    def _extract_and_render_tables(text: str) -> tuple[str, list[TableRender]]:
+        """Extract markdown tables, render to PNG, return placeholders.
+
+        Walks ``text`` line-by-line. Each *well-formed* markdown table
+        (header row + ``|---|---|`` separator + ≥1 data row, ≥2 columns,
+        not inside a ``` code fence) is replaced in the returned text with
+        a unique placeholder ``\\n[TABLE_PNG_N]\\n`` and yields a
+        :class:`TableRender` carrying:
+
+        - ``headers`` / ``rows`` — parsed cell strings (pipe-stripped, trimmed)
+        - ``png_bytes`` — output of :func:`table_png.render_table_png`
+        - ``markdown_source`` — original verbatim block of lines that formed
+          the table (for the Copy-as-text button in #133)
+        - ``placeholder`` — the same token inserted into the returned text
+
+        Returns ``(text_with_placeholders, [TableRender, ...])``. If no
+        tables are found, returns ``(text, [])`` unchanged.
+
+        Edge cases (per PRD R1.4 / R6):
+
+        - Tables inside ``` code fences → left verbatim, no TableRender.
+        - Single-column tables (``| Header |``) → re-emitted verbatim.
+        - Header-only tables (separator present but no data rows) → verbatim.
+        - Malformed tables (no separator row after the header) → verbatim.
+        """
+        lines_in = text.split("\n")
+        result: list[str] = []
+        renders: list[TableRender] = []
+        in_code_fence = False
+        i = 0
+        n = len(lines_in)
+
+        def _is_table_line(s: str) -> bool:
+            return s.startswith("|") and s.endswith("|")
+
+        def _is_separator_line(s: str) -> bool:
+            # e.g. ``|---|---|`` or ``| :--- | ---: |`` — only ``|``, ``-``,
+            # ``:`` and spaces, and at least one ``-``.
+            inner = s.strip("|").strip()
+            if not inner or "-" not in inner:
+                return False
+            return all(c in "|-: " for c in s)
+
+        def _split_cells(s: str) -> list[str]:
+            # Strip leading/trailing pipes, then split. Empty cells preserved.
+            body = s
+            if body.startswith("|"):
+                body = body[1:]
+            if body.endswith("|"):
+                body = body[:-1]
+            return [c.strip() for c in body.split("|")]
+
+        while i < n:
+            line = lines_in[i]
+            stripped = line.strip()
+
+            # Track code fences first — anything inside is opaque.
+            if stripped.startswith("```"):
+                in_code_fence = not in_code_fence
+                result.append(line)
+                i += 1
+                continue
+
+            if in_code_fence or not _is_table_line(stripped):
+                result.append(line)
+                i += 1
+                continue
+
+            # Candidate header. Need a separator on the next non-empty line.
+            header_line = line
+            header_stripped = stripped
+            j = i + 1
+            if j >= n or not _is_table_line(lines_in[j].strip()) \
+                    or not _is_separator_line(lines_in[j].strip()):
+                # Malformed (no separator) — emit verbatim.
+                result.append(header_line)
+                i += 1
+                continue
+
+            sep_line = lines_in[j]
+
+            # Collect contiguous data rows.
+            data_lines: list[str] = []
+            k = j + 1
+            while k < n:
+                ds = lines_in[k].strip()
+                if not _is_table_line(ds) or _is_separator_line(ds):
+                    break
+                data_lines.append(lines_in[k])
+                k += 1
+
+            headers = _split_cells(header_stripped)
+            rows = [_split_cells(dl.strip()) for dl in data_lines]
+
+            # PRD R1.4 — single-column / header-only → emit verbatim.
+            if len(headers) < 2 or not rows:
+                result.append(header_line)
+                result.append(sep_line)
+                for dl in data_lines:
+                    result.append(dl)
+                i = k
+                continue
+
+            # Well-formed table — render PNG, replace with placeholder.
+            png = render_table_png(headers, rows)
+            markdown_source = "\n".join(
+                [header_line, sep_line, *data_lines]
+            )
+            placeholder = f"\n[TABLE_PNG_{len(renders)}]\n"
+            renders.append(
+                TableRender(
+                    headers=headers,
+                    rows=rows,
+                    png_bytes=png,
+                    markdown_source=markdown_source,
+                    placeholder=placeholder,
+                )
+            )
+            result.append(placeholder)
+            i = k
+
+        return "\n".join(result), renders
 
 
     # ------------------------------------------------------------------
