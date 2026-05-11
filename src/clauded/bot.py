@@ -29,6 +29,7 @@ from .session_config import SessionConfig
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
+from .cogs._unbound import UNBOUND_HINT_MESSAGE
 
 # Re-export SystemPromptModal so existing ``from clauded.bot import
 # SystemPromptModal`` continues to work (tests rely on this).
@@ -70,6 +71,42 @@ def _build_intents_safe() -> discord.Intents:
     intents.messages = True
     intents.guilds = True
     return intents
+
+
+# Generic, path-free error: never interpolate ``project_path_obj`` (which
+# is the operator's home dir) into a message Discord users will see.
+_BROKEN_HOME_MESSAGE = (
+    "❌ Couldn't determine your home directory. "
+    "Run `/project bind <path>` to use this bot."
+)
+
+
+async def _resolve_path_or_friendly_error(
+    project_manager: ProjectManager,
+    channel_id: int,
+    reply: "callable",
+) -> tuple[Path, bool] | None:
+    """Resolve ``(path, is_bound)`` for a channel, replying on broken-home.
+
+    Returns the tuple on success. On a broken ``$HOME`` (the only case the
+    fallback can fail), sends a generic error via ``reply``, logs detail
+    at warning, and returns ``None``. Bound paths are validated at bind
+    time so are assumed OK.
+    """
+    project_path_obj, is_bound = project_manager.get_path_or_default(channel_id)
+    if is_bound:
+        return project_path_obj, True
+    # ``Path.home()``-raise is already caught inside ``get_path_or_default``;
+    # what's left is the "set but doesn't exist" case, which ``is_dir()``
+    # reports as False (not a raise). One simple guard suffices.
+    if project_path_obj.is_dir():
+        return project_path_obj, False
+    log.warning("Unbound fallback failed: %s is not a directory", project_path_obj)
+    try:
+        await reply(_BROKEN_HOME_MESSAGE)
+    except discord.HTTPException:
+        log.debug("Could not surface broken-home error")
+    return None
 
 
 class ClaudedBot(commands.Bot):
@@ -194,7 +231,14 @@ class ClaudedBot(commands.Bot):
     # ------------------------------------------------------------------
 
     async def _handle_channel_message(self, message: discord.Message) -> None:
-        """Channel (non-thread) message: open a new thread + session."""
+        """Channel (non-thread) message: open a new thread + session.
+
+        If the channel is bound, scope the session to that project path.
+        Otherwise: when ``Config.allow_unbound_fallback`` is True (opt-in),
+        fall back to the operator's home directory and surface a one-time
+        hint nudging the user to ``/project bind``. When False (default,
+        v1.0 behavior), silently ignore the message.
+        """
         # Only trigger if bot is mentioned
         # Accept real @mention, role mention, or text containing bot name
         bot_mentioned = self.user and self.user.id in [m.id for m in message.mentions]
@@ -204,20 +248,29 @@ class ClaudedBot(commands.Bot):
             return
 
         channel = message.channel
-        if not self.project_manager.is_bound(channel.id):
-            return  # Channel isn't wired up; ignore.
-
-        project_path = self.project_manager.get_path(channel.id)
-        if project_path is None:
-            log.warning("Channel %s reports bound but has no path", channel.id)
+        # SECURITY (sec-1): unbound fallback is off by default. v1.0 behavior
+        # is to silently ignore @bot in unbound channels. Operators opt in via
+        # CLAUDED_ALLOW_UNBOUND_FALLBACK=1 to enable the $HOME fallback.
+        if (
+            not self.project_manager.is_bound(channel.id)
+            and not self.config.allow_unbound_fallback
+        ):
             return
+
+        resolved = await _resolve_path_or_friendly_error(
+            self.project_manager, channel.id, message.reply
+        )
+        if resolved is None:
+            return
+        project_path_obj, is_bound = resolved
+        project_path = str(project_path_obj)
 
         # #87: support forum channel mode
         channel_mode = self.project_manager.get_channel_mode(channel.id)
         is_forum = channel_mode == "forum" and isinstance(channel, discord.ForumChannel)
 
         if not is_forum and not isinstance(channel, discord.TextChannel):
-            log.warning("Bound channel %s is not a TextChannel or ForumChannel; skipping", channel.id)
+            log.warning("Channel %s is not a TextChannel or ForumChannel; skipping", channel.id)
             return
 
         # Strip the bot mention from the message content
@@ -256,6 +309,13 @@ class ClaudedBot(commands.Bot):
             except discord.HTTPException:
                 log.debug("Could not surface thread-creation error to channel")
             return
+
+        # First-time unbound hint, posted before the bridge starts streaming.
+        if not is_bound and self.project_manager.should_hint_unbound(channel.id):
+            try:
+                await thread.send(UNBOUND_HINT_MESSAGE)
+            except discord.HTTPException:
+                log.debug("Could not post unbound-fallback hint to thread")
 
         # Acquire the per-thread lock *before* creating the session so a
         # concurrent thread message that Discord delivers out of order can't
@@ -361,14 +421,28 @@ class ClaudedBot(commands.Bot):
     async def _handle_thread_message(
         self, message: discord.Message, parent_id: int
     ) -> None:
-        """Thread message: route to the existing/new session for that thread."""
-        if not self.project_manager.is_bound(parent_id):
-            return  # Parent channel isn't bound; ignore.
+        """Thread message: route to the existing/new session for that thread.
 
-        project_path = self.project_manager.get_path(parent_id)
-        if project_path is None:
-            log.warning("Parent channel %s bound but has no path", parent_id)
+        Inherits the parent channel's bound state. The hint (if any) is the
+        channel handler's job; threads never post it themselves. When the
+        parent is unbound and the operator has not opted in via
+        ``Config.allow_unbound_fallback``, the message is silently ignored
+        (v1.0 behavior).
+        """
+        # SECURITY (sec-1): mirror channel handler's gate.
+        if (
+            not self.project_manager.is_bound(parent_id)
+            and not self.config.allow_unbound_fallback
+        ):
             return
+
+        resolved = await _resolve_path_or_friendly_error(
+            self.project_manager, parent_id, message.reply
+        )
+        if resolved is None:
+            return
+        project_path_obj, is_bound = resolved
+        project_path = str(project_path_obj)
 
         thread_id = message.channel.id
         # Acquire the per-thread lock for the entire send/render cycle so

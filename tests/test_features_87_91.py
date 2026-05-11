@@ -40,31 +40,52 @@ class TestChannelMode:
     def test_default_mode_is_thread(self, manager: ProjectManager) -> None:
         assert manager.get_channel_mode(999) == "thread"
 
-    def test_set_mode_to_forum(self, manager: ProjectManager) -> None:
+    def test_set_mode_to_forum(
+        self, manager: ProjectManager, projects_root: Path
+    ) -> None:
+        proj = projects_root / "p"
+        proj.mkdir()
+        manager.bind(100, str(proj))
         manager.set_channel_mode(100, "forum")
         assert manager.get_channel_mode(100) == "forum"
 
-    def test_set_mode_to_thread(self, manager: ProjectManager) -> None:
+    def test_set_mode_to_thread(
+        self, manager: ProjectManager, projects_root: Path
+    ) -> None:
+        proj = projects_root / "p"
+        proj.mkdir()
+        manager.bind(100, str(proj))
         manager.set_channel_mode(100, "forum")
         manager.set_channel_mode(100, "thread")
         assert manager.get_channel_mode(100) == "thread"
 
-    def test_set_mode_invalid_raises(self, manager: ProjectManager) -> None:
+    def test_set_mode_invalid_raises(
+        self, manager: ProjectManager, projects_root: Path
+    ) -> None:
+        proj = projects_root / "p"
+        proj.mkdir()
+        manager.bind(100, str(proj))
         with pytest.raises(ValueError, match="Invalid mode"):
             manager.set_channel_mode(100, "invalid")
 
     def test_mode_persists(
         self, data_dir: Path, projects_root: Path
     ) -> None:
+        proj = projects_root / "p"
+        proj.mkdir()
         pm1 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+        pm1.bind(200, str(proj))
         pm1.set_channel_mode(200, "forum")
 
         pm2 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
         assert pm2.get_channel_mode(200) == "forum"
 
     def test_mode_saved_in_projects_json(
-        self, manager: ProjectManager, data_dir: Path
+        self, manager: ProjectManager, data_dir: Path, projects_root: Path
     ) -> None:
+        proj = projects_root / "p"
+        proj.mkdir()
+        manager.bind(300, str(proj))
         manager.set_channel_mode(300, "forum")
         payload = json.loads((data_dir / "projects.json").read_text())
         assert payload["300"]["channel_mode"] == "forum"
@@ -80,12 +101,14 @@ class TestChannelMode:
         assert manager.get_project(400) == str(proj.resolve())
         assert manager.get_channel_mode(400) == "forum"
 
-    def test_mode_on_unbound_channel(self, manager: ProjectManager) -> None:
-        """Setting mode on unbound channel creates a minimal entry."""
-        manager.set_channel_mode(500, "forum")
-        assert manager.get_channel_mode(500) == "forum"
-        # But no path is bound
-        assert manager.get_project(500) is None
+    def test_mode_on_unbound_channel_raises(
+        self, manager: ProjectManager
+    ) -> None:
+        """Mutating channel state on an unbound channel must raise (arch-2)."""
+        with pytest.raises(ValueError, match="not bound"):
+            manager.set_channel_mode(500, "forum")
+        # And reading a never-set mode falls back to the default.
+        assert manager.get_channel_mode(500) == "thread"
 
 
 # ===========================================================================

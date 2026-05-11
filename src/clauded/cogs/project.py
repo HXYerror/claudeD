@@ -8,8 +8,9 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
+from ..discord_renderer import COLOR_INFO
 from ..project_manager import ProjectManager
+from ._unbound import reject_if_unbound
 
 log = logging.getLogger("clauded.bot")
 
@@ -146,11 +147,13 @@ async def project_system_prompt(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("No channel context.", ephemeral=True)
         return
 
-    if not bot.project_manager.is_bound(channel_id):
-        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+    if await reject_if_unbound(interaction, bot):
         return
 
-    modal = SystemPromptModal(channel_id, bot.project_manager)
+    # Threads inherit the parent channel's binding; resolve to parent so the
+    # prompt attaches to the bound row, not the (unbound) thread id.
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    modal = SystemPromptModal(parent_id, bot.project_manager)
     await interaction.response.send_modal(modal)
 
 
@@ -164,11 +167,13 @@ async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
     if channel_id is None:
         await interaction.response.send_message("No channel context.", ephemeral=True)
         return
-    if not bot.project_manager.is_bound(channel_id):
-        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
+    if await reject_if_unbound(interaction, bot):
         return
+    # Threads inherit the parent channel's binding; resolve to parent so
+    # the extra dir attaches to the bound row, not the (unbound) thread id.
+    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
     try:
-        resolved = bot.project_manager.add_extra_dir(channel_id, path)
+        resolved = bot.project_manager.add_extra_dir(parent_id, path)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
@@ -306,11 +311,10 @@ async def env_set(interaction: discord.Interaction, key: str, value: str) -> Non
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    if not bot.project_manager.is_bound(parent_id):
-        await interaction.response.send_message("Channel not bound. Use /project bind first.", ephemeral=True)
-        return
     bot.project_manager.set_env(parent_id, key, value)
     embed = discord.Embed(
         title="✅ Environment Variable Set",
@@ -351,6 +355,8 @@ async def env_remove(interaction: discord.Interaction, key: str) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     channel_id = interaction.channel_id
     parent_id = getattr(interaction.channel, "parent_id", None) or channel_id

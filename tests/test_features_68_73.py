@@ -110,7 +110,10 @@ class TestSystemPromptModal:
         """Modal pre-fills prompt_input.default with existing system prompt."""
         from clauded.bot import SystemPromptModal
 
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root=str(tmp_path))
+        pm.bind(42, str(proj))
         pm.set_system_prompt(42, "Be helpful and concise.")
         modal = SystemPromptModal(42, pm)
         assert modal.prompt_input.default == "Be helpful and concise."
@@ -359,9 +362,23 @@ class TestPostToolUseHook:
 
 
 class TestProjectManagerEnv:
+    @staticmethod
+    def _make_bound_pm(tmp_path, channel_id: int = 100) -> ProjectManager:
+        """Helper: create a ProjectManager with ``channel_id`` already bound
+        to a real directory under the configured root. Required because
+        v1.11 arch-2 forbids ``set_env``/``remove_env`` on unbound channels.
+        """
+        proj = tmp_path / f"proj-{channel_id}"
+        proj.mkdir()
+        pm = ProjectManager(
+            data_dir=str(tmp_path / "data"), projects_root=str(tmp_path)
+        )
+        pm.bind(channel_id, str(proj))
+        return pm
+
     def test_set_and_get_env(self, tmp_path) -> None:
         """set_env stores a variable retrievable via get_env."""
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm = self._make_bound_pm(tmp_path, 100)
         pm.set_env(100, "API_KEY", "secret123")
         env = pm.get_env(100)
         assert env == {"API_KEY": "secret123"}
@@ -373,7 +390,7 @@ class TestProjectManagerEnv:
 
     def test_set_env_multiple(self, tmp_path) -> None:
         """Multiple env vars can be set."""
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm = self._make_bound_pm(tmp_path, 100)
         pm.set_env(100, "KEY1", "val1")
         pm.set_env(100, "KEY2", "val2")
         env = pm.get_env(100)
@@ -381,28 +398,30 @@ class TestProjectManagerEnv:
 
     def test_set_env_overwrites(self, tmp_path) -> None:
         """Setting same key overwrites the value."""
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm = self._make_bound_pm(tmp_path, 100)
         pm.set_env(100, "KEY", "old")
         pm.set_env(100, "KEY", "new")
         assert pm.get_env(100)["KEY"] == "new"
 
     def test_remove_env(self, tmp_path) -> None:
         """remove_env removes the variable and returns True."""
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm = self._make_bound_pm(tmp_path, 100)
         pm.set_env(100, "KEY", "val")
         assert pm.remove_env(100, "KEY") is True
         assert pm.get_env(100) == {}
 
     def test_remove_env_not_found(self, tmp_path) -> None:
         """remove_env returns False if key doesn't exist."""
-        pm = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm = self._make_bound_pm(tmp_path, 100)
         assert pm.remove_env(100, "MISSING") is False
 
     def test_env_persists(self, tmp_path) -> None:
         """Env vars survive a round-trip through save/load."""
-        pm1 = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm1 = self._make_bound_pm(tmp_path, 200)
         pm1.set_env(200, "TOKEN", "abc")
-        pm2 = ProjectManager(data_dir=str(tmp_path / "data"), projects_root="/tmp")
+        pm2 = ProjectManager(
+            data_dir=str(tmp_path / "data"), projects_root=str(tmp_path)
+        )
         assert pm2.get_env(200) == {"TOKEN": "abc"}
 
 

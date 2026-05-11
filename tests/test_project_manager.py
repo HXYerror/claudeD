@@ -452,3 +452,204 @@ def test_add_extra_dir_outside_root_raises(tmp_path):
     pm.bind(1, str(root))  # need a binding first
     with pytest.raises(ValueError, match="outside"):
         pm.add_extra_dir(1, str(outside))
+
+
+# ---------------------------------------------------------------------------
+# Unbound-channel fallback helpers (v1.11, #110)
+# ---------------------------------------------------------------------------
+
+
+def test_get_path_or_default_bound(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """A bound channel returns ``(bound_path, True)``."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(100, str(proj))
+
+    path, is_bound = manager.get_path_or_default(100)
+    assert is_bound is True
+    assert path == proj.resolve()
+
+
+def test_get_path_or_default_unbound(manager: ProjectManager) -> None:
+    """An unbound channel returns ``(Path.home().resolve(), False)``."""
+    path, is_bound = manager.get_path_or_default(101)
+    assert is_bound is False
+    assert path == Path.home().resolve()
+
+
+def test_should_hint_unbound_first_call_returns_true(
+    manager: ProjectManager,
+) -> None:
+    """First call for a channel returns True."""
+    assert manager.should_hint_unbound(200) is True
+
+
+def test_should_hint_unbound_second_call_returns_false(
+    manager: ProjectManager,
+) -> None:
+    """Subsequent calls for the same channel return False."""
+    assert manager.should_hint_unbound(201) is True
+    assert manager.should_hint_unbound(201) is False
+    assert manager.should_hint_unbound(201) is False
+
+
+def test_should_hint_unbound_isolated_per_channel(
+    manager: ProjectManager,
+) -> None:
+    """Different channel ids each get their own first-hint."""
+    assert manager.should_hint_unbound(300) is True
+    assert manager.should_hint_unbound(301) is True
+    # And each is now suppressed independently.
+    assert manager.should_hint_unbound(300) is False
+    assert manager.should_hint_unbound(301) is False
+
+
+# ---------------------------------------------------------------------------
+# tester-1: defensive partial-entry handling in get_path_or_default
+# ---------------------------------------------------------------------------
+
+
+def test_get_path_or_default_partial_entry_falls_through_to_home(
+    manager: ProjectManager,
+) -> None:
+    """``is_bound`` returns True for an entry without a ``path`` key (e.g.
+    a stale projects.json from a partial write). The helper must fall
+    through to the unbound branch instead of returning ``None``-shaped
+    garbage that downstream code asserts on.
+    """
+    # Simulate a partial entry directly — corresponds to a JSON file
+    # written before/around a v1.0 crash that left the row without "path".
+    manager._projects["999"] = {"system_prompt": "stale"}
+    assert manager.is_bound(999) is True
+    assert manager.get_path(999) is None  # the trap
+
+    path, is_bound = manager.get_path_or_default(999)
+    assert is_bound is False, "partial entry must be treated as unbound"
+    assert path == Path.home().resolve()
+
+
+# ---------------------------------------------------------------------------
+# sec-3 / tester-1: Path.home() raise is caught
+# ---------------------------------------------------------------------------
+
+
+def test_get_path_or_default_no_home(
+    manager: ProjectManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.home()`` raises ``RuntimeError`` when ``$HOME`` is unset and
+    there's no passwd entry. ``get_path_or_default`` must catch that and
+    return a sentinel path that ``is_dir()`` reports False for, so the
+    bot's broken-home guard fires cleanly instead of bubbling a stack
+    trace into the on-message handler.
+    """
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("HOME not set")
+
+    monkeypatch.setattr(Path, "home", _raise)
+
+    path, is_bound = manager.get_path_or_default(8888)
+    assert is_bound is False
+    assert path.is_dir() is False, "sentinel must report not-a-directory"
+
+
+def test_get_path_or_default_home_oserror(
+    manager: ProjectManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``Path.home().resolve()`` can raise ``OSError`` on broken filesystems.
+    The helper must catch that too — same sentinel.
+    """
+    def _raise(*_args, **_kwargs):
+        raise OSError("EIO")
+
+    # OSError on the very ``Path.home()`` call exercises the OSError leg of
+    # the except clause without needing to fake a Path subclass.
+    monkeypatch.setattr(Path, "home", _raise)
+
+    path, is_bound = manager.get_path_or_default(8889)
+    assert is_bound is False
+    assert path.is_dir() is False
+
+
+# ---------------------------------------------------------------------------
+# arch-2: _assert_bound invariant in project-mutating methods
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def bound_manager(
+    manager: ProjectManager, projects_root: Path
+) -> tuple[ProjectManager, int]:
+    """Manager with channel id 7000 already bound to a real directory."""
+    proj = projects_root / "boundproj"
+    proj.mkdir()
+    manager.bind(7000, str(proj))
+    return manager, 7000
+
+
+@pytest.mark.parametrize(
+    "method_name,args",
+    [
+        ("set_system_prompt", ("hi there",)),
+        ("set_budget", (1.50,)),
+        ("set_env", ("FOO", "bar")),
+        ("remove_env", ("FOO",)),
+        ("add_mcp_server", ("srv", {"type": "stdio", "command": "/bin/true"})),
+        ("remove_mcp_server", ("srv",)),
+        ("set_channel_mode", ("forum",)),
+        ("remove_extra_dir", ("/tmp/x",)),
+    ],
+)
+def test_mutators_raise_on_unbound_channel(
+    manager: ProjectManager, method_name: str, args: tuple
+) -> None:
+    """Every project-mutating method must raise ``ValueError`` containing
+    "not bound" when called against an unbound channel id. This is the
+    arch-2 defense-in-depth invariant — even if a future cog forgets the
+    user-facing ``reject_if_unbound`` guard, the manager refuses to write.
+    """
+    fn = getattr(manager, method_name)
+    with pytest.raises(ValueError, match="not bound"):
+        fn(123456789, *args)
+    # And nothing was written.
+    assert "123456789" not in manager._projects
+
+
+def test_add_extra_dir_raises_on_unbound_channel(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """``add_extra_dir`` is parametrized separately because its second
+    arg must be a real directory; the others' inputs are all literals.
+    """
+    target = projects_root / "extra"
+    target.mkdir()
+    with pytest.raises(ValueError, match="not bound"):
+        manager.add_extra_dir(987654321, str(target))
+    assert "987654321" not in manager._projects
+
+
+def test_mutators_succeed_on_bound_channel(
+    bound_manager: tuple[ProjectManager, int], projects_root: Path
+) -> None:
+    """Sanity: arch-2 doesn't break the happy path. Each mutator must
+    succeed on a channel that's been bound.
+    """
+    pm, ch = bound_manager
+    pm.set_system_prompt(ch, "hi")
+    assert pm.get_system_prompt(ch) == "hi"
+    pm.set_budget(ch, 0.50)
+    assert pm.get_budget(ch) == pytest.approx(0.50)
+    pm.set_env(ch, "K", "v")
+    assert pm.get_env(ch) == {"K": "v"}
+    assert pm.remove_env(ch, "K") is True
+    pm.add_mcp_server(ch, "srv", {"type": "stdio", "command": "/bin/true"})
+    assert "srv" in pm.get_mcp_servers(ch)
+    assert pm.remove_mcp_server(ch, "srv") is True
+    pm.set_channel_mode(ch, "forum")
+    assert pm.get_channel_mode(ch) == "forum"
+    extra = projects_root / "another"
+    extra.mkdir()
+    pm.add_extra_dir(ch, str(extra))
+    assert str(extra.resolve()) in pm.get_extra_dirs(ch)
+    assert pm.remove_extra_dir(ch, str(extra)) is True

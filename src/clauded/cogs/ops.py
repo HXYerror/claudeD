@@ -10,6 +10,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
+from ._unbound import reject_if_unbound
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -137,15 +138,12 @@ async def review_pr(interaction: discord.Interaction, pr: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     await interaction.response.defer()
     channel = interaction.channel
     parent_id = getattr(channel, "parent_id", None) or channel.id
     project_path = bot.project_manager.get_path(parent_id)
-    if not project_path:
-        await interaction.followup.send(
-            embed=discord.Embed(title="❌ Channel not bound", color=COLOR_TOOL_FAILURE)
-        )
-        return
     if not isinstance(channel, discord.TextChannel):
         await interaction.followup.send(
             embed=discord.Embed(title="❌ Use this in a text channel", color=COLOR_TOOL_FAILURE),
@@ -218,6 +216,8 @@ async def plugin_add(interaction: discord.Interaction, path: str) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
 
     resolved = Path(path).expanduser().resolve()

@@ -21,6 +21,12 @@ class Config:
     claude_model: str
     claude_permission_mode: str
     projects_root: str
+    # SECURITY: when False (default), an unbound channel's @bot message is
+    # silently ignored — restoring v1.0 behavior. When True, the on-message
+    # handler falls back to ``$HOME`` as cwd. Toggling on grants any user
+    # with channel-write permission shell access to the operator's home,
+    # so this stays opt-in. See PRD R4.2/R4.3.
+    allow_unbound_fallback: bool = False
 
 
 def load_config() -> Config:
@@ -57,4 +63,8 @@ def load_config() -> Config:
             or "default"
         ),
         projects_root=projects_root,
+        allow_unbound_fallback=(
+            os.environ.get("CLAUDED_ALLOW_UNBOUND_FALLBACK", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ),
     )
