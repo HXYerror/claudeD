@@ -436,8 +436,10 @@ class DiscordRenderer:
                             # Finalize any pending typewriter message before
                             # interleaving a tool-status message, so the order
                             # in the channel matches the order of events.
+                            # #141 — ``is_final=False`` skips table extraction
+                            # on the partial buffer; see _finalize_typewriter.
                             if live_msg is not None:
-                                await self._finalize_typewriter(live_msg, buffer)
+                                await self._finalize_typewriter(live_msg, buffer, is_final=False)
                                 live_msg = None
                                 buffer = ""
                                 typewriter = False
@@ -1089,16 +1091,38 @@ class DiscordRenderer:
                     self._last_msg_text = chunk
 
     async def _finalize_typewriter(
-        self, live_msg: discord.Message, buffer: str
+        self,
+        live_msg: discord.Message,
+        buffer: str,
+        *,
+        is_final: bool = True,
     ) -> None:
         """Replace the cursor in ``live_msg`` and emit any overflow as new messages.
 
-        If the in-place edit fails permanently we fall back to sending a
-        fresh message; otherwise the entire ``buffer`` content would be
-        silently lost (see truncation root-cause analysis 5/9).
+        Pre-tool-use interleave (``is_final=False``): raw dump without
+        extraction — caller resets ``buffer`` so any table content here
+        renders as markdown, not PNG. Final flush (``is_final=True``):
+        run v1.12 extract + PNG interleave. See #141.
         """
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
+
+        if not is_final:
+            if not buffer:
+                return
+            if len(buffer) <= DISCORD_MAX_LEN:
+                chunks = [buffer]
+            else:
+                chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN) or [buffer[:DISCORD_MAX_LEN]]
+            first = chunks[0]
+            if live_msg is not None:
+                await self._safe_edit(live_msg, content=first)
+            else:
+                await self._safe_send(content=first)
+            for chunk in chunks[1:]:
+                await self._safe_send(content=chunk)
+            return
+
         # v1.12 — extract tables → PNG follow-ups (PRD R2). On the first
         # text-bearing chunk we still drive the typewriter via in-place
         # edit; if tables exist the remaining text is interleaved with
