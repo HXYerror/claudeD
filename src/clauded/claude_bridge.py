@@ -146,6 +146,24 @@ class ClaudeBridge:
         """True iff the underlying client is currently connected."""
         return self._active
 
+    async def get_server_info(self) -> dict | None:
+        """Return cached server init info, or ``None`` if not connected.
+
+        Public wrapper for ``_client.get_server_info()`` — keeps callers
+        out of the bridge's private state (cog/skill.py uses this for
+        ``/skill list``).
+
+        This is a cache read of the SDK's ``_initialization_result``;
+        the call performs no I/O and is safe to invoke concurrently
+        with an in-flight ``send_message`` stream on the same client.
+        A future SDK refactor could break that assumption — callers
+        should still wrap this in ``try/except`` and degrade gracefully.
+        """
+        client = self._client
+        if client is None or not self._active:
+            return None
+        return await client.get_server_info()
+
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT

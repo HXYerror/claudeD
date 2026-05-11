@@ -14,14 +14,11 @@ import logging
 import discord
 from discord import app_commands
 
-from claude_agent_sdk import (
-    ClaudeSDKClient,
-    ClaudeAgentOptions,
-    CLINotFoundError,
-    CLIConnectionError,
-)
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
+from ..skill_parser import classify_command
+from ._unbound import NO_CHANNEL_MESSAGE, resolve_channel_id
 
 log = logging.getLogger("clauded.bot")
 
@@ -32,72 +29,12 @@ skill_group = app_commands.Group(
 )
 
 
-def _classify(cmd: dict) -> tuple[str, str, str]:
-    """Return ``(group, displayName, displayDescription)`` for a CLI command.
-
-    ``group`` is one of ``"user"``, ``"project"``, ``"plugin:<name>"``, or
-    ``""`` for built-in commands (which the caller filters out). The
-    displayed description has the source-tag suffix stripped.
-
-    See PRD §Architecture for the source-tag-suffix encoding.
-    """
-    name = cmd.get("name", "")
-    desc = cmd.get("description", "") or ""
-    if desc.endswith(" (user)"):
-        return ("user", name, desc[:-7].rstrip())
-    if desc.endswith(" (project)"):
-        return ("project", name, desc[:-10].rstrip())
-    if desc.endswith(")") and " (plugin:" in desc:
-        # " (plugin:foo)" — extract plugin name
-        idx = desc.rfind(" (plugin:")
-        plugin_name = desc[idx + 9:-1]
-        return (f"plugin:{plugin_name}", name, desc[:idx].rstrip())
-    return ("", "", "")  # built-in — filter out
-
-
-# Discord limits we observe defensively. Per-field value cap is the hard
-# 1024-char Discord limit; the 4000-char total budget comes from the PRD
-# truncation guard (see PRD edge-case ">4000 chars total embed content").
+# Discord per-field hard limit. The total-embed budget caps conservatively
+# below Discord's 6000-char serialized ceiling to leave room for
+# title/footer. Real pagination is a v1.14 follow-up (PRD §Out-of-scope).
 _FIELD_VALUE_CAP = 1024
-_EMBED_TOTAL_BUDGET = 4000
+_EMBED_TOTAL_BUDGET = 5500
 _DESC_TRUNCATE_AT = 120
-
-
-def _format_row(name: str, desc: str) -> str:
-    """Render a single skill row: ``• <name> — <truncated desc>``."""
-    if not desc:
-        body = "_(no description)_"
-    elif len(desc) > _DESC_TRUNCATE_AT:
-        body = desc[:_DESC_TRUNCATE_AT] + "…"
-    else:
-        body = desc
-    return f"• {name} — {body}"
-
-
-def _ordered_group_keys(groups: dict[str, list[tuple[str, str]]]) -> list[str]:
-    """Return group keys in the PRD display order.
-
-    Order: Project, User (Global), then each Plugin alphabetized. Missing
-    groups are simply absent.
-    """
-    keys: list[str] = []
-    if "project" in groups:
-        keys.append("project")
-    if "user" in groups:
-        keys.append("user")
-    plugin_keys = sorted(k for k in groups if k.startswith("plugin:"))
-    keys.extend(plugin_keys)
-    return keys
-
-
-def _group_field_name(key: str) -> str:
-    if key == "project":
-        return "Project"
-    if key == "user":
-        return "User (Global)"
-    if key.startswith("plugin:"):
-        return f"Plugin: {key[len('plugin:'):]}"
-    return key  # defensive
 
 
 def _build_skills_embed(
@@ -108,9 +45,16 @@ def _build_skills_embed(
 ) -> discord.Embed:
     """Render the grouped skills into a single ``discord.Embed``.
 
-    Enforces both Discord's per-field 1024-char limit AND the PRD
-    4000-char total-embed budget by trimming rows from the tail and
-    appending a "…and N more" notice if anything had to be dropped.
+    Each group becomes one field with rows joined by newlines, capped
+    at the per-field 1024-char limit by simple slice + ellipsis. If
+    the total serialized embed exceeds ``_EMBED_TOTAL_BUDGET`` we
+    drop trailing skills (last group, last rows) until it fits and
+    add a single "…and N more" notice.
+
+    Note: skill names and descriptions are user-visible, sourced from
+    the operator's local ``~/.claude/skills/`` and project
+    ``.claude/skills/`` directories — do not store secrets in skill
+    *names*.
     """
     embed = discord.Embed(title=f"🧰 Skills ({total_skill_count})", color=COLOR_INFO)
 
@@ -126,85 +70,66 @@ def _build_skills_embed(
         embed.description = "No user or project skills installed."
         return embed
 
-    # Build (key, [rendered_row, …]) in display order. We render every row
-    # up-front so we can compute the truncation tail accurately.
-    ordered: list[tuple[str, list[str]]] = []
-    for key in _ordered_group_keys(groups):
-        rows = [_format_row(n, d) for (n, d) in groups[key]]
-        ordered.append((key, rows))
+    # Group display order: Project → User (Global) → Plugin:<name> alphabetized.
+    ordered_keys: list[str] = []
+    if "project" in groups:
+        ordered_keys.append("project")
+    if "user" in groups:
+        ordered_keys.append("user")
+    ordered_keys.extend(sorted(k for k in groups if k.startswith("plugin:")))
 
-    # Walk groups in order, packing rows into each field while respecting
-    # the per-field 1024-char cap and the per-embed 4000-char cap. Rows
-    # we couldn't fit get counted as "dropped".
-    dropped = 0
-    truncation_field_overhead = 64  # rough budget for the "…and N more" line
+    def _row(name: str, desc: str) -> str:
+        if not desc:
+            body = "_(no description)_"
+        elif len(desc) > _DESC_TRUNCATE_AT:
+            body = desc[:_DESC_TRUNCATE_AT] + "…"
+        else:
+            body = desc
+        return f"• {name} — {body}"
 
-    def current_len(e: discord.Embed) -> int:
-        # discord.py's ``Embed.__len__`` returns the serialized length.
-        return len(e)
+    def _field_label(key: str) -> str:
+        if key == "project":
+            return "Project"
+        if key == "user":
+            return "User (Global)"
+        return f"Plugin: {key[len('plugin:'):]}"  # "plugin:<name>"
 
-    for key, rows in ordered:
-        field_name = _group_field_name(key)
-        if not rows:
-            continue
-        accumulated_lines: list[str] = []
-        accumulated_len = 0  # tracks accumulated body length only
-        for row in rows:
-            # +1 for the joining newline if there's already something there.
-            extra = len(row) + (1 if accumulated_lines else 0)
-            new_field_len = accumulated_len + extra
-            if new_field_len > _FIELD_VALUE_CAP:
-                dropped += 1
+    def _add_fields(group_rows: dict[str, list[str]]) -> None:
+        for key in ordered_keys:
+            if key not in group_rows or not group_rows[key]:
                 continue
-            # Tentative new total: simulate adding this row to the field.
-            # We compute the would-be total length by adding the row
-            # (and possibly a newline) plus, on first row of a new field,
-            # the field-name + structural overhead (~ len(name) + ~6).
-            structural = 0 if accumulated_lines else len(field_name) + 6
-            tentative_total = (
-                current_len(embed)
-                + extra
-                + structural
-                + truncation_field_overhead
-            )
-            if tentative_total > _EMBED_TOTAL_BUDGET:
-                dropped += 1
-                continue
-            accumulated_lines.append(row)
-            accumulated_len += extra
-        if accumulated_lines:
+            value = "\n".join(group_rows[key])
+            if len(value) > _FIELD_VALUE_CAP:
+                value = value[: _FIELD_VALUE_CAP - 1] + "…"
+            embed.add_field(name=_field_label(key), value=value, inline=False)
+
+    # Initial render: all rows.
+    rendered: dict[str, list[str]] = {
+        key: [_row(n, d) for (n, d) in groups[key]] for key in ordered_keys
+    }
+    _add_fields(rendered)
+
+    # If the serialized embed blew the total budget, drop trailing
+    # rows (deterministic: last group's tail first) until it fits.
+    if len(embed) > _EMBED_TOTAL_BUDGET:
+        dropped = 0
+        while len(embed) > _EMBED_TOTAL_BUDGET and any(rendered[k] for k in ordered_keys):
+            # Pop from the last non-empty group.
+            for key in reversed(ordered_keys):
+                if rendered[key]:
+                    rendered[key].pop()
+                    dropped += 1
+                    break
+            embed.clear_fields()
+            _add_fields(rendered)
+        if dropped > 0:
             embed.add_field(
-                name=field_name,
-                value="\n".join(accumulated_lines),
+                name="\u200b",  # zero-width space — Discord requires non-empty name
+                value=f"_…and {dropped} more skills (use Claude CLI to see all)_",
                 inline=False,
             )
 
-    if dropped > 0:
-        embed.add_field(
-            name="\u200b",  # zero-width space — Discord requires a non-empty name
-            value=f"_…and {dropped} more skills (use Claude CLI to see all)_",
-            inline=False,
-        )
-
     return embed
-
-
-def _resolve_channel_id(interaction: discord.Interaction) -> int | None:
-    """Resolve the channel id used for project/session lookups.
-
-    Returns ``None`` for DMs / no-channel contexts so the caller can
-    surface a friendly error. Threads resolve to their parent channel
-    (matching ``_unbound.reject_if_unbound``).
-    """
-    ch = interaction.channel
-    if ch is None:
-        # DM, cache miss, or permission gap.
-        return interaction.channel_id
-    if isinstance(ch, discord.DMChannel):
-        return None
-    if isinstance(ch, discord.Thread):
-        return ch.parent_id or interaction.channel_id
-    return ch.id
 
 
 @skill_group.command(name="list", description="List skills available to the current channel.")
@@ -215,7 +140,7 @@ async def skill_list(interaction: discord.Interaction) -> None:
 
     * **Path A** — if there's already an active ``ClaudeBridge`` for this
       thread/channel, piggyback its connected client and call
-      ``get_server_info()`` directly (~0–1 ms, cached snapshot).
+      ``bridge.get_server_info()`` (~0–1 ms, cached snapshot).
     * **Path B** — otherwise, spin up a transient ``ClaudeSDKClient`` with
       the channel's resolved cwd and the appropriate ``setting_sources``
       (``["user", "project", "local"]`` if bound, ``["user"]`` if not),
@@ -232,12 +157,9 @@ async def skill_list(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(ephemeral=True)
 
-    # ---- Channel resolution (PRD §Architecture "Channel resolution") ----
-    channel_id = _resolve_channel_id(interaction)
+    channel_id = resolve_channel_id(interaction)
     if channel_id is None:
-        await interaction.followup.send(
-            "❌ This command must be run in a channel.", ephemeral=True
-        )
+        await interaction.followup.send(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
 
     cwd, is_bound = bot.project_manager.get_path_or_default(channel_id)
@@ -246,15 +168,16 @@ async def skill_list(interaction: discord.Interaction) -> None:
     info_err: Exception | None = None
 
     # ---- Path A: piggyback the live bridge if there is one. ----
-    # NOTE: we deliberately touch ``bridge._client`` here. The PRD risk
-    # table (docs/prd/v1.13-skill-list.md §Risks) flags this as private-
-    # attribute access; mitigation is to pin SDK ≥ 0.1.80 and ask
-    # upstream for a public accessor in v1.14.
+    # ``bridge.get_server_info()`` is a cache read of the SDK's
+    # ``_initialization_result``; safe to call concurrently with an
+    # in-flight ``send_message`` stream. We still wrap in a broad
+    # ``except`` because a future SDK refactor could change that —
+    # if it ever raises, Path B handles the cold path.
+    bridge = bot.session_manager.get_session(channel_id)
     try:
-        bridge = bot.session_manager.get_session(channel_id)
-        if bridge is not None and bridge.is_active and bridge._client is not None:
-            info = await bridge._client.get_server_info()
-    except Exception as exc:  # pragma: no cover - defensive; Path B retries
+        if bridge is not None:
+            info = await bridge.get_server_info()
+    except Exception as exc:
         log.debug("Path A get_server_info failed, falling through: %r", exc)
         info = None
 
@@ -263,23 +186,22 @@ async def skill_list(interaction: discord.Interaction) -> None:
         setting_sources = ["user", "project", "local"] if is_bound else ["user"]
         try:
             async with ClaudeSDKClient(
-                ClaudeAgentOptions(cwd=str(cwd), setting_sources=setting_sources)
+                options=ClaudeAgentOptions(
+                    cwd=str(cwd), setting_sources=setting_sources
+                )
             ) as tmp:
                 info = await tmp.get_server_info()
-        except CLINotFoundError as exc:
-            info_err = exc
-        except CLIConnectionError as exc:
-            info_err = exc
-        except Exception as exc:  # noqa: BLE001 — surface any failure as a friendly embed
+        except Exception as exc:  # noqa: BLE001 — any failure → friendly red embed
             info_err = exc
 
     if info_err is not None or info is None:
         if info_err is None:
-            # info is None with no exception — synthetic message preserves the
-            # "type name + value" shape so users see something useful.
-            desc = "`NoServerInfo`: get_server_info() returned None"
+            desc = "Claude CLI returned no command list."
         else:
-            desc = f"`{type(info_err).__name__}`: {info_err}"
+            # Class name only — exception bodies may echo cli_path /
+            # home dirs / env from SDK error strings. Full exception
+            # is in DEBUG logs above for operators.
+            desc = f"`{type(info_err).__name__}`"
         embed = discord.Embed(
             title="❌ Skills unavailable",
             description=desc,
@@ -292,7 +214,7 @@ async def skill_list(interaction: discord.Interaction) -> None:
     commands_list = info.get("commands", []) or []
     groups: dict[str, list[tuple[str, str]]] = {}
     for cmd in commands_list:
-        group, display_name, display_desc = _classify(cmd)
+        group, display_name, display_desc = classify_command(cmd)
         if not group:
             continue
         groups.setdefault(group, []).append((display_name, display_desc))
@@ -303,6 +225,3 @@ async def skill_list(interaction: discord.Interaction) -> None:
         groups, is_bound=is_bound, total_skill_count=total_skill_count
     )
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-__all__ = ["skill_group", "skill_list", "_classify"]

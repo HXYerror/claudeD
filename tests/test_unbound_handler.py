@@ -120,10 +120,11 @@ async def test_reject_if_unbound_uses_followup_when_response_done() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reject_if_unbound_when_channel_is_none_falls_back_to_channel_id() -> None:
-    """DM / cache miss → ``interaction.channel`` is None. Helper must NOT
-    crash with AttributeError; it should consult ``interaction.channel_id``
-    instead.
+async def test_reject_if_unbound_when_channel_is_none_treats_as_dm() -> None:
+    """DM / cache miss → ``interaction.channel`` is None. Per the unified
+    ``resolve_channel_id`` policy (architect R1 #C6), this is treated the
+    same as an explicit ``DMChannel`` and refused with ``NO_CHANNEL_MESSAGE``
+    — ``is_bound`` is never consulted.
     """
     interaction = _make_interaction(channel=None, channel_id=5555)
     bot = _make_bot(is_bound=False)
@@ -131,9 +132,9 @@ async def test_reject_if_unbound_when_channel_is_none_falls_back_to_channel_id()
     result = await reject_if_unbound(interaction, bot)
 
     assert result is True
-    bot.project_manager.is_bound.assert_called_once_with(5555)
+    bot.project_manager.is_bound.assert_not_called()
     interaction.response.send_message.assert_awaited_once_with(
-        UNBOUND_REFUSE_MESSAGE, ephemeral=True
+        NO_CHANNEL_MESSAGE, ephemeral=True
     )
 
 
