@@ -32,6 +32,7 @@ import io
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 import discord
@@ -48,11 +49,63 @@ from .claude_bridge import (
 )
 from claude_agent_sdk.types import StreamEvent
 from .stream_logger import log_event as _log_stream
+from .cogs._table_view import CopyTableTextView
 
 if TYPE_CHECKING:
     from .claude_bridge import ClaudeBridge
 
 log = logging.getLogger("clauded.discord_renderer")
+
+# Pillow defensive fallback (#135 / PRD R6 + acceptance E).
+# If Pillow (or .table_png's other deps) cannot be imported, fall back to the
+# legacy code-fence wrap in ``DiscordRenderer._format_tables`` rather than
+# crashing the renderer. ``PILLOW_AVAILABLE`` is consulted at the top of
+# :meth:`DiscordRenderer._extract_and_render_tables` for a fast-fail.
+try:
+    from .table_png import render_table_png, MAX_COLS, MAX_ROWS, MAX_TABLE_PIXELS
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILLOW_AVAILABLE = False
+    log.warning("Pillow not installed; tables fall back to code-fence rendering")
+
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TableRender:
+    """A markdown table extracted from a renderer buffer for PNG attachment.
+
+    Produced by :meth:`DiscordRenderer._extract_and_render_tables`. Each
+    instance carries the parsed structure plus the rendered PNG bytes and the
+    original markdown source (kept verbatim for the Copy-as-text button).
+
+    Fields
+    ------
+    headers
+        Cell text of the table's header row, one per column.
+    rows
+        Body rows (each a list of cell strings, length matching ``headers``).
+    png_bytes
+        Result of :func:`table_png.render_table_png` — ready to attach to a
+        Discord message via :class:`discord.File`.
+    markdown_source
+        Original markdown table text exactly as it appeared in the input
+        buffer (verbatim, including any leading/trailing whitespace per line).
+        This is the source-of-truth surfaced by the Copy button.
+    placeholder
+        Token inserted into the surrounding text where the table used to be,
+        e.g. ``"\\n[TABLE_PNG_0]\\n"``. Callers split on these to interleave
+        text segments with PNG follow-ups (PRD R2.2 ordering).
+    """
+
+    headers: list[str]
+    rows: list[list[str]]
+    png_bytes: bytes
+    markdown_source: str
+    placeholder: str
 
 # ---------------------------------------------------------------------------
 # Color scheme for embeds
@@ -924,6 +977,87 @@ class DiscordRenderer:
         new_live = await self._safe_send(content=tail + CURSOR) if tail else None
         return new_live, tail
 
+    async def _send_table_renders(
+        self, renders: list[TableRender]
+    ) -> None:
+        """Send each :class:`TableRender` as a follow-up PNG message.
+
+        Each render becomes one Discord message carrying two attachments
+        (``table_N.png`` and ``table_N.md`` sidecar with the verbatim
+        markdown source) plus a :class:`CopyTableTextView`. The view is
+        persistent (``custom_id="copy_table_text"``) — see
+        :mod:`clauded.cogs._table_view` (PRD R3.3).
+
+        After each successful send we point ``_last_msg`` at the new
+        message but reset ``_last_msg_text`` to ``""``. The shadow reset is
+        what prevents the cost-footer splicer from re-writing the previous
+        text body onto this attachment-only message (`current + footer`
+        would otherwise carry the prior chunk's text onto a PNG-only msg).
+        It is NOT about losing the attachment — ``Message.edit(content=…)``
+        does not strip attachments. See #113.
+
+        If a PNG send permanently fails (``_safe_send`` returned ``None``
+        after MAX_HTTP_RETRIES), log an error so the silent drop becomes
+        visible in bot.log (review I2).
+        """
+        for i, render in enumerate(renders):
+            png_file = discord.File(
+                io.BytesIO(render.png_bytes),
+                filename=f"table_{i}.png",
+            )
+            md_file = discord.File(
+                io.BytesIO(render.markdown_source.encode()),
+                filename=f"table_{i}.md",
+            )
+            sent = await self._safe_send(
+                files=[png_file, md_file],
+                view=CopyTableTextView(),
+            )
+            if sent is not None:
+                self._last_msg = sent
+                # Block cost-footer splice of the prior text body onto
+                # this PNG message — see docstring + #113.
+                self._last_msg_text = ""
+            else:
+                log.error(
+                    "Table %d PNG send permanently failed (%d bytes)",
+                    i, len(render.png_bytes),
+                )
+
+    async def _send_text_and_tables(
+        self, text: str, renders: list[TableRender]
+    ) -> None:
+        """Interleave text segments and PNG attachments per PRD R2.2.
+
+        Splits ``text`` on each ``render.placeholder`` token (in order) and
+        alternates ``_safe_send(content=segment)`` with the matching PNG
+        follow-up. Segments are passed through ``_smart_split`` so they
+        still respect ``DISCORD_MAX_LEN``. Empty segments (table at start
+        or back-to-back tables) are skipped — never send a blank message.
+
+        This is the fix for review C1: previously the caller sent ``text``
+        whole then PNGs after, leaking ``[TABLE_PNG_N]`` placeholders into
+        the user-visible message body.
+        """
+        segments = text
+        for render in renders:
+            before, _, segments = segments.partition(render.placeholder)
+            if before.strip():
+                for chunk in self._smart_split(before, limit=DISCORD_MAX_LEN):
+                    sent = await self._safe_send(content=chunk)
+                    if sent is not None:
+                        self._last_msg = sent
+                        self._last_msg_text = chunk
+            # Now the PNG (with its own _last_msg / shadow reset).
+            await self._send_table_renders([render])
+        # Tail after the last placeholder (or all of ``text`` if no renders).
+        if segments.strip():
+            for chunk in self._smart_split(segments, limit=DISCORD_MAX_LEN):
+                sent = await self._safe_send(content=chunk)
+                if sent is not None:
+                    self._last_msg = sent
+                    self._last_msg_text = chunk
+
     async def _finalize_typewriter(
         self, live_msg: discord.Message, buffer: str
     ) -> None:
@@ -935,21 +1069,54 @@ class DiscordRenderer:
         """
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
-        buffer = self._format_tables(buffer)
+        # v1.12 — extract tables → PNG follow-ups (PRD R2). On the first
+        # text-bearing chunk we still drive the typewriter via in-place
+        # edit; if tables exist the remaining text is interleaved with
+        # PNG follow-ups via ``_send_text_and_tables`` (review C1).
+        stripped_text, table_renders = await self._extract_and_render_tables(buffer)
 
-        if len(buffer) <= DISCORD_MAX_LEN:
-            chunks = [buffer]
+        if not table_renders:
+            # Fast path — no tables, pre-table behaviour preserved verbatim.
+            buffer = stripped_text
+            if len(buffer) <= DISCORD_MAX_LEN:
+                chunks = [buffer]
+            else:
+                chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN) or [buffer[:DISCORD_MAX_LEN]]
+
+            first = await self._typewriter_apply(live_msg, chunks[0])
+            if first is not None:
+                self._last_msg = first
+            for chunk in chunks[1:]:
+                sent = await self._safe_send(content=chunk)
+                if sent is not None:
+                    self._last_msg = sent
+            return
+
+        # Interleaved path (PRD R2.2): split ``stripped_text`` on
+        # placeholders. The first text segment (before the first table)
+        # replaces the cursor in ``live_msg``; subsequent segments and PNG
+        # follow-ups are sent fresh. If the first segment is empty (table
+        # at the very start of the buffer), edit the cursor away with the
+        # empty string so the cursor is gone before the PNG arrives.
+        first_seg, _, rest_text = stripped_text.partition(table_renders[0].placeholder)
+        if first_seg.strip():
+            first_chunks = self._smart_split(first_seg, limit=DISCORD_MAX_LEN) or [first_seg[:DISCORD_MAX_LEN]]
         else:
-            chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN) or [buffer[:DISCORD_MAX_LEN]]
-
-        # First chunk replaces the cursor in live_msg (or sends fresh on failure).
-        first = await self._typewriter_apply(live_msg, chunks[0])
+            first_chunks = [""]
+        first = await self._typewriter_apply(live_msg, first_chunks[0])
         if first is not None:
             self._last_msg = first
-        for chunk in chunks[1:]:
+            self._last_msg_text = first_chunks[0]
+        for chunk in first_chunks[1:]:
             sent = await self._safe_send(content=chunk)
             if sent is not None:
                 self._last_msg = sent
+                self._last_msg_text = chunk
+
+        # First PNG, then the rest of the interleave (text-then-PNG pairs +
+        # final tail). ``_send_text_and_tables`` handles the residual.
+        await self._send_table_renders([table_renders[0]])
+        await self._send_text_and_tables(rest_text, table_renders[1:])
 
     async def _flush(
         self,
@@ -964,21 +1131,50 @@ class DiscordRenderer:
         # Process channel/thread management markers before sending.
         if buffer:
             buffer = await self._process_markers(buffer)
-        buffer = self._format_tables(buffer)
 
         if typewriter and live_msg is not None:
+            # ``_finalize_typewriter`` runs its own table extraction so it
+            # can interleave text segments with PNG follow-ups (PRD R2.2).
             await self._finalize_typewriter(live_msg, buffer)
             return
 
+        # Fast-path: split text from tables before send. If buffer is empty
+        # the extractor is a no-op (returns ``("", [])``).
+        stripped_text, table_renders = await self._extract_and_render_tables(buffer)
+
         if buffer:
-            chunks = self._smart_split(buffer, limit=DISCORD_MAX_LEN)
-            # If too many chunks, upload as file instead of flooding
+            # If text after table extraction is still too big for inline
+            # chunks, upload as file — re-splice the markdown sources back
+            # into the upload buffer so the `.md` is self-contained (C3).
+            chunks = self._smart_split(stripped_text, limit=DISCORD_MAX_LEN) if stripped_text else []
             if len(chunks) > 4:
                 import io as _io
-                summary = buffer[:200] + "..." if len(buffer) > 200 else buffer
-                f = discord.File(_io.BytesIO(buffer.encode()), filename="claude-response.md")
+                # Re-splice markdown_source back into the upload .md so the
+                # user-downloadable file doesn't contain ``[TABLE_PNG_N]``
+                # placeholders (review C3).
+                upload_buffer = stripped_text
+                for render in table_renders:
+                    upload_buffer = upload_buffer.replace(
+                        render.placeholder,
+                        "\n" + render.markdown_source + "\n",
+                        1,
+                    )
+                summary = upload_buffer[:200] + "..." if len(upload_buffer) > 200 else upload_buffer
+                f = discord.File(_io.BytesIO(upload_buffer.encode()), filename="claude-response.md")
                 await self._safe_send(content=summary, file=f)
+                # Still send the PNG follow-ups so chat carries the visuals.
+                if table_renders:
+                    await self._send_table_renders(table_renders)
                 return
+
+            # Standard inline path. If tables exist, use the interleaving
+            # helper so placeholders never leak into the user-visible text
+            # (review C1). Otherwise fall through to the legacy chunked send
+            # which knows how to do the long-code-block file upload.
+            if table_renders:
+                await self._send_text_and_tables(stripped_text, table_renders)
+                return
+
             for chunk in chunks:
                 is_file = self._should_upload_as_file(chunk)
                 if is_file:
@@ -992,6 +1188,12 @@ class DiscordRenderer:
                     if is_file:
                         # File-only — no text body for the cost footer to splice.
                         self._last_msg_text = ""
+            return
+
+        # No surrounding text but a table can still exist (e.g., Claude
+        # replied with a bare table) — emit the PNG(s) directly.
+        if table_renders:
+            await self._send_table_renders(table_renders)
             return
 
         # No text buffered. If we never showed *anything* (no text, no tools),
@@ -1122,6 +1324,7 @@ class DiscordRenderer:
         *,
         embed: discord.Embed | None = None,
         file: discord.File | None = None,
+        files: list[discord.File] | None = None,
         view: discord.ui.View | None = None,
     ) -> discord.Message | None:
         """Send a message with retry/backoff on transient HTTP errors.
@@ -1132,8 +1335,19 @@ class DiscordRenderer:
         ``MAX_HTTP_RETRIES`` times with the ``_BACKOFF`` schedule before
         giving up. On giveup with a non-empty ``content``, we log at error
         level so the drop shows up in bot.log.
+
+        ``file`` (single) and ``files`` (list) are mutually exclusive — both
+        map onto ``discord.abc.Messageable.send``'s twin kwargs. The list
+        form is used by #134 to attach a PNG table + ``.md`` sidecar in one
+        message together with a :class:`CopyTableTextView` persistent view.
         """
-        if not content and embed is None and file is None and view is None:
+        if (
+            not content
+            and embed is None
+            and file is None
+            and files is None
+            and view is None
+        ):
             return None
 
         kwargs: dict = {}
@@ -1143,18 +1357,28 @@ class DiscordRenderer:
             kwargs["embed"] = embed
         if file is not None:
             kwargs["file"] = file
+        if files is not None:
+            kwargs["files"] = files
         if view is not None:
             kwargs["view"] = view
 
         def _reset_file() -> None:
-            # Reset file stream between attempts so the second send doesn't
-            # see an empty buffer.
+            # Reset file stream(s) between attempts so the second send
+            # doesn't see an empty buffer.
             f = kwargs.get("file")
             if f is not None and hasattr(f, "fp") and hasattr(f.fp, "seek"):
                 try:
                     f.fp.seek(0)
                 except Exception:
                     pass
+            fs = kwargs.get("files")
+            if fs:
+                for entry in fs:
+                    if hasattr(entry, "fp") and hasattr(entry.fp, "seek"):
+                        try:
+                            entry.fp.seek(0)
+                        except Exception:
+                            pass
 
         async def _op() -> discord.Message | None:
             return await self.target.send(**kwargs)
@@ -1163,7 +1387,9 @@ class DiscordRenderer:
             _op,
             label="send",
             content_len=len(content or ""),
-            between_attempts=_reset_file if "file" in kwargs else None,
+            between_attempts=(
+                _reset_file if ("file" in kwargs or "files" in kwargs) else None
+            ),
         )
         # Only advance the shadow on content-bearing sends. Embed-only and
         # file-only sends do NOT touch _last_msg here — callers that want
@@ -1200,6 +1426,21 @@ class DiscordRenderer:
         """
         kwargs: dict = {}
         if content is not None:
+            # v1.12 bug D-2 — Discord rejects both ``content=""`` AND
+            # ``content=" "`` (single space) with HTTP 400 code 50006
+            # "Cannot send an empty message" — whitespace-only content
+            # is treated as empty by Discord's validator. This bites
+            # the streaming-cursor cleanup path in
+            # ``_finalize_typewriter`` where the buffer is entirely a
+            # table placeholder and the pre-table segment is empty.
+            # Substitute U+200B (zero-width space): Discord accepts it
+            # as non-empty content and it renders invisibly so the
+            # user sees the live_msg as "cleared" rather than
+            # retaining the leaked raw markdown table text alongside
+            # the PNG follow-up (Bug C symptom in the v1.12 smoke run).
+            if not content.strip():
+                log.debug("_safe_edit: empty content; substituting U+200B to clear cursor msg without Discord 50006")
+                content = "\u200b"
             kwargs["content"] = content
         if embed is not None:
             kwargs["embed"] = embed
@@ -1223,12 +1464,18 @@ class DiscordRenderer:
         return result is not None
 
     # ------------------------------------------------------------------
-    # Markdown table → code block conversion
+    # Markdown table → code block conversion (legacy) / PNG extraction
     # ------------------------------------------------------------------
 
     @staticmethod
     def _format_tables(text: str) -> str:
-        """Convert markdown tables to code blocks for Discord.
+        """Legacy: wrap markdown tables in code-fence blocks for Discord.
+
+        Kept as the fallback path for #135 (no-Pillow / missing-font
+        environments) — do not remove. Live callers use
+        :meth:`_extract_and_render_tables` for the PNG path; this method
+        remains the documented escape hatch when PNG rendering is
+        unavailable.
 
         Discord does not render markdown tables, so we wrap them in
         code blocks where at least the column alignment is preserved.
@@ -1281,6 +1528,240 @@ class DiscordRenderer:
             result.append("```")
 
         return "\n".join(result)
+
+    @staticmethod
+    async def _extract_and_render_tables(
+        text: str,
+    ) -> tuple[str, list[TableRender]]:
+        """Extract markdown tables, render to PNG, return placeholders.
+
+        Walks ``text`` line-by-line. Each *well-formed* markdown table is
+        replaced in the returned text with a unique placeholder
+        ``\\n[TABLE_PNG_N]\\n`` and yields a :class:`TableRender` carrying
+        headers/rows/png_bytes/markdown_source.
+
+        Two table shapes are accepted (≥2 columns, not inside a ``` code
+        fence, ≥1 data row in both cases):
+
+        1. **Strict GFM**: header + ``|---|---|`` separator + data rows.
+        2. **Relaxed (no separator)**: header followed directly by data
+           rows where the first data row has the same cell count as the
+           header. Claude's SDK frequently emits tables without a
+           separator row, so the relaxed shape catches production output
+           that the strict matcher would otherwise drop into the legacy
+           code-fence fallback path. On the relaxed path a synthetic
+           ``|---|...|`` line is spliced into ``markdown_source`` only
+           (so the ``.md`` sidecar stays GFM-valid); the PNG renderer
+           and the verbatim-fallback paths see exactly the original
+           input lines.
+
+        - ``headers`` / ``rows`` — parsed cell strings (pipe-stripped, trimmed)
+        - ``png_bytes`` — output of :func:`table_png.render_table_png`
+        - ``markdown_source`` — original verbatim block of lines that formed
+          the table (for the Copy-as-text button)
+        - ``placeholder`` — the same token inserted into the returned text
+
+        Returns ``(text_with_placeholders, [TableRender, ...])``. If no
+        tables are found, returns ``(text, [])`` unchanged.
+
+        PNG generation is dispatched through :func:`asyncio.to_thread` so
+        the renderer's heartbeat-bound event loop is never blocked on the
+        Pillow draw + PNG-encode CPU burst (review I3).
+
+        Edge cases (per PRD R1.4 / R6):
+
+        - Tables inside ``` code fences → left verbatim, no TableRender.
+        - Single-column tables (``| Header |``) → re-emitted verbatim.
+        - Header-only tables (separator present but no data rows) → verbatim.
+        - Header line with no following ``|...|`` line → verbatim.
+        - Header + non-separator next row with mismatched cell count → verbatim.
+        - PNG render failure (Pillow error, oversize → ``ValueError``) →
+          original lines re-emitted verbatim, error logged (review C2).
+
+        TODO(v1.13): support border-less GFM tables (no leading/trailing
+        pipe). Currently the line must satisfy ``startswith("|") and
+        endswith("|")``; Claude sometimes emits ``Name | Score`` form
+        (review I5).
+        """
+        # Pillow defensive fallback (#135 / PRD R6 + acceptance E).
+        # If the import at module load failed, we never had a working PNG
+        # path — return the legacy code-fence formatting and an empty
+        # render list. Caller branches on ``not renders`` and continues
+        # down its no-table path (no PNG follow-ups will be attempted).
+        if not PILLOW_AVAILABLE:
+            return DiscordRenderer._format_tables(text), []
+
+        lines_in = text.split("\n")
+        result: list[str] = []
+        renders: list[TableRender] = []
+        # v1.12 bug D — fence depth tracker per CommonMark §4.5. A fence
+        # opens with N≥3 consecutive backticks and only closes on a line
+        # whose backtick run length is ≥N. Tracking just a bool with
+        # ``startswith("```")`` mis-parsed quad-backtick outer fences:
+        # the inner ``\u0060\u0060\u0060`` line was treated as a fence
+        # toggle and the markdown table inside leaked back out to PNG
+        # extraction, violating PRD R5 (code fences preserved verbatim).
+        fence_count = 0  # 0 ⇒ not in a fence; otherwise the opener's backtick run
+        i = 0
+        n = len(lines_in)
+
+        def _is_table_line(s: str) -> bool:
+            return s.startswith("|") and s.endswith("|")
+
+        def _leading_backtick_run(s: str) -> int:
+            """Return the count of leading backticks on ``s`` (already stripped)."""
+            j = 0
+            while j < len(s) and s[j] == "`":
+                j += 1
+            return j
+
+        def _is_separator_line(s: str) -> bool:
+            # e.g. ``|---|---|`` or ``| :--- | ---: |`` — only ``|``, ``-``,
+            # ``:`` and spaces, and at least one ``-``.
+            inner = s.strip("|").strip()
+            if not inner or "-" not in inner:
+                return False
+            return all(c in "|-: " for c in s)
+
+        def _split_cells(s: str) -> list[str]:
+            # Strip leading/trailing pipes, then split. Empty cells preserved.
+            body = s
+            if body.startswith("|"):
+                body = body[1:]
+            if body.endswith("|"):
+                body = body[:-1]
+            return [c.strip() for c in body.split("|")]
+
+        while i < n:
+            line = lines_in[i]
+            stripped = line.strip()
+
+            # Track code fences first — anything inside is opaque.
+            # CommonMark §4.5: a fence opens with N≥3 consecutive backticks
+            # at line start; it only closes on a line whose backtick run
+            # length is ≥N (so a ``\u0060\u0060\u0060\u0060`` outer fence
+            # is NOT closed by an inner ``\u0060\u0060\u0060``). v1.12
+            # bug D — see comment block above.
+            ticks = _leading_backtick_run(stripped)
+            if fence_count == 0:
+                if ticks >= 3:
+                    fence_count = ticks
+                    result.append(line)
+                    i += 1
+                    continue
+            else:
+                # Currently inside a fence — only a ≥fence_count run closes it.
+                if ticks >= fence_count:
+                    fence_count = 0
+                result.append(line)
+                i += 1
+                continue
+
+            if not _is_table_line(stripped):
+                result.append(line)
+                i += 1
+                continue
+
+            # Candidate header. Two accepted shapes:
+            #   1. Strict GFM: header + ``|---|---|`` separator + ≥1 row.
+            #   2. Relaxed: header followed directly by another ``|...|``
+            #      row with matching cell count (Claude SDK frequently emits
+            #      tables without a separator row). On the relaxed path we
+            #      synthesize a ``|---|...|`` separator solely for
+            #      ``markdown_source`` so the ``.md`` sidecar stays
+            #      GFM-valid; the PNG renderer only ever sees headers+rows.
+            header_line = line
+            header_stripped = stripped
+            j = i + 1
+
+            if j >= n or not _is_table_line(lines_in[j].strip()):
+                # No next table-shaped line — not a table.
+                result.append(header_line)
+                i += 1
+                continue
+
+            next_stripped = lines_in[j].strip()
+            sep_synthesized = False
+            if _is_separator_line(next_stripped):
+                # Strict path — separator row consumes lines_in[j].
+                sep_line = lines_in[j]
+                k = j + 1
+            else:
+                # Relaxed path — no separator row. Require matching cell
+                # count between header and the candidate first data row;
+                # otherwise this is not a table and we fall back verbatim.
+                header_cells = len(_split_cells(header_stripped))
+                next_cells = len(_split_cells(next_stripped))
+                if header_cells != next_cells:
+                    result.append(header_line)
+                    i += 1
+                    continue
+                # Synthesize a GFM separator for ``markdown_source`` only.
+                sep_line = "|" + "|".join(["---"] * header_cells) + "|"
+                sep_synthesized = True
+                # First data row is lines_in[j] — do NOT skip it.
+                k = j
+
+            # Collect contiguous data rows.
+            data_lines: list[str] = []
+            while k < n:
+                ds = lines_in[k].strip()
+                if not _is_table_line(ds) or _is_separator_line(ds):
+                    break
+                data_lines.append(lines_in[k])
+                k += 1
+
+            headers = _split_cells(header_stripped)
+            rows = [_split_cells(dl.strip()) for dl in data_lines]
+
+            # PRD R1.4 — single-column / header-only → emit verbatim.
+            # Only emit ``sep_line`` if it actually came from the input
+            # (strict path); the relaxed path synthesizes it for the
+            # markdown_source sidecar only and must not leak into output.
+            if len(headers) < 2 or not rows:
+                result.append(header_line)
+                if not sep_synthesized:
+                    result.append(sep_line)
+                for dl in data_lines:
+                    result.append(dl)
+                i = k
+                continue
+
+            # Well-formed table — render PNG (off the event loop), then
+            # replace with placeholder. On any render failure (Pillow OOM,
+            # oversize guard, font corruption), emit the original lines
+            # verbatim so the user never silently loses a table block.
+            try:
+                png = await asyncio.to_thread(render_table_png, headers, rows)
+            except Exception:
+                log.exception(
+                    "PNG render failed for table %d; emitting verbatim",
+                    len(renders),
+                )
+                result.append(header_line)
+                if not sep_synthesized:
+                    result.append(sep_line)
+                result.extend(data_lines)
+                i = k
+                continue
+
+            markdown_source = "\n".join(
+                [header_line, sep_line, *data_lines]
+            )
+            placeholder = f"\n[TABLE_PNG_{len(renders)}]\n"
+            renders.append(
+                TableRender(
+                    headers=headers,
+                    rows=rows,
+                    png_bytes=png,
+                    markdown_source=markdown_source,
+                    placeholder=placeholder,
+                )
+            )
+            result.append(placeholder)
+            i = k
+
+        return "\n".join(result), renders
 
 
     # ------------------------------------------------------------------

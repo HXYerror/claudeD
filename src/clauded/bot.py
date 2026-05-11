@@ -30,6 +30,7 @@ from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
 from .cogs._unbound import UNBOUND_HINT_MESSAGE
+from .cogs._table_view import CopyTableTextView
 
 # Re-export SystemPromptModal so existing ``from clauded.bot import
 # SystemPromptModal`` continues to work (tests rely on this).
@@ -139,6 +140,20 @@ class ClaudedBot(commands.Bot):
         except Exception:
             self._claude_version = "unknown"
         self._cleanup_task.start()
+
+        # PRD R3.3 — register the persistent Copy-as-text button view so
+        # the button keeps working after a bot restart.
+        #
+        # Why both registrations:
+        # - This ``add_view(CopyTableTextView())`` at startup registers a
+        #   global handler for ``custom_id="copy_table_text"`` so clicks
+        #   are dispatched even on messages whose original view object is
+        #   long gone (post-restart).
+        # - ``DiscordRenderer._send_table_renders`` also instantiates a
+        #   fresh ``CopyTableTextView()`` on each PNG send, because
+        #   discord.py needs a view object on the initial send to inject
+        #   the button components into the Discord message.
+        self.add_view(CopyTableTextView())
 
         # ----- Import command objects from cog modules -----
         from .cogs.project import project_group, env_group
@@ -301,14 +316,37 @@ class ClaudedBot(commands.Bot):
             except discord.HTTPException:
                 log.debug("Could not surface thread-permission error to channel")
             return
-        except discord.HTTPException:
-            log.exception("Failed to create thread for channel=%s", channel.id)
-            try:
-                if not is_forum:
-                    await channel.send("❌ Failed to create a thread for this message.")
-            except discord.HTTPException:
-                log.debug("Could not surface thread-creation error to channel")
-            return
+        except discord.HTTPException as e:
+            # Discord gateway can duplicate MESSAGE_CREATE → on_message runs
+            # twice → the second ``message.create_thread`` raises 160004
+            # ("a thread has already been created for this message"). The
+            # winning race already created the thread; we just need to
+            # re-fetch the message to see it and reuse it. Forum-channel
+            # thread creation goes through a different path and isn't
+            # subject to this race, so we only handle 160004 here.
+            if getattr(e, "code", None) == 160004 and not is_forum:
+                try:
+                    message = await channel.fetch_message(message.id)
+                except discord.HTTPException:
+                    log.exception("Could not refetch after thread-race")
+                    return
+                if message.thread is not None:
+                    log.info(
+                        "Thread-race: reusing existing thread %d",
+                        message.thread.id,
+                    )
+                    thread = message.thread
+                else:
+                    log.warning("160004 reported but message.thread is None")
+                    return
+            else:
+                log.exception("Failed to create thread for channel=%s", channel.id)
+                try:
+                    if not is_forum:
+                        await channel.send("❌ Failed to create a thread for this message.")
+                except discord.HTTPException:
+                    log.debug("Could not surface thread-creation error to channel")
+                return
 
         # First-time unbound hint, posted before the bridge starts streaming.
         if not is_bound and self.project_manager.should_hint_unbound(channel.id):
