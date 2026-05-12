@@ -957,14 +957,49 @@ class DiscordRenderer:
                             if tool_log_msg is not None:
                                 # Update rolling tool log
                                 status = "✅" if not is_err else "❌"
+                                # #161 bonus bug fix: WebSearch / WebFetch emit
+                                # rolling-log lines that start with "🔄 🔍" /
+                                # "🔄 🌐" (tool-specific emoji between marker and
+                                # content). The original ``startswith("🔄 " + name)``
+                                # never matched those, so the status emoji stuck
+                                # at 🔄 forever. Use a tolerant match: any line
+                                # starting with 🔄 (any line not yet completed)
+                                # AND containing the name OR its tool-specific
+                                # emoji.
+                                tool_marker_aliases = {
+                                    "WebSearch": "🔍",
+                                    "WebFetch": "🌐",
+                                }
+                                alias = tool_marker_aliases.get(name, "")
                                 for i in range(len(tool_log_lines) - 1, -1, -1):
-                                    if tool_log_lines[i].startswith("🔄 " + name):
-                                        if is_err:
-                                            error_text = str(block.content)[:100] if block.content else "Failed"
-                                            tool_log_lines[i] = f"{status} {name}: {error_text}"
-                                        else:
-                                            tool_log_lines[i] = f"{status} {name}"
-                                        break
+                                    line = tool_log_lines[i]
+                                    if not line.startswith("🔄 "):
+                                        continue
+                                    matches_name = line.startswith("🔄 " + name)
+                                    matches_alias = alias and line.startswith("🔄 " + alias)
+                                    if not (matches_name or matches_alias):
+                                        continue
+                                    # #161 short tier: when result is short and
+                                    # single-line, surface it inline so user
+                                    # sees ``✅ Bash → 42`` instead of bare ✅ Bash.
+                                    # Per PRD: < 200 chars and no newlines.
+                                    content_str = str(block.content) if block.content else ""
+                                    is_short = (
+                                        len(content_str) < 200
+                                        and "\n" not in content_str
+                                        and content_str.strip() != ""
+                                    )
+                                    if is_err:
+                                        error_text = content_str[:100] if content_str else "Failed"
+                                        tool_log_lines[i] = f"{status} {name}: {error_text}"
+                                    elif is_short:
+                                        # Strip backticks to avoid breaking the
+                                        # rolling-log embed's markdown.
+                                        safe = content_str.strip().replace("`", "'")
+                                        tool_log_lines[i] = f"{status} {name} → {safe}"
+                                    else:
+                                        tool_log_lines[i] = f"{status} {name}"
+                                    break
                                 has_errors = any("❌" in l for l in tool_log_lines)
                                 tool_embed = discord.Embed(
                                     title="🔧 Tool Activity",
