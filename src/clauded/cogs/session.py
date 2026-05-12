@@ -83,14 +83,9 @@ async def session_clear(interaction: discord.Interaction) -> None:
         )
         return
 
-    # Stop the live bridge first so save_session_state during teardown
-    # doesn't re-persist the entry we're about to delete.
-    had_active = await bot.session_manager.stop_session(thread_id)
-
-    # Drop the persisted resume entry. session_store.remove_session is a
-    # no-op when no entry exists, so safe to call unconditionally.
-    had_stored = bot.session_manager.get_stored_session(thread_id) is not None
-    bot.session_manager._session_store.remove_session(thread_id)
+    # Atomic clear: holds the per-thread lock around stop + remove so a
+    # concurrent /session resume (which also takes the lock) can't race in.
+    had_active, had_stored = await bot.session_manager.clear_session(thread_id)
 
     if had_active or had_stored:
         await interaction.response.send_message(

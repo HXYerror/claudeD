@@ -105,6 +105,29 @@ class SessionManager:
         """Return persisted session metadata for ``thread_id``, or ``None``."""
         return self._session_store.get_session_info(thread_id)
 
+    async def clear_session(self, thread_id: int) -> tuple[bool, bool]:
+        """Tear down live bridge AND drop persisted resume entry atomically.
+
+        Used by ``/session clear`` (#163 sub-task 2). Holds the per-thread
+        lock for the entire stop+remove sequence so a concurrent
+        ``/session resume`` (which also takes the lock) can't race in and
+        re-persist the session between our stop and remove calls.
+
+        Returns a ``(had_active, had_stored)`` tuple so the caller can
+        choose between a success embed and a 'no session to clear'
+        message without re-querying after the side effect.
+        """
+        async with self.get_lock(thread_id):
+            had_stored = self._session_store.get_session_info(thread_id) is not None
+            bridge = self._sessions.pop(thread_id, None)
+            had_active = bridge is not None
+            if bridge is not None:
+                await bridge.stop()
+            # Remove AFTER stop so save_session_state during teardown can't
+            # re-persist what we're about to delete.
+            self._session_store.remove_session(thread_id)
+            return had_active, had_stored
+
     def list_sessions(self) -> dict[int, ClaudeBridge]:
         """Return a snapshot of all active sessions."""
         return dict(self._sessions)

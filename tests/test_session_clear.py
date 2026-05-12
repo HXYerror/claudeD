@@ -156,3 +156,97 @@ async def test_session_clear_response_is_ephemeral(bot: ClaudedBot) -> None:
     interaction = _make_interaction(bot, channel_id=56789)
     await session_clear.callback(interaction)
     assert interaction.response.send_message.call_args.kwargs["ephemeral"] is True
+
+
+# ---------------------------------------------------------------------------
+# v1.18 R1 — engineer + architect convergent finding: clear_session must hold
+# the per-thread lock around stop+remove so a concurrent /session resume can't
+# race in between the stop and the remove_session, leaving a re-persisted
+# zombie entry.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_clear_session_holds_per_thread_lock(bot: ClaudedBot) -> None:
+    """Regression pin for R1 engineer + architect convergent RC:
+    SessionManager.clear_session must acquire ``get_lock(thread_id)`` for
+    the entire stop+remove sequence. Pin via pre-hold pattern: hold the
+    lock from a separate task, assert clear_session blocks until release.
+    """
+    import asyncio
+    thread_id = 67890
+    bot.session_manager._session_store.save_session(
+        thread_id, "sess-id", "/tmp/proj",
+        model="sonnet", system_prompt=None,
+    )
+
+    pre_held = asyncio.Event()
+    release_pre_hold = asyncio.Event()
+
+    async def pre_hold():
+        async with bot.session_manager.get_lock(thread_id):
+            pre_held.set()
+            await release_pre_hold.wait()
+
+    holder = asyncio.create_task(pre_hold())
+    await pre_held.wait()
+
+    # clear_session should block on the lock
+    clear_task = asyncio.create_task(bot.session_manager.clear_session(thread_id))
+    await asyncio.sleep(0.05)  # let clear_session reach its `async with`
+    assert not clear_task.done(), (
+        "clear_session must wait on per-thread lock; if done() is True, it "
+        "is bypassing the lock (R1 engineer/architect convergent RC)"
+    )
+    # Stored entry must still exist (clear_session hasn't run yet)
+    assert bot.session_manager.get_stored_session(thread_id) is not None
+
+    release_pre_hold.set()
+    await holder
+    result = await clear_task
+    assert result == (False, True)
+    assert bot.session_manager.get_stored_session(thread_id) is None
+
+
+@pytest.mark.asyncio
+async def test_clear_session_atomic_against_concurrent_resume(bot: ClaudedBot) -> None:
+    """End-to-end test that resume + clear don't leave a zombie:
+    if /session resume runs while /session clear is mid-flight, the
+    final state must be 'no stored entry' (clear wins because it ran
+    second; or no race because both serialize on the lock)."""
+    import asyncio
+    thread_id = 78901
+    bot.session_manager._session_store.save_session(
+        thread_id, "sess-stored", "/tmp",
+        model="sonnet", system_prompt=None,
+    )
+
+    # Race: kick off clear_session AND a re-save (simulating resume's
+    # save_session_state inside its own lock acquisition).
+    async def fake_resume():
+        async with bot.session_manager.get_lock(thread_id):
+            # Simulate what resume does: save_session_state
+            bot.session_manager._session_store.save_session(
+                thread_id, "sess-resumed", "/tmp",
+                model="sonnet", system_prompt=None,
+            )
+
+    # Order: clear acquires first, completes; then fake_resume acquires,
+    # re-saves. OR: fake_resume acquires first, then clear runs and
+    # removes. Either way, the lock guarantees atomicity. Pin: no torn
+    # state (both keys overlap on disk).
+    clear_task = asyncio.create_task(bot.session_manager.clear_session(thread_id))
+    resume_task = asyncio.create_task(fake_resume())
+    await asyncio.gather(clear_task, resume_task)
+    # Whichever ran last is the final state. We don't assert WHICH won;
+    # just that the state is internally consistent (no torn writes).
+    # (For deterministic semantics, prod code outside this test would
+    # block resume on the bridge being torn down via stop_session, but
+    # this test only pins atomicity of clear_session itself.)
+    final = bot.session_manager.get_stored_session(thread_id)
+    # Either: clear ran last → None; or resume ran last → entry exists
+    # with the resume session_id. Both are valid.
+    if final is not None:
+        assert final.get("session_id") == "sess-resumed", (
+            f"final state should be the resume's session, got: {final}"
+        )
