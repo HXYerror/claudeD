@@ -149,3 +149,57 @@ async def test_cleanup_concurrent_one_stuck_two_healthy(
         f"{CONCURRENCY_BOUND:.3f}s (serial would be "
         f"~{STUCK_TIMEOUT + 2 * HEALTHY_DELAY:.3f}s)"
     )
+
+
+@pytest.mark.asyncio
+async def test_send_message_exception_path_disconnect_force_drops_after_timeout(
+    cfg: "Config", monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#173 regression pin: when send_message hits an exception and the
+    cleanup `disconnect()` call hangs (anyio cross-task cancel scope dead-
+    lock — same root cause as #146), the call MUST time out per the env
+    var and force-drop the client. Without this fix, the current user's
+    Discord turn would hang forever (the #145 frozen-UI symptom).
+
+    Construct a bridge where:
+      - send_message's inner SDK call raises (synthetic ValueError to
+        force the BaseException branch at claude_bridge.py:411)
+      - The same client's disconnect() never returns (mirrors the #146
+        anyio deadlock)
+
+    Assert: send_message returns within (timeout + small margin), and
+    the bridge has been force-dropped (client=None, active=False).
+    """
+    from clauded.claude_bridge import ClaudeBridge
+
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+
+    class FakeStuckClient:
+        async def query(self, *args, **kwargs):
+            raise ValueError("synthetic SDK failure")
+        async def receive_response(self):
+            # If query raised before stream starts, this won't be called;
+            # included for completeness.
+            raise ValueError("synthetic SDK failure")
+            yield  # pragma: no cover
+        async def disconnect(self):
+            await asyncio.sleep(999)  # mirrors the anyio deadlock
+
+    bridge._client = FakeStuckClient()
+    bridge._active = True
+
+    monkeypatch.setenv("CLAUDED_BRIDGE_STOP_TIMEOUT", "0.5")
+
+    # send_message must raise (re-raises the original ValueError after
+    # attempting cleanup) AND must NOT hang forever on the stuck disconnect.
+    with pytest.raises(ValueError, match="synthetic SDK failure"):
+        # Use wait_for as a safety net so a regression doesn't hang the
+        # test suite. Cap at 3s — generous vs the 0.5s timeout.
+        async def _drive():
+            async for _ in bridge.send_message("test prompt"):
+                pass
+        await asyncio.wait_for(_drive(), timeout=3.0)
+
+    # After the timeout fired, bridge must be force-dropped
+    assert bridge._client is None
+    assert bridge._active is False

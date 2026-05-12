@@ -403,12 +403,27 @@ class ClaudeBridge:
         except BaseException:
             self._active = False
             # Best-effort disconnect; if it fails, we still re-raise the
-            # original exception is what callers care about.
+            # original exception which is what callers care about.
+            #
+            # #173 fix: wrap ``disconnect()`` in ``asyncio.wait_for(timeout)``
+            # matching the ``stop()`` path's protection (#146). The SDK's
+            # ``disconnect()`` can deadlock on anyio cross-task cancel scope
+            # (verified upstream). Without the timeout, this exception path
+            # would hang the current user's Discord turn forever — the same
+            # frozen-UI symptom that #145 documented. We reuse the same env
+            # var so operators only tune one knob.
             client = self._client
             self._client = None
             if client is not None:
+                timeout = float(os.environ.get("CLAUDED_BRIDGE_STOP_TIMEOUT", "30"))
                 try:
-                    await client.disconnect()
+                    await asyncio.wait_for(client.disconnect(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "send_message error-path disconnect timed out after %ss; "
+                        "force-dropping (subprocess may leak)",
+                        timeout,
+                    )
                 except Exception:  # pragma: no cover - defensive
                     log.exception(
                         "Error disconnecting ClaudeSDKClient after stream failure"
