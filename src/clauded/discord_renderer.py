@@ -966,6 +966,19 @@ class DiscordRenderer:
                                 # starting with 🔄 (any line not yet completed)
                                 # AND containing the name OR its tool-specific
                                 # emoji.
+                                #
+                                # Audit of all rolling-log append sites at
+                                # _tool_log_lines.append(...) confirms the
+                                # following tools need alias entries (only those
+                                # whose append format inserts a glyph between
+                                # "🔄 " and the tool name):
+                                #   - WebSearch → "🔄 🔍 {query}"
+                                #   - WebFetch  → "🔄 🌐 {url}"
+                                # All other tools (Bash, Read, Write, Edit, Grep,
+                                # Glob, Skill, fallback) append as
+                                # "🔄 {name}: …" so direct match already works.
+                                # If a future tool adds emoji-prefix shape, add
+                                # it here and to test_tool_result_shorttier.py.
                                 tool_marker_aliases = {
                                     "WebSearch": "🔍",
                                     "WebFetch": "🌐",
