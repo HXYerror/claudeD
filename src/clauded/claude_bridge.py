@@ -166,6 +166,24 @@ class ClaudeBridge:
             return None
         return await client.get_server_info()
 
+    async def get_context_usage(self) -> dict | None:
+        """Return current context-window usage, or ``None`` if not connected.
+
+        Public wrapper for ``_client.get_context_usage()`` (added in v1.18
+        for ``/context`` slash command, #163 sub-task 3). Like
+        ``get_server_info``, this keeps callers out of the bridge's private
+        state.
+
+        Unlike ``get_server_info`` (which is a cached init-result read),
+        ``get_context_usage`` makes an actual SDK request to compute current
+        token counts. It's safe to invoke alongside an active ``send_message``
+        stream, but the call may be slower (~tens of ms).
+        """
+        client = self._client
+        if client is None or not self._active:
+            return None
+        return await client.get_context_usage()
+
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT
