@@ -1221,6 +1221,7 @@ class DiscordRenderer:
                                     and self._bot is not None
                                     and tool_log_msg is not None
                                 ):
+                                    add_view_failed = False
                                     try:
                                         self._bot.add_view(
                                             tool_results_view,
@@ -1230,6 +1231,31 @@ class DiscordRenderer:
                                         log.exception(
                                             "Failed to register ToolResultsView "
                                             "for persistence"
+                                        )
+                                        add_view_failed = True
+                                    # R1 engineer: if add_view raised, the
+                                    # rolling-log line still promises
+                                    # ``click to view`` but Discord won't
+                                    # route the click anywhere. Downgrade
+                                    # the line + refresh embed so the user
+                                    # isn't lied to.
+                                    if add_view_failed and is_medium and tool_id:
+                                        for j in range(len(tool_log_lines) - 1, -1, -1):
+                                            line = tool_log_lines[j]
+                                            if line.startswith(f"{status} {name}:") and "click to view" in line:
+                                                tool_log_lines[j] = (
+                                                    f"{status} {name}: "
+                                                    f"{len(content_str)} chars "
+                                                    f"(view registration failed)"
+                                                )
+                                                break
+                                        refresh_embed = discord.Embed(
+                                            title="🔧 Tool Activity",
+                                            description="\n".join(tool_log_lines[-15:]),
+                                            color=COLOR_TOOL_SUCCESS,
+                                        )
+                                        await self._safe_edit(
+                                            tool_log_msg, embed=refresh_embed
                                         )
                                 if not edit_ok and is_medium and not is_err and tool_id:
                                     # Edit failed permanently (rate-limit /

@@ -677,3 +677,104 @@ async def test_medium_tier_registers_view_via_bot_add_view():
     assert isinstance(view, ToolResultsView), f"Expected ToolResultsView; got {type(view).__name__}"
     assert msg_id is not None, "add_view must be called with message_id= to scope the persistence"
     assert msg_id > 0
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_downgrades_log_when_add_view_raises():
+    """R1 engineer mitigation: if bot.add_view raises (e.g.
+    timeout != None contract violation regression, or any other
+    discord.py ValueError), the rolling-log line MUST be downgraded
+    so the user doesn't see `⬇ click to view` pointing at a dead
+    button."""
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self, msg_id=999):
+            self.id = msg_id
+            self.content = ""
+            self.embeds = []
+            self.attached_view = None
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._next_id = 90000
+        async def send(self, *args, **kwargs):
+            self._next_id += 1
+            msg = FakeMessage(msg_id=self._next_id)
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
+            self._sent.append(msg)
+            return msg
+
+    class FailingAddViewBot:
+        def add_view(self, view, *, message_id=None):
+            raise ValueError("synthetic: View is not persistent")
+
+    medium_content = "\n".join(f"line {i}" for i in range(30))
+
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-x",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    bot = FailingAddViewBot()
+    renderer = DiscordRenderer(target, bot=bot)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls")
+
+    rolling = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
+    ]
+    assert rolling
+    final_desc = rolling[-1].embeds[0].description
+    # MUST NOT promise click; MUST signal failure
+    assert "click to view" not in final_desc, (
+        f"After add_view failure, rolling log MUST NOT promise click; got: {final_desc!r}"
+    )
+    assert "view registration failed" in final_desc, (
+        f"Expected explicit 'view registration failed' downgrade; got: {final_desc!r}"
+    )
