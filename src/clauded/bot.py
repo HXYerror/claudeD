@@ -578,7 +578,7 @@ class ClaudedBot(commands.Bot):
                 user_text = user_text.replace(message.content, content) if message.content else user_text
             else:
                 user_text = content
-            renderer = DiscordRenderer(thread)
+            renderer = DiscordRenderer(thread, bot=self)
             cost_before = bridge.total_cost if bridge else 0.0
             _render_ok = False
             try:
@@ -714,7 +714,7 @@ class ClaudedBot(commands.Bot):
                 pass
 
             user_text, tmp_dir = await self._compose_user_text(message)
-            renderer = DiscordRenderer(message.channel)
+            renderer = DiscordRenderer(message.channel, bot=self)
             cost_before = bridge.total_cost if bridge else 0.0
             _render_ok = False
             try:
@@ -976,7 +976,7 @@ class ClaudedBot(commands.Bot):
                         # blip; on permanent failure we silently drop.
                         await safe_send_message(thread, embed=err_embed)
                         return
-                    new_renderer = DiscordRenderer(thread)
+                    new_renderer = DiscordRenderer(thread, bot=self)
                     await self._render_with_retry(
                         renderer=new_renderer,
                         bridge=new_bridge,

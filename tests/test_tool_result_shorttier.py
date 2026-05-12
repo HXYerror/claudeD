@@ -59,8 +59,13 @@ def test_bash_grep_glob_read_still_match_directly():
 
 
 def test_short_result_inline_arrow_display():
-    """When result content is short (<200 chars), single-line, non-empty,
-    rolling log renders ``✅ {name} → {content}`` instead of bare ``✅ {name}``.
+    """When result content is short (<200 chars), non-empty, rolling log
+    renders ``✅ {name} → {content}`` instead of bare ``✅ {name}``.
+
+    v1.18 R3 (user feedback): multiline short outputs are NO LONGER
+    excluded — they collapse to ``line1 │ line2 │ line3`` so a `ls`
+    that prints 3 file names still shows the actual file names inline
+    instead of disappearing into a bare ✅.
 
     Pure-string logic test — the production code in render_response is
     integration-tested elsewhere; this pins the threshold semantics.
@@ -70,27 +75,29 @@ def test_short_result_inline_arrow_display():
         return (
             content is not None
             and len(content) < 200
-            and "\n" not in content
             and content.strip() != ""
         )
 
     assert should_inline("42")                # tiny ✅
     assert should_inline("Found 7 matches")   # short prose ✅
     assert should_inline("x" * 199)           # boundary
+    assert should_inline("line1\nline2")      # multiline short ✅ (new in R3)
+    assert should_inline("a\nb\nc")           # 3 lines short ✅
     assert not should_inline("x" * 200)       # over threshold
-    assert not should_inline("line1\nline2")  # multiline excluded
     assert not should_inline("")              # empty excluded
     assert not should_inline("   \t")         # whitespace-only excluded
     assert not should_inline(None)            # None excluded
 
 
-def test_short_result_backtick_escape():
-    """Inline display strips backticks from content to avoid breaking the
-    rolling-log embed's markdown rendering."""
-    raw = "result with `backticks` inside"
-    safe = raw.strip().replace("`", "'")
+def test_short_result_backtick_escape_and_newline_collapse():
+    """Inline display: backticks → single-quotes (avoids markdown break)
+    AND newlines → ``│`` separator (keeps multiline outputs on one log
+    line, v1.18 R3 user feedback)."""
+    raw = "result with `backticks`\nand a newline"
+    safe = raw.strip().replace("`", "'").replace("\n", " │ ")
     assert "`" not in safe
-    assert safe == "result with 'backticks' inside"
+    assert "\n" not in safe
+    assert safe == "result with 'backticks' │ and a newline"
 
 
 def test_skill_and_fallback_rolling_log_match():
@@ -434,16 +441,15 @@ def test_medium_tier_error_path_does_not_emit_detail_message():
     )
 
 
-def test_multiline_short_content_falls_to_bare_branch():
-    """Content < 200 chars but multiline goes to the bare ``✅ Bash`` branch
-    (not short, not medium). User sees `✅ Bash` with no inline arrow.
-    Architectural choice: multiline short outputs are visually awkward
-    inline; user can run the tool again with more flags if they want detail.
-    """
+def test_multiline_short_content_inlines_with_separator():
+    """v1.18 R3 (user feedback): content < 200 chars with multiline now
+    inlines with ``│`` separator instead of falling to bare ``✅ Bash``.
+    Architectural choice: short multi-line outputs (3-file ``ls``,
+    7-match ``grep``) are useful to see; the separator keeps the rolling
+    log compact."""
     def is_short(content):
         return (
             len(content) < 200
-            and "\n" not in content
             and content.strip() != ""
         )
     def is_medium(content, is_err=False, is_short_val=False):
@@ -453,14 +459,17 @@ def test_multiline_short_content_falls_to_bare_branch():
             and 200 <= len(content) < 8000
             and content.strip() != ""
         )
-    multiline_short = "line 1\nline 2\nline 3"  # 20 chars but multiline
+    multiline_short = "line 1\nline 2\nline 3"  # 20 chars, multiline
     assert len(multiline_short) < 200
     assert "\n" in multiline_short
     short_result = is_short(multiline_short)
     medium_result = is_medium(multiline_short, is_short_val=short_result)
-    assert not short_result, "multiline short content must NOT match short tier"
-    assert not medium_result, "multiline short content must NOT match medium tier (len<200)"
-    # → falls through to bare `✅ Bash` (the else branch)
+    assert short_result, "multiline short content MUST now match short tier (R3)"
+    assert not medium_result, "multiline short content excluded from medium tier (handled by short)"
+    # Verify separator collapse
+    rendered = multiline_short.replace("`", "'").replace("\n", " │ ")
+    assert "\n" not in rendered
+    assert rendered == "line 1 │ line 2 │ line 3"
 
 
 @pytest.mark.asyncio
@@ -555,11 +564,217 @@ async def test_toolresults_view_rejects_non_author_click():
     assert kwargs.get("ephemeral") is True
 
 
-def test_toolresults_view_has_finite_default_timeout():
-    """R1 architect: persistent views (timeout=None) accumulate over
-    long bot uptimes since discord.py never garbage-collects them.
-    Default timeout is now 24h (86400s) so abandoned views from past
-    turns get released."""
+def test_toolresults_view_has_none_timeout_for_persistence():
+    """R2 fix: discord.py's bot.add_view requires timeout=None for
+    persistent dispatch. Buttons carry stable custom_ids so clicks route
+    via the bot's view store. We tried timeout=86400 first per the R1
+    architect note but bot.add_view raised ValueError forcing the
+    revert. The orphan-accumulation concern is now handled by the view
+    store's own lifecycle (discord.py replaces same-message-id views).
+    """
     from clauded.discord_renderer import ToolResultsView
     v = ToolResultsView()
-    assert v.timeout == 86400.0
+    assert v.timeout is None
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_registers_view_via_bot_add_view():
+    """R2 fix for #161 user-reported "点击没获取到": Message.edit(view=v)
+    alone is insufficient for click-routing — clicks were dropping
+    silently because the view was not in the bot's persistent view store.
+    Fix: after edit, call bot.add_view(view, message_id=msg.id). This
+    test pins that call so a regression can't drop it."""
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer, ToolResultsView
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self, msg_id=12345):
+            self.id = msg_id
+            self.content = ""
+            self.embeds = []
+            self.attached_view = None
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._next_id = 99000
+        async def send(self, *args, **kwargs):
+            self._next_id += 1
+            msg = FakeMessage(msg_id=self._next_id)
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
+            self._sent.append(msg)
+            return msg
+
+    class FakeBot:
+        """Captures add_view calls."""
+        def __init__(self):
+            self.add_view_calls = []
+        def add_view(self, view, *, message_id=None):
+            self.add_view_calls.append((view, message_id))
+
+    medium_content = "\n".join(f"line {i}" for i in range(30))
+
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-pv",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    bot = FakeBot()
+    renderer = DiscordRenderer(target, bot=bot)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls")
+
+    # bot.add_view MUST have been called with the ToolResultsView and a
+    # message_id pointing at the rolling-log message.
+    assert bot.add_view_calls, (
+        "Expected bot.add_view to be called for medium-tier view persistence; "
+        "without it, button clicks are silently dropped (user reported "
+        "'点击没获取到')."
+    )
+    view, msg_id = bot.add_view_calls[-1]
+    assert isinstance(view, ToolResultsView), f"Expected ToolResultsView; got {type(view).__name__}"
+    assert msg_id is not None, "add_view must be called with message_id= to scope the persistence"
+    assert msg_id > 0
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_downgrades_log_when_add_view_raises():
+    """R1 engineer mitigation: if bot.add_view raises (e.g.
+    timeout != None contract violation regression, or any other
+    discord.py ValueError), the rolling-log line MUST be downgraded
+    so the user doesn't see `⬇ click to view` pointing at a dead
+    button."""
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self, msg_id=999):
+            self.id = msg_id
+            self.content = ""
+            self.embeds = []
+            self.attached_view = None
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._next_id = 90000
+        async def send(self, *args, **kwargs):
+            self._next_id += 1
+            msg = FakeMessage(msg_id=self._next_id)
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
+            self._sent.append(msg)
+            return msg
+
+    class FailingAddViewBot:
+        def add_view(self, view, *, message_id=None):
+            raise ValueError("synthetic: View is not persistent")
+
+    medium_content = "\n".join(f"line {i}" for i in range(30))
+
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-x",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    bot = FailingAddViewBot()
+    renderer = DiscordRenderer(target, bot=bot)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls")
+
+    rolling = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
+    ]
+    assert rolling
+    final_desc = rolling[-1].embeds[0].description
+    # MUST NOT promise click; MUST signal failure
+    assert "click to view" not in final_desc, (
+        f"After add_view failure, rolling log MUST NOT promise click; got: {final_desc!r}"
+    )
+    assert "view registration failed" in final_desc, (
+        f"Expected explicit 'view registration failed' downgrade; got: {final_desc!r}"
+    )

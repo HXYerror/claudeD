@@ -327,8 +327,20 @@ def _format_subagent_footer(stats: dict[str, Any] | None) -> str | None:
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
 
-    def __init__(self, target: discord.abc.Messageable) -> None:
+    def __init__(
+        self,
+        target: discord.abc.Messageable,
+        *,
+        bot: discord.Client | None = None,
+    ) -> None:
         self.target = target
+        # Optional bot reference — when provided, persistent views (e.g.
+        # :class:`ToolResultsView` from #161) are registered via
+        # ``bot.add_view(view, message_id=...)`` so button-click routing
+        # works even after the in-memory View instance is gc'd or the bot
+        # restarts (discord.py only re-dispatches custom_id interactions
+        # to views that are in the client's persistent view store).
+        self._bot = bot
         self._last_msg: discord.Message | None = None
         # Shadow of the text we last wrote to ``_last_msg``. discord.py 2.0+
         # Message.edit() is not in-place; reading msg.content post-edit returns
@@ -723,7 +735,7 @@ class DiscordRenderer:
 
                                     if tool_id:
                                         subagent_threads[tool_id] = sub_thread
-                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
+                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread, bot=self._bot)
 
                                     # Compact summary in main thread
                                     summary_embed = discord.Embed(
@@ -1089,14 +1101,19 @@ class DiscordRenderer:
                                     matches_alias = alias and line.startswith("🔄 " + alias)
                                     if not (matches_name or matches_alias):
                                         continue
-                                    # #161 short tier: when result is short and
-                                    # single-line, surface it inline so user
-                                    # sees ``✅ Bash → 42`` instead of bare ✅ Bash.
-                                    # Per PRD: < 200 chars and no newlines.
+                                    # #161 short tier: when result is short
+                                    # (< 200 chars), surface it inline so
+                                    # user sees the actual data instead of a
+                                    # bare ``✅ Bash``. v1.18 R3 (user
+                                    # feedback "1-3 lines should display
+                                    # directly"): drop the single-line
+                                    # constraint. Multiline short outputs
+                                    # collapse to ``line1 │ line2 │ line3``
+                                    # so they fit in the rolling-log embed
+                                    # without ballooning vertical height.
                                     content_str = str(block.content) if block.content else ""
                                     is_short = (
                                         len(content_str) < 200
-                                        and "\n" not in content_str
                                         and content_str.strip() != ""
                                     )
                                     # #161 medium tier (v1.18 R3): 200 <=
@@ -1124,8 +1141,14 @@ class DiscordRenderer:
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
                                     elif is_short:
                                         # Strip backticks to avoid breaking the
-                                        # rolling-log embed's markdown.
-                                        safe = content_str.strip().replace("`", "'")
+                                        # rolling-log embed's markdown. Collapse
+                                        # newlines to ``│`` so multi-line short
+                                        # outputs fit on one log line.
+                                        safe = (
+                                            content_str.strip()
+                                            .replace("`", "'")
+                                            .replace("\n", " │ ")
+                                        )
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
                                     elif is_medium:
                                         # Rolling log shows summary;
@@ -1154,20 +1177,18 @@ class DiscordRenderer:
                                 if is_medium and not is_err and tool_id:
                                     medium_results[tool_id] = (name, content_str)
                                     if tool_results_view is None:
-                                        # R1 architect: finite timeout so
-                                        # orphan views (rolling-log msg from
-                                        # a past turn nobody clicked) are
-                                        # garbage-collected by discord.py
-                                        # after 24h instead of accumulating
-                                        # forever in long-running bots.
-                                        # R1 security: author_id restricts
+                                        # R2: timeout=None required by
+                                        # ``bot.add_view`` for persistent
+                                        # dispatch. Buttons carry stable
+                                        # custom_ids derived from
+                                        # tool_use_id so clicks route to
+                                        # this view instance via the bot's
+                                        # view store. author_id restricts
                                         # ephemeral followups to the turn's
-                                        # original requester; same-channel
-                                        # third parties cannot read another
-                                        # user's tool output via the button.
+                                        # original requester.
                                         tool_results_view = ToolResultsView(
                                             author_id=author_id,
-                                            timeout=86400.0,
+                                            timeout=None,
                                         )
                                     # Idempotent: add_result skips if id
                                     # already present (defends against
@@ -1185,6 +1206,57 @@ class DiscordRenderer:
                                     embed=tool_embed,
                                     view=edit_view_kwarg,
                                 )
+                                # #161 R2 fix: register the view in the
+                                # bot's persistent-view store so button
+                                # clicks route to this View instance even
+                                # after gc / bot restart. Without this,
+                                # ``Message.edit(view=v)`` stores the view
+                                # only weakly and clicks were getting
+                                # dropped silently (user-reported). Idem-
+                                # potent: discord.py de-dups by
+                                # (custom_id, message_id).
+                                if (
+                                    edit_ok
+                                    and tool_results_view is not None
+                                    and self._bot is not None
+                                    and tool_log_msg is not None
+                                ):
+                                    add_view_failed = False
+                                    try:
+                                        self._bot.add_view(
+                                            tool_results_view,
+                                            message_id=tool_log_msg.id,
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            "Failed to register ToolResultsView "
+                                            "for persistence"
+                                        )
+                                        add_view_failed = True
+                                    # R1 engineer: if add_view raised, the
+                                    # rolling-log line still promises
+                                    # ``click to view`` but Discord won't
+                                    # route the click anywhere. Downgrade
+                                    # the line + refresh embed so the user
+                                    # isn't lied to.
+                                    if add_view_failed and is_medium and tool_id:
+                                        for j in range(len(tool_log_lines) - 1, -1, -1):
+                                            line = tool_log_lines[j]
+                                            if line.startswith(f"{status} {name}:") and "click to view" in line:
+                                                tool_log_lines[j] = (
+                                                    f"{status} {name}: "
+                                                    f"{len(content_str)} chars "
+                                                    f"(view registration failed)"
+                                                )
+                                                break
+                                        refresh_embed = discord.Embed(
+                                            title="🔧 Tool Activity",
+                                            description="\n".join(tool_log_lines[-15:]),
+                                            color=COLOR_TOOL_SUCCESS,
+                                        )
+                                        await self._safe_edit(
+                                            tool_log_msg, embed=refresh_embed
+                                        )
                                 if not edit_ok and is_medium and not is_err and tool_id:
                                     # Edit failed permanently (rate-limit /
                                     # message deleted). Downgrade the
@@ -2531,7 +2603,13 @@ class ToolResultsView(discord.ui.View):
     # cap; we never hit content-length issues because the body lives in
     # the attachment.
 
-    def __init__(self, *, author_id: int | None = None, timeout: float | None = 86400.0) -> None:
+    def __init__(self, *, author_id: int | None = None, timeout: float | None = None) -> None:
+        # discord.py requires ``timeout=None`` for persistent views
+        # (those registered via ``bot.add_view``). Per-instance items'
+        # ``custom_id`` is the unique routing key; the view is dispatch-
+        # ed from the bot's view store keyed on (custom_id, message_id).
+        # Since the buttons in this view have stable custom_ids derived
+        # from ``tool_use_id``, ``timeout=None`` is the correct choice.
         super().__init__(timeout=timeout)
         self._author_id = author_id
         self._results: dict[str, tuple[str, str]] = {}  # id -> (name, content)
@@ -2558,6 +2636,10 @@ class ToolResultsView(discord.ui.View):
         )
 
         async def _callback(interaction: discord.Interaction) -> None:
+            log.info(
+                "ToolResultsView click: tool_use_id=%s user_id=%s",
+                tool_use_id, interaction.user.id,
+            )
             await self._dispatch(interaction, tool_use_id)
 
         button.callback = _callback  # type: ignore[assignment]
