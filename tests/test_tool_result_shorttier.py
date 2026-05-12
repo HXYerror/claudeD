@@ -518,3 +518,48 @@ async def test_toolresults_view_button_label_truncates_long_tool_name():
     assert len(label) <= 80, f"Discord button label cap exceeded: {len(label)}"
     # First 18 chars of name preserved
     assert long_name[:18] in label
+
+
+@pytest.mark.asyncio
+async def test_toolresults_view_rejects_non_author_click():
+    """R1 security: when author_id is set at View construction, clicks
+    from a different user must NOT receive the .txt — they get a polite
+    refusal message ephemerally. Defends against same-channel third
+    parties reading another user's tool output."""
+    from clauded.discord_renderer import ToolResultsView
+    from unittest.mock import AsyncMock, MagicMock
+
+    view = ToolResultsView(author_id=12345)
+    view.add_result(tool_use_id="tool-x", tool_name="Bash", content="x" * 500)
+
+    # Author click — should send the file
+    author_interaction = MagicMock()
+    author_interaction.user.id = 12345
+    author_interaction.response.send_message = AsyncMock()
+    await view._dispatch(author_interaction, "tool-x")
+    args, kwargs = author_interaction.response.send_message.call_args
+    assert kwargs.get("file") is not None
+    assert "Bash result" in kwargs.get("content", "")
+    assert kwargs.get("ephemeral") is True
+
+    # Non-author click — should get a refusal, no file
+    intruder_interaction = MagicMock()
+    intruder_interaction.user.id = 99999
+    intruder_interaction.response.send_message = AsyncMock()
+    await view._dispatch(intruder_interaction, "tool-x")
+    args, kwargs = intruder_interaction.response.send_message.call_args
+    # Refusal sent as positional content arg (no file kwarg)
+    assert kwargs.get("file") is None
+    refusal_text = args[0] if args else kwargs.get("content", "")
+    assert "only viewable" in refusal_text
+    assert kwargs.get("ephemeral") is True
+
+
+def test_toolresults_view_has_finite_default_timeout():
+    """R1 architect: persistent views (timeout=None) accumulate over
+    long bot uptimes since discord.py never garbage-collects them.
+    Default timeout is now 24h (86400s) so abandoned views from past
+    turns get released."""
+    from clauded.discord_renderer import ToolResultsView
+    v = ToolResultsView()
+    assert v.timeout == 86400.0

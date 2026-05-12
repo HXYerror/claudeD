@@ -382,8 +382,21 @@ class DiscordRenderer:
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def render_response(self, bridge: "ClaudeBridge", user_text: str) -> None:
-        """Stream Claude's response for ``user_text`` to :attr:`target`."""
+    async def render_response(
+        self,
+        bridge: "ClaudeBridge",
+        user_text: str,
+        *,
+        author_id: int | None = None,
+    ) -> None:
+        """Stream Claude's response for ``user_text`` to :attr:`target`.
+
+        ``author_id`` (optional) is the Discord user id that triggered the
+        turn — used by :class:`ToolResultsView` to restrict ephemeral
+        followups (clicking a tool-result button) to the original author,
+        so other channel members can't read another user's tool output.
+        When omitted, the View accepts clicks from anyone (legacy /
+        single-user channel behavior)."""
         buffer = ""                               # text not yet finalized into a sent msg
         live_msg: discord.Message | None = None   # the in-flight typewriter message
         start_time: float | None = None
@@ -1141,7 +1154,21 @@ class DiscordRenderer:
                                 if is_medium and not is_err and tool_id:
                                     medium_results[tool_id] = (name, content_str)
                                     if tool_results_view is None:
-                                        tool_results_view = ToolResultsView()
+                                        # R1 architect: finite timeout so
+                                        # orphan views (rolling-log msg from
+                                        # a past turn nobody clicked) are
+                                        # garbage-collected by discord.py
+                                        # after 24h instead of accumulating
+                                        # forever in long-running bots.
+                                        # R1 security: author_id restricts
+                                        # ephemeral followups to the turn's
+                                        # original requester; same-channel
+                                        # third parties cannot read another
+                                        # user's tool output via the button.
+                                        tool_results_view = ToolResultsView(
+                                            author_id=author_id,
+                                            timeout=86400.0,
+                                        )
                                     # Idempotent: add_result skips if id
                                     # already present (defends against
                                     # duplicate ToolResultBlock events).
@@ -2504,8 +2531,9 @@ class ToolResultsView(discord.ui.View):
     # cap; we never hit content-length issues because the body lives in
     # the attachment.
 
-    def __init__(self) -> None:
-        super().__init__(timeout=None)  # persistent through session
+    def __init__(self, *, author_id: int | None = None, timeout: float | None = 86400.0) -> None:
+        super().__init__(timeout=timeout)
+        self._author_id = author_id
         self._results: dict[str, tuple[str, str]] = {}  # id -> (name, content)
         self._buttons: dict[str, discord.ui.Button] = {}  # id -> Button
 
@@ -2539,7 +2567,19 @@ class ToolResultsView(discord.ui.View):
 
     async def _dispatch(self, interaction: discord.Interaction, tool_use_id: str) -> None:
         """Send the .txt file as an ephemeral followup visible only to
-        the user who clicked."""
+        the user who clicked. If ``author_id`` was set at construction,
+        non-author clicks get a polite refusal (so other channel members
+        can't read another user's tool output)."""
+        if self._author_id is not None and interaction.user.id != self._author_id:
+            try:
+                await interaction.response.send_message(
+                    "🔒 This tool result is only viewable by the user who "
+                    "started this turn.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
         entry = self._results.get(tool_use_id)
         if entry is None:
             try:
