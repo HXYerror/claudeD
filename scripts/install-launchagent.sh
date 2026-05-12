@@ -35,15 +35,26 @@ launchctl enable "$UID_GUI/com.hxy.clauded"
 launchctl enable "$UID_GUI/com.hxy.clauded.healthcheck"
 launchctl kickstart -k "$UID_GUI/com.hxy.clauded"
 
-# #168 verification: after bootout/bootstrap, confirm the healthcheck is
-# actually periodic (run interval = 300). The bug we're fixing was a stale
-# launchd in-memory copy showing OnDemand=true forever; this guard catches
-# any future install-script regression.
-if launchctl print "$UID_GUI/com.hxy.clauded.healthcheck" 2>/dev/null | grep -q "run interval = 300"; then
-    echo "✅ healthcheck is periodic (5min interval)"
+# #168 verification (R1 engineer): confirm launchd is treating the healthcheck
+# as periodic. We assert BOTH:
+#   1. Disk plist has StartInterval=300 (catches a botched sed-templating)
+#   2. launchctl's in-memory view has "run interval" set (catches the stale-
+#      load bug #168 itself, where disk and memory disagree)
+# The grep against ``launchctl print`` output is fragile to format changes
+# across macOS versions but is the only way to see runtime state — fall back
+# to plutil-only if Apple changes the human-readable layout.
+DISK_INTERVAL=$(plutil -extract StartInterval raw "$INSTALL_DIR/com.hxy.clauded.healthcheck.plist" 2>/dev/null || echo "")
+if [ "$DISK_INTERVAL" != "300" ]; then
+    echo "❌ healthcheck plist StartInterval is '$DISK_INTERVAL' on disk, expected '300'"
+    echo "   Inspect: plutil -p $INSTALL_DIR/com.hxy.clauded.healthcheck.plist"
+    exit 1
+fi
+if launchctl print "$UID_GUI/com.hxy.clauded.healthcheck" 2>/dev/null | grep -qE "run interval\s*=\s*300"; then
+    echo "✅ healthcheck is periodic (disk + runtime both show 5min interval)"
 else
-    echo "⚠️  healthcheck is NOT periodic — launchctl print didn't show 'run interval = 300'"
+    echo "⚠️  healthcheck disk plist OK but runtime view missing 'run interval = 300'"
     echo "   Diagnose with: launchctl print $UID_GUI/com.hxy.clauded.healthcheck"
+    echo "   This is the #168 stale-load bug — try: launchctl bootout '$UID_GUI/com.hxy.clauded.healthcheck' && launchctl bootstrap '$UID_GUI' '$INSTALL_DIR/com.hxy.clauded.healthcheck.plist'"
     exit 1
 fi
 
