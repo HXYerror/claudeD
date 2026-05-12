@@ -210,3 +210,196 @@ async def test_short_tier_integration_via_render_response():
         f"Expected '✅ Bash → 42' inline-arrow display in rolling log; "
         f"got: {final_log!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.18 medium tier (#161 sub-PR): 200 ≤ len < 3500 chars → separate detail
+# embed with ||spoiler|| body. Rolling log shows summary; detail follows.
+# ---------------------------------------------------------------------------
+
+
+def test_medium_tier_threshold_boundaries():
+    """The medium-tier predicate matches 200 ≤ len(content) < 3500, with
+    content non-empty and is_err False. Test the boundaries directly so a
+    future refactor of the threshold constants doesn't silently regress."""
+    def is_medium(content, is_err=False, is_short=False):
+        return (
+            not is_short
+            and not is_err
+            and 200 <= len(content) < 3500
+            and content.strip() != ""
+        )
+
+    # Just under 200 → not medium (short tier's domain)
+    assert not is_medium("x" * 199)
+    # Exactly 200 → medium (lower boundary inclusive)
+    assert is_medium("x" * 200)
+    # Mid-range → medium
+    assert is_medium("x" * 1000)
+    # Just under 3500 → still medium
+    assert is_medium("x" * 3499)
+    # Exactly 3500 → not medium (long tier's domain)
+    assert not is_medium("x" * 3500)
+    # Empty → not medium
+    assert not is_medium("")
+    assert not is_medium("   " * 100)  # whitespace-only
+    # is_err overrides → not medium
+    assert not is_medium("x" * 500, is_err=True)
+    # Short overrides → not medium (predicates are exclusive)
+    assert not is_medium("x" * 500, is_short=True)
+
+
+def test_medium_tier_spoiler_wrapper_shape():
+    """The medium-tier detail embed wraps content in
+    ``||\n````\n{content}\n````\n||`` so Discord renders it as a spoiler
+    containing a 4-backtick fenced code block. 4-backtick outer fence
+    prevents ``` in content from breaking the inner fence (same fix as
+    /diff PR #170 R2)."""
+    content = "line 1\nline 2\nsome ```triple backticks``` inside\nline 4"
+    detail = content.replace("||", "\\|\\|")
+    spoiler_body = f"||\n````\n{detail}\n````\n||"
+    # Outer spoiler markers present
+    assert spoiler_body.startswith("||\n")
+    assert spoiler_body.endswith("\n||")
+    # 4-backtick fence (not 3) so inner triple-backticks don't escape
+    assert "````\n" in spoiler_body
+    assert "```triple backticks```" in spoiler_body, (
+        f"3-backtick content must survive verbatim inside 4-backtick fence; "
+        f"got: {spoiler_body!r}"
+    )
+
+
+def test_medium_tier_existing_double_pipe_escape():
+    """If content contains literal ``||`` (Discord's spoiler marker), escape
+    it so the inner spoilers don't terminate the outer wrapper early."""
+    content = "before ||not a spoiler|| after"
+    detail = content.replace("||", "\\|\\|")
+    assert "\\|\\|" in detail
+    assert "||" not in detail
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_integration_emits_spoiler_embed():
+    """Integration: drive render_response with a medium-tier Bash result
+    (200-3500 chars, multiline) and verify TWO embeds reach the target:
+      1. Rolling log embed with summary line ('N lines / M chars (click...)')
+      2. Separate detail embed with title '📄 Bash result (M chars)' and
+         description containing ``||\n````\n...`` spoiler-fenced content.
+
+    Catches future regressions where the medium-tier branch is silently
+    skipped or the detail embed format drifts.
+    """
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self):
+            self.content = ""
+            self.embeds = []
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+        async def send(self, *args, **kwargs):
+            msg = FakeMessage()
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            self._sent.append(msg)
+            return msg
+
+    # Medium-tier output: 30-line Bash stdout (~500 chars)
+    medium_content = "\n".join(f"line {i}: some output text here" for i in range(30))
+    assert 200 <= len(medium_content) < 3500
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="tool-1", name="Bash",
+                    input={"command": "ls -la"},
+                ),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="tool-1", content=medium_content, is_error=False),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=100,
+            duration_api_ms=80,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-medium",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls -la")
+
+    # Find the rolling-log embed AND the detail embed.
+    rolling_log_embeds = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
+    ]
+    detail_embeds = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "").startswith("📄 ")
+    ]
+
+    assert rolling_log_embeds, (
+        f"Expected a Tool Activity rolling-log embed; got titles: "
+        f"{[(m.embeds[0].title if m.embeds else None) for m in target._sent]}"
+    )
+    # Rolling log final state should have the 'N lines / M chars' summary
+    final_log = rolling_log_embeds[-1].embeds[0].description
+    assert "30 lines" in final_log or f"{len(medium_content)} chars" in final_log, (
+        f"Rolling log should show medium-tier summary line; got: {final_log!r}"
+    )
+
+    assert detail_embeds, (
+        f"Expected a separate ‘📄 Bash result (… chars)’ detail embed; "
+        f"got titles: {[(m.embeds[0].title if m.embeds else None) for m in target._sent]}"
+    )
+    detail = detail_embeds[0].embeds[0]
+    assert f"Bash result" in detail.title
+    assert f"{len(medium_content)} chars" in detail.title
+    # Description must wrap content in ``||\n````\n...\n````\n||`` spoiler+fence
+    assert detail.description.startswith("||\n````\n")
+    assert detail.description.endswith("\n````\n||")
+    # Original content lines preserved inside the spoiler
+    assert "line 0: some output text here" in detail.description
+    assert "line 29: some output text here" in detail.description

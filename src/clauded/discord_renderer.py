@@ -1077,6 +1077,21 @@ class DiscordRenderer:
                                         and "\n" not in content_str
                                         and content_str.strip() != ""
                                     )
+                                    # #161 medium tier: 200 <= len(content) <
+                                    # 3500 chars — send a separate detail embed
+                                    # with ``||spoiler||`` so user can click to
+                                    # reveal the output without it bloating the
+                                    # rolling tool log. Multiline allowed here
+                                    # (Read 30-line file, Grep 7-match output,
+                                    # short Bash stdout). PRD R2: per-tool
+                                    # thresholds finer-tuned later; v1.18 ships
+                                    # the default 200/3500 boundary.
+                                    is_medium = (
+                                        not is_short
+                                        and not is_err
+                                        and 200 <= len(content_str) < 3500
+                                        and content_str.strip() != ""
+                                    )
                                     if is_err:
                                         error_text = content_str[:100] if content_str else "Failed"
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
@@ -1085,6 +1100,14 @@ class DiscordRenderer:
                                         # rolling-log embed's markdown.
                                         safe = content_str.strip().replace("`", "'")
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
+                                    elif is_medium:
+                                        # Rolling log shows summary only;
+                                        # detail embed follows below.
+                                        line_count = content_str.count("\n") + 1
+                                        tool_log_lines[i] = (
+                                            f"{status} {name}: {line_count} lines / "
+                                            f"{len(content_str)} chars (click below to expand)"
+                                        )
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
                                     break
@@ -1095,6 +1118,26 @@ class DiscordRenderer:
                                     color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
                                 )
                                 await self._safe_edit(tool_log_msg, embed=tool_embed)
+                                # #161 medium tier: send the spoiler-wrapped
+                                # detail embed AFTER updating the rolling log so
+                                # the order in the channel is summary-then-detail.
+                                # Use 4-backtick fence so any ``` in content
+                                # doesn't escape the fence (mirrors /diff PR
+                                # #170 R2 fix).
+                                if is_medium and not is_err:
+                                    detail = content_str.replace("||", "\\|\\|")
+                                    # Discord spoiler `||...||` works inside
+                                    # code blocks but the code block doesn't
+                                    # auto-collapse on mobile. Prefer the
+                                    # ``||\n```\n...\n```\n||`` shape that
+                                    # collapses cleanly across clients.
+                                    spoiler_body = f"||\n````\n{detail}\n````\n||"
+                                    detail_embed = discord.Embed(
+                                        title=f"📄 {name} result ({len(content_str)} chars)",
+                                        description=spoiler_body,
+                                        color=COLOR_TOOL_SUCCESS,
+                                    )
+                                    await self._safe_send(embed=detail_embed)
                             elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
                                 if is_err:
