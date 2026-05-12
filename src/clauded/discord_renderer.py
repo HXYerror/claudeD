@@ -382,8 +382,21 @@ class DiscordRenderer:
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def render_response(self, bridge: "ClaudeBridge", user_text: str) -> None:
-        """Stream Claude's response for ``user_text`` to :attr:`target`."""
+    async def render_response(
+        self,
+        bridge: "ClaudeBridge",
+        user_text: str,
+        *,
+        author_id: int | None = None,
+    ) -> None:
+        """Stream Claude's response for ``user_text`` to :attr:`target`.
+
+        ``author_id`` (optional) is the Discord user id that triggered the
+        turn — used by :class:`ToolResultsView` to restrict ephemeral
+        followups (clicking a tool-result button) to the original author,
+        so other channel members can't read another user's tool output.
+        When omitted, the View accepts clicks from anyone (legacy /
+        single-user channel behavior)."""
         buffer = ""                               # text not yet finalized into a sent msg
         live_msg: discord.Message | None = None   # the in-flight typewriter message
         start_time: float | None = None
@@ -411,6 +424,15 @@ class DiscordRenderer:
         # right stats. Populated in the UserMessage branch below; consumed
         # at line ~915 / ~944.
         tool_use_results: dict[str, dict[str, Any]] = {}
+        # #161 medium tier (v1.18 R3): collected tool results that need a
+        # "view" button on the rolling-log embed itself. Each entry:
+        #   {tool_use_id: (tool_name, content_str)}
+        # The accompanying ToolResultsView attaches one button per entry
+        # (up to 25, Discord's per-view limit) to the rolling-log message.
+        # Clicking sends an ephemeral message containing the .txt file
+        # attachment — only the clicker sees it, zero channel real-estate.
+        medium_results: dict[str, tuple[str, str]] = {}
+        tool_results_view: ToolResultsView | None = None
 
         try:
             async for event in bridge.send_message(user_text):
@@ -1077,22 +1099,20 @@ class DiscordRenderer:
                                         and "\n" not in content_str
                                         and content_str.strip() != ""
                                     )
-                                    # #161 medium tier: 200 <= len(content)
-                                    # — send as a .txt FILE ATTACHMENT below
-                                    # the rolling log. Discord renders file
-                                    # attachments as a single-line link/icon
-                                    # that the user can click to view in a
-                                    # side-pane, which is the actual collapse
-                                    # UX (verified post-R1: both embed-desc
-                                    # spoilers AND message-content spoilers
-                                    # only BLUR text — they don't reduce
-                                    # vertical height, so an 80-line output
-                                    # remained an 80-line gray block).
-                                    # Upper bound 8000 chars: covers nearly
-                                    # all real Bash/Read outputs; xlong tier
-                                    # (>8000) can compress or paginate in
-                                    # a follow-up. No 2000-char content cap
-                                    # because file payload is separate.
+                                    # #161 medium tier (v1.18 R3): 200 <=
+                                    # len(content) < 8000. Instead of
+                                    # sending a separate file message (R2)
+                                    # or trying spoiler hacks (R1), attach
+                                    # a *button* directly to the rolling-
+                                    # log embed. Clicking the button sends
+                                    # an ephemeral message with the .txt
+                                    # file attachment — only the clicker
+                                    # sees it, zero channel real-estate
+                                    # when nobody clicks. Discord per-view
+                                    # cap is 25 buttons / 5 rows; that
+                                    # bounds tool calls per turn but is
+                                    # rarely hit (typical turn < 10 tool
+                                    # calls).
                                     is_medium = (
                                         not is_short
                                         and not is_err
@@ -1108,12 +1128,14 @@ class DiscordRenderer:
                                         safe = content_str.strip().replace("`", "'")
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
                                     elif is_medium:
-                                        # Rolling log shows summary only;
-                                        # file attachment follows below.
+                                        # Rolling log shows summary;
+                                        # button on this same message lets
+                                        # the user open the full content
+                                        # ephemerally. No separate message.
                                         line_count = content_str.count("\n") + 1
                                         tool_log_lines[i] = (
                                             f"{status} {name}: {line_count} lines / "
-                                            f"{len(content_str)} chars (see attached file)"
+                                            f"{len(content_str)} chars (⬇ click to view)"
                                         )
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
@@ -1124,50 +1146,55 @@ class DiscordRenderer:
                                     description="\n".join(tool_log_lines[-15:]),
                                     color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
                                 )
-                                await self._safe_edit(tool_log_msg, embed=tool_embed)
-                                # #161 medium tier: send the detail file
-                                # attachment AFTER updating the rolling log
-                                # so the order in the channel is summary-
-                                # then-detail.
-                                if is_medium and not is_err:
-                                    # #161 medium tier: send as .txt file
-                                    # attachment below the rolling log.
-                                    # Discord file attachments render as a
-                                    # single-line preview card that the user
-                                    # clicks to expand — the actual collapse
-                                    # UX. Spoiler-text hacks (`||...||`)
-                                    # only blur text, they don't reduce
-                                    # vertical height.
-                                    label = f"📄 **{name} result** \u2014 {len(content_str)} chars / {content_str.count(chr(10)) + 1} lines"
-                                    file_bytes = content_str.encode("utf-8", errors="replace")
-                                    file_name = f"{name.lower()}_result.txt"
-                                    detail_file = discord.File(
-                                        fp=io.BytesIO(file_bytes),
-                                        filename=file_name,
-                                    )
-                                    sent = await self._safe_send(
-                                        content=label, file=detail_file
-                                    )
-                                    if sent is None:
-                                        # R1 engineer #2: detail send failed
-                                        # (rate-limited, network blip).
-                                        # Rewrite the rolling log line to NOT
-                                        # promise an attached file — the
-                                        # user would otherwise see ``see
-                                        # attached file`` pointing at
-                                        # nothing. Downgrade to bare summary.
-                                        for j in range(len(tool_log_lines) - 1, -1, -1):
-                                            if tool_log_lines[j].startswith(f"{status} {name}:") and "see attached file" in tool_log_lines[j]:
-                                                tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; detail send failed)"
-                                                break
-                                        # Refresh the rolling log embed so
-                                        # the rewrite reaches the user too.
-                                        refresh_embed = discord.Embed(
-                                            title="🔧 Tool Activity",
-                                            description="\n".join(tool_log_lines[-15:]),
-                                            color=COLOR_TOOL_SUCCESS,
+                                # #161 medium tier (v1.18 R3): if this tool
+                                # call hit medium tier, add it to the view
+                                # before editing the rolling-log message,
+                                # so the new button is part of the same
+                                # edit (atomic).
+                                if is_medium and not is_err and tool_id:
+                                    medium_results[tool_id] = (name, content_str)
+                                    if tool_results_view is None:
+                                        # R1 architect: finite timeout so
+                                        # orphan views (rolling-log msg from
+                                        # a past turn nobody clicked) are
+                                        # garbage-collected by discord.py
+                                        # after 24h instead of accumulating
+                                        # forever in long-running bots.
+                                        # R1 security: author_id restricts
+                                        # ephemeral followups to the turn's
+                                        # original requester; same-channel
+                                        # third parties cannot read another
+                                        # user's tool output via the button.
+                                        tool_results_view = ToolResultsView(
+                                            author_id=author_id,
+                                            timeout=86400.0,
                                         )
-                                        await self._safe_edit(tool_log_msg, embed=refresh_embed)
+                                    # Idempotent: add_result skips if id
+                                    # already present (defends against
+                                    # duplicate ToolResultBlock events).
+                                    tool_results_view.add_result(
+                                        tool_use_id=tool_id,
+                                        tool_name=name,
+                                        content=content_str,
+                                    )
+                                # Edit the rolling-log message with the new
+                                # embed AND attach (or refresh) the view.
+                                edit_view_kwarg = tool_results_view if tool_results_view is not None else None
+                                edit_ok = await self._safe_edit(
+                                    tool_log_msg,
+                                    embed=tool_embed,
+                                    view=edit_view_kwarg,
+                                )
+                                if not edit_ok and is_medium and not is_err and tool_id:
+                                    # Edit failed permanently (rate-limit /
+                                    # message deleted). Downgrade the
+                                    # rolling log line so the user doesn't
+                                    # see a click-to-view promise that
+                                    # can't be honored.
+                                    for j in range(len(tool_log_lines) - 1, -1, -1):
+                                        if tool_log_lines[j].startswith(f"{status} {name}:") and "click to view" in tool_log_lines[j]:
+                                            tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; view button unavailable)"
+                                            break
                             elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
                                 if is_err:
@@ -2481,6 +2508,110 @@ _RETRY_EMBED_DESC_MAX = 4000
 _RETRY_TIMEOUT_SECONDS = 600.0
 
 
+class ToolResultsView(discord.ui.View):
+    """Per-rolling-log persistent view holding one button per medium-tier
+    tool result. Click → ephemeral followup with the result as a .txt
+    file attachment, visible only to the clicker.
+
+    Lifecycle: attached to the ``🔧 Tool Activity`` message via _safe_edit.
+    Each ToolResultBlock that hits medium tier calls :meth:`add_result`
+    which appends a new ``📄 #N {name}`` button. View edits are idempo-
+    tent on (tool_use_id, ...) so duplicate events don't add dup buttons.
+
+    Discord limits: max 25 components per view, 5 components per row.
+    Each button uses 1 component slot → max 25 medium-tier results per
+    turn before we stop accepting new ones (rare in practice).
+    """
+
+    # Cap so we don't try to over-pack the view
+    _MAX_BUTTONS = 25
+    # Discord ephemeral followup hard cap is 2000 chars (content); file
+    # attachments are independent and capped at the bot's upload limit.
+    # For medium tier (< 8000 chars) the file is always well under any
+    # cap; we never hit content-length issues because the body lives in
+    # the attachment.
+
+    def __init__(self, *, author_id: int | None = None, timeout: float | None = 86400.0) -> None:
+        super().__init__(timeout=timeout)
+        self._author_id = author_id
+        self._results: dict[str, tuple[str, str]] = {}  # id -> (name, content)
+        self._buttons: dict[str, discord.ui.Button] = {}  # id -> Button
+
+    def add_result(self, *, tool_use_id: str, tool_name: str, content: str) -> bool:
+        """Add a new result; return True iff a button was actually appen-
+        ded. Idempotent on tool_use_id. Returns False once the 25-button
+        cap is hit — caller should fall back to a different surface
+        (e.g., the per-message file attachment path) for the overflow.
+        """
+        if tool_use_id in self._results:
+            return False  # already added
+        if len(self._results) >= self._MAX_BUTTONS:
+            return False  # at cap
+        self._results[tool_use_id] = (tool_name, content)
+        index = len(self._results)
+        # Custom_id must be unique per button across the bot's active
+        # views; embed the tool_use_id so callbacks can dispatch.
+        button = discord.ui.Button(  # type: ignore[var-annotated]
+            label=f"📄 #{index} {tool_name[:18]}",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"clauded_toolresult_{tool_use_id[:64]}",
+        )
+
+        async def _callback(interaction: discord.Interaction) -> None:
+            await self._dispatch(interaction, tool_use_id)
+
+        button.callback = _callback  # type: ignore[assignment]
+        self._buttons[tool_use_id] = button
+        self.add_item(button)
+        return True
+
+    async def _dispatch(self, interaction: discord.Interaction, tool_use_id: str) -> None:
+        """Send the .txt file as an ephemeral followup visible only to
+        the user who clicked. If ``author_id`` was set at construction,
+        non-author clicks get a polite refusal (so other channel members
+        can't read another user's tool output)."""
+        if self._author_id is not None and interaction.user.id != self._author_id:
+            try:
+                await interaction.response.send_message(
+                    "🔒 This tool result is only viewable by the user who "
+                    "started this turn.",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+            return
+        entry = self._results.get(tool_use_id)
+        if entry is None:
+            try:
+                await interaction.response.send_message(
+                    "⚠️ Result no longer available.", ephemeral=True
+                )
+            except discord.HTTPException:
+                pass
+            return
+        tool_name, content = entry
+        file_bytes = content.encode("utf-8", errors="replace")
+        file_name = f"{tool_name.lower()}_result.txt"
+        try:
+            await interaction.response.send_message(
+                content=(
+                    f"📄 **{tool_name} result** \u2014 "
+                    f"{len(content)} chars / {content.count(chr(10)) + 1} lines"
+                ),
+                file=discord.File(fp=io.BytesIO(file_bytes), filename=file_name),
+                ephemeral=True,
+            )
+        except discord.HTTPException as exc:
+            log.warning("ToolResultsView dispatch failed: %s", exc)
+            try:
+                await interaction.response.send_message(
+                    f"⚠️ Could not send result: {exc.text[:200] if hasattr(exc, 'text') else 'unknown'}",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
+
+
 class RetryView(discord.ui.View):
     """View attached to a crash embed that re-runs the last user message."""
 
@@ -2537,6 +2668,7 @@ class RetryView(discord.ui.View):
 __all__ = [
     "DiscordRenderer",
     "RetryView",
+    "ToolResultsView",
     "COLOR_CLAUDE",
     "COLOR_TOOL_RUNNING",
     "COLOR_TOOL_SUCCESS",

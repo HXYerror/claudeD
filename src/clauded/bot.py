@@ -589,6 +589,7 @@ class ClaudedBot(commands.Bot):
                     thread=thread,
                     project_path=project_path,
                     session_config=sc,
+                    author_id=message.author.id,
                 )
                 _render_ok = True
             except Exception:
@@ -724,6 +725,7 @@ class ClaudedBot(commands.Bot):
                     thread=message.channel,
                     project_path=project_path,
                     session_config=sc,
+                    author_id=message.author.id,
                 )
                 _render_ok = True
             except Exception:
@@ -880,15 +882,20 @@ class ClaudedBot(commands.Bot):
         thread: discord.abc.Messageable,
         project_path: str,
         session_config: SessionConfig | None = None,
+        author_id: int | None = None,
     ) -> None:
         """Run ``renderer.render_response`` and surface a retry button on crash.
 
         On exception we drop the (now-dead) bridge so the next message —
         either via the retry button or a fresh user message — recreates a
         clean session.
+
+        ``author_id`` (optional) is threaded into ``render_response`` so the
+        :class:`ToolResultsView` can restrict per-button ephemeral followups
+        to the original requester (#179 R1 security).
         """
         try:
-            await renderer.render_response(bridge, user_text)
+            await renderer.render_response(bridge, user_text, author_id=author_id)
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # Render gave up (rare — _retry_http exhausted), but bridge is
@@ -907,8 +914,9 @@ class ClaudedBot(commands.Bot):
             if thread_id is not None:
                 await self.session_manager.stop_session(thread_id)
 
-            # Capture session_config for retry (#80)
+            # Capture session_config + author_id for retry (#80, #161 sec)
             _retry_sc = session_config
+            _retry_author_id = author_id
 
             async def _on_retry() -> None:
                 # Re-acquire the lock so a manual click can't race with a
@@ -976,6 +984,7 @@ class ClaudedBot(commands.Bot):
                         thread=thread,
                         project_path=project_path,
                         session_config=retry_sc,
+                        author_id=_retry_author_id,
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
