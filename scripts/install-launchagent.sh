@@ -35,14 +35,28 @@ launchctl enable "$UID_GUI/com.hxy.clauded"
 launchctl enable "$UID_GUI/com.hxy.clauded.healthcheck"
 launchctl kickstart -k "$UID_GUI/com.hxy.clauded"
 
+# #168 verification: after bootout/bootstrap, confirm the healthcheck is
+# actually periodic (run interval = 300). The bug we're fixing was a stale
+# launchd in-memory copy showing OnDemand=true forever; this guard catches
+# any future install-script regression.
+if launchctl print "$UID_GUI/com.hxy.clauded.healthcheck" 2>/dev/null | grep -q "run interval = 300"; then
+    echo "✅ healthcheck is periodic (5min interval)"
+else
+    echo "⚠️  healthcheck is NOT periodic — launchctl print didn't show 'run interval = 300'"
+    echo "   Diagnose with: launchctl print $UID_GUI/com.hxy.clauded.healthcheck"
+    exit 1
+fi
+
 cat <<EOF
 ✅ Installed claudeD as a macOS LaunchAgent.
 
 Status:        launchctl print $UID_GUI/com.hxy.clauded
 App log:       tail -f $LOG_DIR/clauded.log
-launchd out:   tail -f $LOG_DIR/out.log $LOG_DIR/err.log
+launchd out:   tail -f $LOG_DIR/out.log
+Healthcheck:   tail -f $LOG_DIR/healthcheck.log
 Alerts:        tail -f $LOG_DIR/alerts.log
 Uninstall:     ./scripts/uninstall-launchagent.sh
 
 Bot should be online in Discord within 30 s.
+Healthcheck will run every 5 min and log to $LOG_DIR/healthcheck.log.
 EOF

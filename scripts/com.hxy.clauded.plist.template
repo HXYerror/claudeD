@@ -18,6 +18,9 @@
     <key>ThrottleInterval</key><integer>30</integer>
     <key>ProcessType</key><string>Background</string>
     <key>StandardOutPath</key><string>{{HOME}}/Library/Logs/clauded/out.log</string>
-    <key>StandardErrorPath</key><string>{{HOME}}/Library/Logs/clauded/err.log</string>
+    <!-- #168 dropped: ``StandardErrorPath`` previously pointed at err.log, which
+         mirrored every Python log line (Python's stderr handler in bot.py +
+         launchd's redirect both wrote the same content). RotatingFileHandler
+         at ~/Library/Logs/clauded/clauded.log is now the canonical log. -->
 </dict>
 </plist>
