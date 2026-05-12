@@ -190,3 +190,108 @@ async def test_btw_truncates_long_text_in_ack(bot: ClaudedBot, monkeypatch: pyte
     # Verify truncation happens at 200 chars (allows ack_msg to stay short)
     assert "x" * 200 in ack_msg
     assert "x" * 250 not in ack_msg
+
+
+@pytest.mark.asyncio
+async def test_btw_acquires_per_thread_lock(bot: ClaudedBot, monkeypatch: pytest.MonkeyPatch) -> None:
+    """R1 engineer/architect/tester regression pin: /btw MUST hold
+    ``session_manager.get_lock(thread_id)`` around the render_response cycle
+    so a concurrent main-turn message can't race-call ``bridge.send_message``.
+
+    Pin via the visible side-effect: pre-acquire the lock from a separate
+    task; /btw's render_response should NOT execute until the test releases
+    it. Concretely: render_response is only awaited after we release the
+    blocking acquire — if /btw weren't using get_lock, render would run
+    immediately and the assertion order would be wrong.
+    """
+    import asyncio
+    from clauded.cogs import ops as ops_mod
+    from clauded import discord_renderer as dr_mod
+    interaction = _make_thread_interaction(bot, thread_id=99999)
+    active_bridge = MagicMock()
+    active_bridge.is_active = True
+    bot.session_manager._sessions[99999] = active_bridge
+
+    render_started = asyncio.Event()
+
+    class _SignallingRenderer:
+        def __init__(self, target):
+            pass
+        async def render_response(self, bridge, user_text):
+            render_started.set()
+    monkeypatch.setattr(dr_mod, "DiscordRenderer", _SignallingRenderer, raising=False)
+
+    # Pre-hold the per-thread lock from a separate task.
+    lock = bot.session_manager.get_lock(99999)
+    held = asyncio.Event()
+    release_pre_lock = asyncio.Event()
+
+    async def pre_hold_lock():
+        async with lock:
+            held.set()
+            await release_pre_lock.wait()
+
+    holder_task = asyncio.create_task(pre_hold_lock())
+    await held.wait()  # ensure the lock is held before /btw fires
+
+    # Now invoke /btw. If it acquires the lock, render_started must NOT be set
+    # while the pre-hold task is still holding the lock.
+    btw_task = asyncio.create_task(ops_mod.btw_cmd.callback(interaction, "test"))
+    # Give /btw a moment to reach the lock
+    await asyncio.sleep(0.05)
+    assert not render_started.is_set(), (
+        "/btw must wait on the lock; if render_started was set, /btw is "
+        "bypassing the lock (R1 engineer/architect/tester regression)"
+    )
+
+    # Release the pre-hold; now /btw should proceed and complete
+    release_pre_lock.set()
+    await holder_task
+    await btw_task
+    assert render_started.is_set(), "render must run after lock is freed"
+
+
+@pytest.mark.asyncio
+async def test_btw_handles_race_with_session_shutdown(
+    bot: ClaudedBot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2: if bridge is cleared between the pre-lock active-session check
+    and lock acquisition (e.g. concurrent /session stop), surface a
+    distinct error instead of crashing."""
+    from clauded.cogs import ops as ops_mod
+    from clauded import discord_renderer as dr_mod
+    interaction = _make_thread_interaction(bot, thread_id=88888)
+
+    # Pre-lock: bridge exists
+    active_bridge = MagicMock()
+    active_bridge.is_active = True
+    bot.session_manager._sessions[88888] = active_bridge
+
+    # Inside the lock, simulate the bridge being torn down (e.g. by
+    # /session stop running concurrently). The /btw handler should detect
+    # this and emit the "raced with session shutdown" message.
+    class _NoopRenderer:
+        def __init__(self, target):
+            pass
+        async def render_response(self, bridge, user_text):
+            raise AssertionError("render_response should NOT run when bridge is gone")
+    monkeypatch.setattr(dr_mod, "DiscordRenderer", _NoopRenderer, raising=False)
+
+    # Monkey-patch get_session to return None ONLY for the in-lock re-check.
+    # First call (pre-lock) returns the active bridge; second (in-lock) returns None.
+    call_count = {"n": 0}
+    original_get_session = bot.session_manager.get_session
+    def fake_get_session(tid):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return active_bridge
+        return None
+    monkeypatch.setattr(bot.session_manager, "get_session", fake_get_session)
+
+    await ops_mod.btw_cmd.callback(interaction, "test")
+    # Verify the race-message embed was sent to the channel (via thread.send mock)
+    thread_send = interaction.channel.send
+    assert thread_send.await_count == 1
+    sent_embed = thread_send.call_args.kwargs.get("embed")
+    assert sent_embed is not None
+    assert "raced with session shutdown" in sent_embed.title

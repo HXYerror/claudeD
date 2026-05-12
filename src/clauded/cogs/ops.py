@@ -514,20 +514,45 @@ async def btw_cmd(interaction: discord.Interaction, text: str) -> None:
 
     # Forward to the bridge with the CLI's native /btw prefix. The bundled
     # claude CLI recognizes this and opens a side-track in-session.
+    # R1 engineer + architect + tester all flagged: must hold the per-thread
+    # lock around the entire render_response cycle so a concurrent main-turn
+    # user message can't race in and double-dispatch into ``bridge.send_message``.
+    # All other ``render_response`` call sites in the project hold this lock
+    # (bot.py:_handle_thread_message, ops.py:send_to_claude, _recreate_session);
+    # /btw must follow the same discipline.
     forwarded = f"/btw {text}"
     renderer = DiscordRenderer(channel)
-    try:
-        await renderer.render_response(bridge, forwarded)
-    except Exception:
-        log.exception("/btw render failed")
-        try:
-            await channel.send(
-                embed=discord.Embed(
-                    title="❌ /btw failed",
-                    description="The side-track question couldn't complete. "
-                    "The main session is still alive.",
-                    color=COLOR_TOOL_FAILURE,
+    async with bot.session_manager.get_lock(thread_id):
+        # Re-check bridge inside the lock — a concurrent /session stop or
+        # bridge crash between the pre-lock check and the await could have
+        # cleared the session. Failing soft is better than crashing into the
+        # outer except (which would also try to send to the dead thread).
+        bridge_locked = bot.session_manager.get_session(thread_id)
+        if bridge_locked is None or not bridge_locked.is_active:
+            try:
+                await channel.send(
+                    embed=discord.Embed(
+                        title="❌ /btw raced with session shutdown",
+                        description="The active Claude session ended before "
+                        "the side-track could start. Start a new turn and retry.",
+                        color=COLOR_TOOL_FAILURE,
+                    )
                 )
-            )
+            except Exception:
+                pass
+            return
+        try:
+            await renderer.render_response(bridge_locked, forwarded)
         except Exception:
-            pass
+            log.exception("/btw render failed")
+            try:
+                await channel.send(
+                    embed=discord.Embed(
+                        title="❌ /btw failed",
+                        description="The side-track question couldn't complete. "
+                        "The main session is still alive.",
+                        color=COLOR_TOOL_FAILURE,
+                    )
+                )
+            except Exception:
+                pass
