@@ -391,3 +391,102 @@ async def test_broken_home_dir_friendly_error(
     assert "/project bind" in reply
     # sec-2: error must NOT leak the operator's home path or any other path.
     assert str(bogus) not in reply, "broken-home reply leaked the path"
+
+
+# ---------------------------------------------------------------------------
+# v1.18 — unbound-refuse hint: when allow_unbound_fallback=False, surface
+# a one-shot reply pointing user to /project bind instead of silent ignore
+# (UX bug surfaced 2026-05-12: user sent @bot in unbound channel, no response,
+# no idea why — root cause was silent-ignore at bot.py:359-362).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cfg_strict(tmp_path: Path) -> Config:
+    """Config with allow_unbound_fallback=False (the v1.11 default + the
+    common LaunchAgent deployment shape)."""
+    return Config(
+        discord_bot_token="tok",
+        claude_model="sonnet",
+        claude_permission_mode="default",
+        projects_root=str(tmp_path),
+        allow_unbound_fallback=False,
+    )
+
+
+@pytest.fixture
+def bot_strict(
+    cfg_strict: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> ClaudedBot:
+    """Bot with strict unbound policy — clone of bot fixture but flag OFF."""
+    pm = ProjectManager(data_dir=str(tmp_path / "data2"), projects_root=str(tmp_path))
+    bot = ClaudedBot.__new__(ClaudedBot)
+    bot.config = cfg_strict
+    bot.project_manager = pm
+    bot.session_manager = SessionManager()
+    bot.cost_tracker = CostTracker()
+    bot.agent_manager = MagicMock()
+    bot._start_time = 0.0
+    bot._claude_version = "test"
+    bot._debug_logging = False
+    bot._pre_tool_notifications = False
+    bot._notify_enabled = {}
+    bot._connection = MagicMock()
+    fake_user = FakeUser(id=42, name="bot")
+    monkeypatch.setattr(ClaudedBot, "user", property(lambda self: fake_user))
+    monkeypatch.setattr(discord, "TextChannel", FakeChannel)
+    class _Forum:  # noqa: D401
+        pass
+    monkeypatch.setattr(discord, "ForumChannel", _Forum)
+    return bot
+
+
+@pytest.mark.asyncio
+async def test_unbound_strict_first_message_replies_refuse_hint(
+    bot_strict: ClaudedBot,
+) -> None:
+    """First @bot in unbound channel (flag OFF) → bot replies UNBOUND_REFUSE_MESSAGE
+    via message.reply(). Not silent — user sees the bind instruction."""
+    from clauded.cogs._unbound import UNBOUND_REFUSE_MESSAGE
+    channel = FakeChannel(channel_id=70000)
+    msg = FakeMessage(channel=channel, content="<@42> hello", bot_user_id=42)
+    await bot_strict._handle_channel_message(msg)
+    assert msg.replies == [UNBOUND_REFUSE_MESSAGE], (
+        f"Expected one reply == UNBOUND_REFUSE_MESSAGE, got: {msg.replies!r}"
+    )
+    # And no thread was created (still refused — just no longer silent)
+    assert msg._created_thread is None
+
+
+@pytest.mark.asyncio
+async def test_unbound_strict_second_message_silent(
+    bot_strict: ClaudedBot,
+) -> None:
+    """Second @bot in SAME unbound channel → silent (rate-limited to once-per-process).
+    User already saw the hint; subsequent messages don't spam."""
+    from clauded.cogs._unbound import UNBOUND_REFUSE_MESSAGE
+    channel = FakeChannel(channel_id=70001)
+    msg1 = FakeMessage(channel=channel, content="<@42> first", bot_user_id=42)
+    msg2 = FakeMessage(channel=channel, content="<@42> second", bot_user_id=42)
+    await bot_strict._handle_channel_message(msg1)
+    await bot_strict._handle_channel_message(msg2)
+    assert msg1.replies == [UNBOUND_REFUSE_MESSAGE]
+    assert msg2.replies == [], (
+        f"Expected silent on 2nd message, got: {msg2.replies!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unbound_strict_per_channel_independent(
+    bot_strict: ClaudedBot,
+) -> None:
+    """Two different unbound channels each get their own first-time hint."""
+    from clauded.cogs._unbound import UNBOUND_REFUSE_MESSAGE
+    ch_a = FakeChannel(channel_id=80001)
+    ch_b = FakeChannel(channel_id=80002)
+    msg_a = FakeMessage(channel=ch_a, content="<@42> a", bot_user_id=42)
+    msg_b = FakeMessage(channel=ch_b, content="<@42> b", bot_user_id=42)
+    await bot_strict._handle_channel_message(msg_a)
+    await bot_strict._handle_channel_message(msg_b)
+    assert msg_a.replies == [UNBOUND_REFUSE_MESSAGE]
+    assert msg_b.replies == [UNBOUND_REFUSE_MESSAGE]

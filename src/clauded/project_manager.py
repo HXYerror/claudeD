@@ -41,6 +41,11 @@ class ProjectManager:
         # Channels that have already been shown the "unbound, falling back to
         # ~" hint this process. In-memory only — bot restart re-arms the hint.
         self._hinted_unbound_channels: set[int] = set()
+        # Channels where we've already replied with the unbound-refusal hint
+        # this process (v1.18: nudge user to /project bind exactly once per
+        # unbound channel so silent-ignore doesn't become invisible-failure).
+        # In-memory only — bot restart re-arms.
+        self._refused_unbound_channels: set[int] = set()
         self._load()
         self._load_guild_roots()
         self._load_channel_settings()
@@ -184,6 +189,20 @@ class ProjectManager:
         if channel_id in self._hinted_unbound_channels:
             return False
         self._hinted_unbound_channels.add(channel_id)
+        return True
+
+    def should_refuse_unbound(self, channel_id: int) -> bool:
+        """Return True only the first time we should reply with the refusal hint.
+
+        Used by ``on_message`` when ``allow_unbound_fallback`` is False so the
+        user sees one ``UNBOUND_REFUSE_MESSAGE`` reply per unbound channel
+        per process instead of getting silently ignored. Repeating it on
+        every message would be noise; once-per-process keeps the channel
+        signal-to-noise high while still surfacing the misconfiguration.
+        """
+        if channel_id in self._refused_unbound_channels:
+            return False
+        self._refused_unbound_channels.add(channel_id)
         return True
 
     # ------------------------------------------------------------------

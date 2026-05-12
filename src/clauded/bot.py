@@ -357,10 +357,19 @@ class ClaudedBot(commands.Bot):
         # SECURITY (sec-1): unbound fallback is off by default. v1.0 behavior
         # is to silently ignore @bot in unbound channels. Operators opt in via
         # CLAUDED_ALLOW_UNBOUND_FALLBACK=1 to enable the $HOME fallback.
+        # v1.18: first time we see an unbound channel, reply once with a hint
+        # so the user isn't left wondering why bot didn't respond. Subsequent
+        # messages in the same channel still silent-return (no spam).
         if (
             not self.project_manager.is_bound(channel.id)
             and not self.config.allow_unbound_fallback
         ):
+            if self.project_manager.should_refuse_unbound(channel.id):
+                from .cogs._unbound import UNBOUND_REFUSE_MESSAGE
+                try:
+                    await message.reply(UNBOUND_REFUSE_MESSAGE)
+                except discord.HTTPException:
+                    log.debug("Could not surface unbound-refuse hint")
             return
 
         resolved = await _resolve_path_or_friendly_error(
@@ -587,10 +596,18 @@ class ClaudedBot(commands.Bot):
         (v1.0 behavior).
         """
         # SECURITY (sec-1): mirror channel handler's gate.
+        # v1.18: also mirror the first-time-refusal hint so unbound *parent*
+        # channels of thread messages don't silent-fail either.
         if (
             not self.project_manager.is_bound(parent_id)
             and not self.config.allow_unbound_fallback
         ):
+            if self.project_manager.should_refuse_unbound(parent_id):
+                from .cogs._unbound import UNBOUND_REFUSE_MESSAGE
+                try:
+                    await message.reply(UNBOUND_REFUSE_MESSAGE)
+                except discord.HTTPException:
+                    log.debug("Could not surface unbound-refuse hint in thread")
             return
 
         resolved = await _resolve_path_or_friendly_error(
