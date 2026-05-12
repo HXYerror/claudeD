@@ -233,6 +233,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.mcp import mcp_group
         from .cogs.skill import skill_group
         from .cogs.context import context_cmd
+        from .cogs.diff import diff_cmd
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
@@ -264,6 +265,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(unbound_fallback_toggle)
         self.tree.add_command(btw_cmd)
         self.tree.add_command(context_cmd)
+        self.tree.add_command(diff_cmd)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
