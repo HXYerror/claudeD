@@ -235,6 +235,7 @@ def captured_sessions(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 async def test_thread_race_160004_reuses_existing_thread(
     bot: ClaudedBot,
     captured_sessions: list[dict[str, Any]],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Duplicate MESSAGE_CREATE race:
 
@@ -369,3 +370,70 @@ async def test_thread_race_160004_with_active_session_skips_render(
         "ignoring duplicate MESSAGE_CREATE" in rec.getMessage()
         for rec in caplog.records
     ), f"Expected duplicate-suppression log entry, got: {[r.getMessage() for r in caplog.records]!r}"
+
+
+# ---------------------------------------------------------------------------
+# v1.18 #155 follow-up: TOCTOU inside per-thread lock (engineer R1 important)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_in_flight_race_session_appears_during_lock_acquire(
+    bot: ClaudedBot,
+    captured_sessions: list[dict[str, Any]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Two MESSAGE_CREATE dispatches: both see ``get_session() == None`` pre-lock,
+    both reach the per-thread lock. The waiter must NOT stomp the winner's
+    bridge — the inside-lock re-check should suppress the duplicate.
+
+    Scenario:
+    - First dispatch holds the lock and is mid-``create_session``
+    - Second dispatch acquires the lock right after; sees a live bridge in
+      ``_sessions``; must skip its own ``create_session`` call
+
+    We simulate this by pre-seeding an active bridge into ``_sessions``
+    just before invoking ``_handle_channel_message`` — this represents the
+    state the second dispatch sees once it acquires the lock.
+    """
+    winner_thread = FakeThread(thread_id=88888, name="winner-thread")
+    channel = FakeChannel(channel_id=9001)
+
+    # Subclass FakeRaceMessage to have create_thread SUCCEED (returning a fresh
+    # thread) instead of raising 160004. This forces the handler past the
+    # pre-lock 160004 recovery branch and into the per-thread lock where the
+    # new inside-lock gate must catch the duplicate.
+    class _SuccessMessage(FakeRaceMessage):
+        async def create_thread(self, *, name: str, **kwargs: Any) -> FakeThread:
+            self._create_thread_calls += 1
+            return winner_thread
+
+    msg = _SuccessMessage(
+        channel=channel,
+        content="<@42> hello",
+        bot_user_id=42,
+        existing_thread=winner_thread,
+    )
+
+    # Pre-seed an active bridge for the thread — this is the state the second
+    # dispatch sees inside the lock.
+    active_bridge = MagicMock()
+    active_bridge.is_active = True
+    bot.session_manager._sessions[winner_thread.id] = active_bridge
+
+    import logging
+    caplog.set_level(logging.INFO, logger="clauded.bot")
+    await bot._handle_channel_message(msg)
+
+    # ----- Inside-lock suppression assertions -----
+    # 1) No NEW session was created — the inside-lock re-check caught the duplicate.
+    assert not captured_sessions, (
+        f"Inside-lock TOCTOU: expected no create_session, got: {captured_sessions!r}"
+    )
+    # 2) The active bridge we pre-seeded is still the registered one (not stomped).
+    assert bot.session_manager._sessions[winner_thread.id] is active_bridge
+    # 3) The new inside-lock suppression log fired.
+    assert any(
+        "Thread-race (inside lock)" in rec.getMessage()
+        for rec in caplog.records
+    ), f"Expected inside-lock suppression log, got: {[r.getMessage() for r in caplog.records]!r}"
