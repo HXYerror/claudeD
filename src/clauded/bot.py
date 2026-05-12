@@ -62,6 +62,24 @@ _CACHE_DIR = Path.home() / "Library" / "Caches" / "clauded"
 _HEARTBEAT_PATH = _CACHE_DIR / "heartbeat"
 
 
+def _ensure_runtime_dirs() -> None:
+    """Create ``_LOG_DIR`` and ``_CACHE_DIR`` once at process start.
+
+    Replaces the per-tick ``parent.mkdir`` calls in ``_touch_heartbeat`` and
+    ``_configure_logging`` so a 30 s heartbeat loop and a 1-call logging-setup
+    don't each redo the dir checks (PR #149 R2 engineer suggestion). Swallows
+    ``OSError`` so a read-only or sandboxed home doesn't crash startup; the
+    individual write call sites handle the consequence.
+    """
+    if sys.platform != "darwin":
+        return
+    for d in (_LOG_DIR, _CACHE_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+
 def _touch_heartbeat() -> None:
     """Refresh ``_HEARTBEAT_PATH`` mtime so the external healthcheck sees us alive.
 
@@ -71,11 +89,13 @@ def _touch_heartbeat() -> None:
     macOS-only by design — Linux/Windows dev boxes are no-ops to avoid littering
     ``~/Library/`` outside Darwin. ``OSError`` is swallowed so a read-only home
     or unusual test sandbox never crashes startup.
+
+    Directory creation lives in :func:`_ensure_runtime_dirs` (called once at
+    startup); this function does just the ``touch``.
     """
     if sys.platform != "darwin":
         return
     try:
-        _HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
         _HEARTBEAT_PATH.touch()
     except OSError:
         pass
@@ -925,9 +945,9 @@ def _configure_logging() -> None:
     if sys.platform != "darwin":
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
-    try:
-        _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    # _LOG_DIR was created at startup by _ensure_runtime_dirs(); if it's still
+    # absent (e.g. read-only home, sandboxed test runner) fall back to stderr.
+    if not _LOG_DIR.exists():
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
     handler = RotatingFileHandler(
@@ -947,14 +967,17 @@ def _configure_logging() -> None:
 
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
-    _configure_logging()
-    # Claim "process alive" for the external healthcheck BEFORE bot.run() — a
-    # bad token / network outage makes discord.py block in login forever, which
-    # would otherwise leave the heartbeat file un-created and trigger an
-    # infinite quiet kickstart loop (helper agent → launchctl kickstart -k →
-    # rerun → relogin hang → repeat). The in-loop _heartbeat_task takes over
-    # once setup_hook fires and refreshes mtime every 30 s thereafter.
+    # Order matters (#149 R2 engineer suggestion): create runtime dirs FIRST so
+    # both _touch_heartbeat() and _configure_logging() can rely on them. Then
+    # touch heartbeat BEFORE _configure_logging() — if logging setup ever
+    # raises (e.g. disk full), we still want the external healthcheck to see a
+    # fresh heartbeat instead of looping kickstart-quiet.
+    _ensure_runtime_dirs()
     _touch_heartbeat()
+    _configure_logging()
+    # The in-loop _heartbeat_task takes over once setup_hook fires and
+    # refreshes mtime every 30 s thereafter.
+    log.info("claudeD starting (launchd label: %s)", _LAUNCHD_LABEL)
 
     # Resolve and log the operator's Claude CLI so it's visible at boot time.
     from .cli_paths import resolve_claude_cli
