@@ -318,9 +318,16 @@ class ClaudedBot(commands.Bot):
         log.info("Bot online as %s (id=%s)", user, getattr(user, "id", "?"))
 
     async def on_message(self, message: discord.Message) -> None:  # type: ignore[override]
-        # Ignore self / other bots.
-        if message.author.bot:
+        # Always ignore self.
+        if message.author.id == getattr(self.user, "id", None):
             return
+        # Ignore other bots, except an opt-in testbot allowlist for smoke
+        # testing (set CLAUDED_TESTBOT_ID to the bot account's user id;
+        # leave unset in production).
+        if message.author.bot:
+            testbot_id = os.environ.get("CLAUDED_TESTBOT_ID")
+            if not (testbot_id and str(message.author.id) == testbot_id):
+                return
 
         channel = message.channel
         parent_id = getattr(channel, "parent_id", None)
