@@ -437,10 +437,10 @@ class ClaudedBot(commands.Bot):
 
         # First-time unbound hint, posted before the bridge starts streaming.
         if not is_bound and self.project_manager.should_hint_unbound(channel.id):
-            try:
-                await thread.send(UNBOUND_HINT_MESSAGE)
-            except discord.HTTPException:
-                log.debug("Could not post unbound-fallback hint to thread")
+            # safe_send_message handles transient-blip retries internally (#148
+            # architect §3). Returns None on permanent failure; we just
+            # silently skip the hint in that case.
+            await safe_send_message(thread, content=UNBOUND_HINT_MESSAGE)
 
         # Acquire the per-thread lock *before* creating the session so a
         # concurrent thread message that Discord delivers out of order can't
@@ -485,15 +485,13 @@ class ClaudedBot(commands.Bot):
                 )
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
-                try:
-                    err_embed = discord.Embed(
-                        title="❌ Error",
-                        description=f"```\n{str(exc)[:500]}\n```",
-                        color=COLOR_TOOL_FAILURE,
-                    )
-                    await thread.send(embed=err_embed)
-                except discord.HTTPException:
-                    log.debug("Could not post session-start error to thread")
+                err_embed = discord.Embed(
+                    title="❌ Error",
+                    description=f"```\n{str(exc)[:500]}\n```",
+                    color=COLOR_TOOL_FAILURE,
+                )
+                # #148 architect §3 — retry-aware send (transient blip survival).
+                await safe_send_message(thread, embed=err_embed)
                 return
 
             # Feature #66: Add hourglass reaction
@@ -621,15 +619,14 @@ class ClaudedBot(commands.Bot):
                     )
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
-                    try:
-                        err_embed = discord.Embed(
-                            title="❌ Error",
-                            description=f"```\n{str(exc)[:500]}\n```",
-                            color=COLOR_TOOL_FAILURE,
-                        )
-                        await message.channel.send(embed=err_embed)
-                    except discord.HTTPException:
-                        log.debug("Could not post session-start error to thread")
+                    err_embed = discord.Embed(
+                        title="❌ Error",
+                        description=f"```\n{str(exc)[:500]}\n```",
+                        color=COLOR_TOOL_FAILURE,
+                    )
+                    # #148 architect §3 — retry-aware send (transient blip survival).
+                    await safe_send_message(message.channel, embed=err_embed)
+                    return
                     return
 
             # Feature #66: Add hourglass reaction
@@ -885,15 +882,14 @@ class ClaudedBot(commands.Bot):
                         )
                     except Exception as start_exc:
                         log.exception("Retry: failed to restart ClaudeBridge")
-                        try:
-                            err_embed = discord.Embed(
-                                title="❌ Error",
-                                description=f"```\n{str(start_exc)[:500]}\n```",
-                                color=COLOR_TOOL_FAILURE,
-                            )
-                            await thread.send(embed=err_embed)
-                        except discord.HTTPException:
-                            log.debug("Retry: could not surface restart error")
+                        err_embed = discord.Embed(
+                            title="❌ Error",
+                            description=f"```\n{str(start_exc)[:500]}\n```",
+                            color=COLOR_TOOL_FAILURE,
+                        )
+                        # #148 architect §3 — retry-embed survives a Discord
+                        # blip; on permanent failure we silently drop.
+                        await safe_send_message(thread, embed=err_embed)
                         return
                     new_renderer = DiscordRenderer(thread)
                     await self._render_with_retry(
