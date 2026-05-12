@@ -170,3 +170,17 @@ async def test_reject_if_unbound_thread_with_no_parent_id_falls_back_to_channel_
 
     assert result is True
     bot.project_manager.is_bound.assert_called_once_with(6001)
+
+
+def test_unbound_refuse_message_is_single_line() -> None:
+    """Regression pin (#159 R1 tester nice-to-have): ``UNBOUND_REFUSE_MESSAGE``
+    must not contain ``\\n``. The existing ``test_group_a_unbound`` substring
+    matchers do ``UNBOUND_REFUSE_MESSAGE in str(call_tuple)`` where the call
+    tuple repr converts embedded newlines to ``\\\\n``, defeating the match.
+    A future contributor wanting multi-line would need to also update those
+    matchers; this guard makes the constraint loud."""
+    from clauded.cogs._unbound import UNBOUND_REFUSE_MESSAGE
+    assert "\n" not in UNBOUND_REFUSE_MESSAGE, (
+        "UNBOUND_REFUSE_MESSAGE must stay single-line — see #159 R1 tester note "
+        "for the str(tuple) repr trap that breaks 15 existing tests."
+    )
