@@ -235,7 +235,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
-            debug_toggle, notify_toggle, unbound_fallback_toggle,
+            debug_toggle, notify_toggle, unbound_fallback_toggle, btw_cmd,
         )
 
         self.tree.add_command(project_group)
@@ -261,6 +261,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(debug_toggle)
         self.tree.add_command(notify_toggle)
         self.tree.add_command(unbound_fallback_toggle)
+        self.tree.add_command(btw_cmd)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 

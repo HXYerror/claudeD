@@ -438,3 +438,96 @@ async def unbound_fallback_toggle(
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# /btw — transparent forward of side-question to Claude CLI (#163 sub-task 1)
+# ---------------------------------------------------------------------------
+
+@app_commands.command(
+    name="btw",
+    description="Ask a quick side question without interrupting the main conversation.",
+)
+@app_commands.describe(text="The side question (forwarded to Claude with /btw prefix)")
+async def btw_cmd(interaction: discord.Interaction, text: str) -> None:
+    """Transparent forward of `/btw <text>` to the Claude CLI in this thread.
+
+    Mode B1 (per #163): the bundled Claude Code CLI natively recognizes the
+    `/btw` prefix and opens a side-track that answers the question without
+    interrupting the main agent's turn. claudeD just forwards `f"/btw {text}"`
+    as a user message via the existing bridge — zero semantic divergence from
+    direct CLI use.
+
+    Requires:
+      - Active session in this thread (use a thread that already had a Claude
+        @-mention or send-to-claude turn).
+      - User invoking from inside a thread (not a top-level channel; the side
+        question belongs to whatever conversation is happening in the thread).
+    """
+    from ..bot import ClaudedBot
+    from ..discord_renderer import DiscordRenderer
+
+    log.info(
+        "/btw text-len=%d channel=%s",
+        len(text), interaction.channel_id,
+    )
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("❌ Bot not ready.", ephemeral=True)
+        return
+
+    # Must be invoked from inside a thread (where there's an active session).
+    channel = interaction.channel
+    if not isinstance(channel, discord.Thread):
+        await interaction.response.send_message(
+            "❌ `/btw` must be used inside a thread. Start (or resume) a Claude "
+            "thread first, then invoke `/btw <question>` there.",
+            ephemeral=True,
+        )
+        return
+
+    # Empty / whitespace-only text → reject with usage hint.
+    if not text or not text.strip():
+        await interaction.response.send_message(
+            "❌ Side question text is empty. Usage: `/btw <your question>`",
+            ephemeral=True,
+        )
+        return
+
+    thread_id = channel.id
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is None or not bridge.is_active:
+        await interaction.response.send_message(
+            "❌ No active Claude session in this thread. Send a regular message "
+            "to start (or `/session resume`), then try `/btw` again.",
+            ephemeral=True,
+        )
+        return
+
+    # Acknowledge synchronously — the actual side-track render runs as a
+    # background task because the slash interaction must respond within 3s but
+    # Claude's reply takes much longer.
+    await interaction.response.send_message(
+        f"💬 Forwarding side question to Claude: `{text[:200]}{'…' if len(text) > 200 else ''}`",
+        ephemeral=True,
+    )
+
+    # Forward to the bridge with the CLI's native /btw prefix. The bundled
+    # claude CLI recognizes this and opens a side-track in-session.
+    forwarded = f"/btw {text}"
+    renderer = DiscordRenderer(channel)
+    try:
+        await renderer.render_response(bridge, forwarded)
+    except Exception:
+        log.exception("/btw render failed")
+        try:
+            await channel.send(
+                embed=discord.Embed(
+                    title="❌ /btw failed",
+                    description="The side-track question couldn't complete. "
+                    "The main session is still alive.",
+                    color=COLOR_TOOL_FAILURE,
+                )
+            )
+        except Exception:
+            pass
