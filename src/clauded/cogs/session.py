@@ -48,6 +48,63 @@ async def session_stop(interaction: discord.Interaction) -> None:
         )
 
 
+@session_group.command(
+    name="clear",
+    description="Drop context and start a fresh session in this thread (#163 sub-task 2).",
+)
+async def session_clear(interaction: discord.Interaction) -> None:
+    """Tear down the current bridge AND remove the persisted resume entry.
+
+    The CLI's native ``/clear`` semantics: start a new session with empty
+    context; the previous session stays on disk (Claude's own jsonl history)
+    but won't be resumed by this thread.
+
+    Inverse of ``/session resume``. Long sessions warrant a clean restart
+    without leaving the thread — this gives users that control without
+    requiring them to ``/session stop`` + leave + rebind.
+
+    Implementation:
+      - Stop the live bridge (if any) via ``stop_session``
+      - Remove the entry from ``data/sessions.json`` via
+        ``session_store.remove_session`` so the next user message starts
+        a fresh session (no ``resume_session_id`` in SessionConfig)
+    """
+    log.info("/session clear channel=%s", interaction.channel_id)
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+
+    thread_id = interaction.channel_id
+    if thread_id is None:
+        await interaction.response.send_message(
+            "No thread context for this command.", ephemeral=True
+        )
+        return
+
+    # Atomic clear: holds the per-thread lock around stop + remove so a
+    # concurrent /session resume (which also takes the lock) can't race in.
+    had_active, had_stored = await bot.session_manager.clear_session(thread_id)
+
+    if had_active or had_stored:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="🗑️ Session cleared",
+                description=(
+                    "Dropped this thread's Claude session context. The next "
+                    "message will start a fresh session (no resume)."
+                ),
+                color=COLOR_INFO,
+            ),
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "No session to clear in this thread.", ephemeral=True
+        )
+
+
 @session_group.command(name="info", description="Show the current session's status.")
 async def session_info(interaction: discord.Interaction) -> None:
     log.info("/session info channel=%s", interaction.channel_id)
