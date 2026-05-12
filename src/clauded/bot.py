@@ -183,8 +183,25 @@ class ClaudedBot(commands.Bot):
         self.agent_manager = AgentManager()
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
+        # v1.18 #160: runtime override for allow_unbound_fallback. None = use
+        # ``self.config.allow_unbound_fallback`` (env-derived). When set via
+        # ``/unbound-fallback`` slash command, takes effect immediately and
+        # survives until process restart (Config is frozen by design; this
+        # mirror lives on the mutable bot instance instead).
+        self._allow_unbound_fallback_runtime: bool | None = None
         self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
+
+    @property
+    def allow_unbound_fallback(self) -> bool:
+        """Effective unbound-fallback policy: runtime override > config default.
+
+        Toggle via ``/unbound-fallback`` (admin slash command, runtime only) or
+        set ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` in the bot env (persistent).
+        """
+        if self._allow_unbound_fallback_runtime is not None:
+            return self._allow_unbound_fallback_runtime
+        return self.config.allow_unbound_fallback
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -227,7 +244,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
-            debug_toggle, notify_toggle,
+            debug_toggle, notify_toggle, unbound_fallback_toggle,
         )
 
         self.tree.add_command(project_group)
@@ -252,6 +269,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(toggle_bare)
         self.tree.add_command(debug_toggle)
         self.tree.add_command(notify_toggle)
+        self.tree.add_command(unbound_fallback_toggle)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -362,7 +380,7 @@ class ClaudedBot(commands.Bot):
         # messages in the same channel still silent-return (no spam).
         if (
             not self.project_manager.is_bound(channel.id)
-            and not self.config.allow_unbound_fallback
+            and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(channel.id):
                 try:
@@ -599,7 +617,7 @@ class ClaudedBot(commands.Bot):
         # channels of thread messages don't silent-fail either.
         if (
             not self.project_manager.is_bound(parent_id)
-            and not self.config.allow_unbound_fallback
+            and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(parent_id):
                 try:

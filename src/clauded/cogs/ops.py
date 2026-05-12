@@ -372,3 +372,56 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
         ),
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# /unbound-fallback command — runtime toggle for unbound-channel fallback
+# ---------------------------------------------------------------------------
+
+@app_commands.command(
+    name="unbound-fallback",
+    description="Toggle CLAUDED_ALLOW_UNBOUND_FALLBACK at runtime (admin; no restart needed).",
+)
+@app_commands.describe(
+    enabled="True: unbound channels fall back to ~ (operator's home). False: refuse with hint."
+)
+@app_commands.default_permissions(administrator=True)
+async def unbound_fallback_toggle(
+    interaction: discord.Interaction, enabled: bool
+) -> None:
+    """Runtime override of ``Config.allow_unbound_fallback``.
+
+    Not persisted: bot restart re-loads the env-default. This is intentional —
+    the flag controls a security-relevant gate (Discord channel-write
+    permission ≠ shell access in operator's $HOME), so it fails-closed on
+    every restart unless ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` is set in the
+    bot environment (the env-persistent path).
+    """
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bot._allow_unbound_fallback_runtime = enabled
+    # Reset the refuse-hint set so the next unbound @bot will surface a hint
+    # again under the new policy (when enabled=True the hint never fires
+    # because the gate doesn't trip; when enabled=False the user gets a fresh
+    # nudge on the next attempt). Without this, a process that's already
+    # shown the hint once before the operator toggled the policy would stay
+    # silent on the next message even though the policy now warrants surfacing.
+    bot.project_manager._refused_unbound_channels.clear()
+    state = "ON (fallback to ~)" if enabled else "OFF (refuse with hint)"
+    persist_note = (
+        "\nℹ️ Runtime only — set `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` in the bot "
+        "environment for the setting to survive restart."
+    )
+    embed = discord.Embed(
+        title=f"🔓 Unbound fallback: {state}",
+        description=(
+            "Bot will create sessions in `~` for unbound channels."
+            if enabled
+            else "Bot will refuse unbound channels and direct user to `/project bind`."
+        ) + persist_note,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
