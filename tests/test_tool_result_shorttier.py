@@ -59,8 +59,13 @@ def test_bash_grep_glob_read_still_match_directly():
 
 
 def test_short_result_inline_arrow_display():
-    """When result content is short (<200 chars), single-line, non-empty,
-    rolling log renders ``✅ {name} → {content}`` instead of bare ``✅ {name}``.
+    """When result content is short (<200 chars), non-empty, rolling log
+    renders ``✅ {name} → {content}`` instead of bare ``✅ {name}``.
+
+    v1.18 R3 (user feedback): multiline short outputs are NO LONGER
+    excluded — they collapse to ``line1 │ line2 │ line3`` so a `ls`
+    that prints 3 file names still shows the actual file names inline
+    instead of disappearing into a bare ✅.
 
     Pure-string logic test — the production code in render_response is
     integration-tested elsewhere; this pins the threshold semantics.
@@ -70,27 +75,29 @@ def test_short_result_inline_arrow_display():
         return (
             content is not None
             and len(content) < 200
-            and "\n" not in content
             and content.strip() != ""
         )
 
     assert should_inline("42")                # tiny ✅
     assert should_inline("Found 7 matches")   # short prose ✅
     assert should_inline("x" * 199)           # boundary
+    assert should_inline("line1\nline2")      # multiline short ✅ (new in R3)
+    assert should_inline("a\nb\nc")           # 3 lines short ✅
     assert not should_inline("x" * 200)       # over threshold
-    assert not should_inline("line1\nline2")  # multiline excluded
     assert not should_inline("")              # empty excluded
     assert not should_inline("   \t")         # whitespace-only excluded
     assert not should_inline(None)            # None excluded
 
 
-def test_short_result_backtick_escape():
-    """Inline display strips backticks from content to avoid breaking the
-    rolling-log embed's markdown rendering."""
-    raw = "result with `backticks` inside"
-    safe = raw.strip().replace("`", "'")
+def test_short_result_backtick_escape_and_newline_collapse():
+    """Inline display: backticks → single-quotes (avoids markdown break)
+    AND newlines → ``│`` separator (keeps multiline outputs on one log
+    line, v1.18 R3 user feedback)."""
+    raw = "result with `backticks`\nand a newline"
+    safe = raw.strip().replace("`", "'").replace("\n", " │ ")
     assert "`" not in safe
-    assert safe == "result with 'backticks' inside"
+    assert "\n" not in safe
+    assert safe == "result with 'backticks' │ and a newline"
 
 
 def test_skill_and_fallback_rolling_log_match():
@@ -434,16 +441,15 @@ def test_medium_tier_error_path_does_not_emit_detail_message():
     )
 
 
-def test_multiline_short_content_falls_to_bare_branch():
-    """Content < 200 chars but multiline goes to the bare ``✅ Bash`` branch
-    (not short, not medium). User sees `✅ Bash` with no inline arrow.
-    Architectural choice: multiline short outputs are visually awkward
-    inline; user can run the tool again with more flags if they want detail.
-    """
+def test_multiline_short_content_inlines_with_separator():
+    """v1.18 R3 (user feedback): content < 200 chars with multiline now
+    inlines with ``│`` separator instead of falling to bare ``✅ Bash``.
+    Architectural choice: short multi-line outputs (3-file ``ls``,
+    7-match ``grep``) are useful to see; the separator keeps the rolling
+    log compact."""
     def is_short(content):
         return (
             len(content) < 200
-            and "\n" not in content
             and content.strip() != ""
         )
     def is_medium(content, is_err=False, is_short_val=False):
@@ -453,14 +459,17 @@ def test_multiline_short_content_falls_to_bare_branch():
             and 200 <= len(content) < 8000
             and content.strip() != ""
         )
-    multiline_short = "line 1\nline 2\nline 3"  # 20 chars but multiline
+    multiline_short = "line 1\nline 2\nline 3"  # 20 chars, multiline
     assert len(multiline_short) < 200
     assert "\n" in multiline_short
     short_result = is_short(multiline_short)
     medium_result = is_medium(multiline_short, is_short_val=short_result)
-    assert not short_result, "multiline short content must NOT match short tier"
-    assert not medium_result, "multiline short content must NOT match medium tier (len<200)"
-    # → falls through to bare `✅ Bash` (the else branch)
+    assert short_result, "multiline short content MUST now match short tier (R3)"
+    assert not medium_result, "multiline short content excluded from medium tier (handled by short)"
+    # Verify separator collapse
+    rendered = multiline_short.replace("`", "'").replace("\n", " │ ")
+    assert "\n" not in rendered
+    assert rendered == "line 1 │ line 2 │ line 3"
 
 
 @pytest.mark.asyncio

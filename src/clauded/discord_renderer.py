@@ -1101,14 +1101,19 @@ class DiscordRenderer:
                                     matches_alias = alias and line.startswith("🔄 " + alias)
                                     if not (matches_name or matches_alias):
                                         continue
-                                    # #161 short tier: when result is short and
-                                    # single-line, surface it inline so user
-                                    # sees ``✅ Bash → 42`` instead of bare ✅ Bash.
-                                    # Per PRD: < 200 chars and no newlines.
+                                    # #161 short tier: when result is short
+                                    # (< 200 chars), surface it inline so
+                                    # user sees the actual data instead of a
+                                    # bare ``✅ Bash``. v1.18 R3 (user
+                                    # feedback "1-3 lines should display
+                                    # directly"): drop the single-line
+                                    # constraint. Multiline short outputs
+                                    # collapse to ``line1 │ line2 │ line3``
+                                    # so they fit in the rolling-log embed
+                                    # without ballooning vertical height.
                                     content_str = str(block.content) if block.content else ""
                                     is_short = (
                                         len(content_str) < 200
-                                        and "\n" not in content_str
                                         and content_str.strip() != ""
                                     )
                                     # #161 medium tier (v1.18 R3): 200 <=
@@ -1136,8 +1141,14 @@ class DiscordRenderer:
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
                                     elif is_short:
                                         # Strip backticks to avoid breaking the
-                                        # rolling-log embed's markdown.
-                                        safe = content_str.strip().replace("`", "'")
+                                        # rolling-log embed's markdown. Collapse
+                                        # newlines to ``│`` so multi-line short
+                                        # outputs fit on one log line.
+                                        safe = (
+                                            content_str.strip()
+                                            .replace("`", "'")
+                                            .replace("\n", " │ ")
+                                        )
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
                                     elif is_medium:
                                         # Rolling log shows summary;
