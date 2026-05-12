@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import time
 import uuid
@@ -221,48 +222,47 @@ def _extract_subagent_stats(content: Any) -> dict[str, Any] | None:
     present — callers should treat ``None`` as "don't render a mini-footer"
     rather than crashing.
 
+    Fails-soft: ANY exception during parsing (malformed JSON, deep nesting
+    RecursionError, non-numeric values) yields ``None``. This is the
+    boundary between SDK output (attacker-controllable via sub-agent stdout)
+    and the renderer's fatal-error path; we MUST NOT let a malformed stats
+    string tear down the whole turn (R1 engineer #1 + security #1).
+
     #160 Fix C: sub-agent threads previously had NO footer at all. The user
     runs ``/crew`` workflows that spawn 5-10 sub-threads per turn; surfacing
     per-sub-thread cost is the highest-value half of this fix.
     """
     if content is None:
         return None
-    text = content if isinstance(content, str) else str(content)
-    # Try JSON first; common SDK shape is `{"totalDurationMs": ..., ...}`.
-    import json
-    import re
-    parsed: dict[str, Any] | None = None
     try:
-        candidate = json.loads(text)
-        if isinstance(candidate, dict):
-            parsed = candidate
-    except (json.JSONDecodeError, ValueError):
-        parsed = None
-    # Fallback: scrape `key=val` or `"key": val` from free-form content.
-    if parsed is None:
-        scraped: dict[str, Any] = {}
-        for key in ("totalDurationMs", "totalTokens", "totalCostUsd",
-                    "totalToolUseCount", "inputTokens", "outputTokens"):
-            m = re.search(rf'"{key}":\s*([\d.]+)', text)
-            if m:
-                scraped[key] = float(m.group(1)) if "." in m.group(1) else int(m.group(1))
-        parsed = scraped if scraped else None
-    if not parsed:
+        text = content if isinstance(content, str) else str(content)
+        # JSON-only — the regex scrape fallback from R1 was dropped per
+        # simplicity/engineer/security feedback: free-form text containing
+        # quoted stat keys (e.g. ``"totalTokens": 999999`` in a Claude
+        # narrative) was producing false positives, and the regex's
+        # ``[\d.]+`` over-matched values like ``1.2.3`` causing ``float()``
+        # to crash and tear down the whole turn.
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            return None
+        out: dict[str, Any] = {}
+        if "totalDurationMs" in parsed:
+            out["duration_s"] = float(parsed["totalDurationMs"]) / 1000
+        if "totalTokens" in parsed:
+            out["total_tokens"] = int(parsed["totalTokens"])
+        if "inputTokens" in parsed:
+            out["input_tokens"] = int(parsed["inputTokens"])
+        if "outputTokens" in parsed:
+            out["output_tokens"] = int(parsed["outputTokens"])
+        if "totalCostUsd" in parsed:
+            out["cost"] = float(parsed["totalCostUsd"])
+        if "totalToolUseCount" in parsed:
+            out["tool_count"] = int(parsed["totalToolUseCount"])
+        return out if out else None
+    except Exception:
+        # Malformed JSON / unexpected types / recursion / encoding errors:
+        # treat as "no stats" and let the caller skip the mini-footer.
         return None
-    out: dict[str, Any] = {}
-    if "totalDurationMs" in parsed:
-        out["duration_s"] = float(parsed["totalDurationMs"]) / 1000
-    if "totalTokens" in parsed:
-        out["total_tokens"] = int(parsed["totalTokens"])
-    if "inputTokens" in parsed:
-        out["input_tokens"] = int(parsed["inputTokens"])
-    if "outputTokens" in parsed:
-        out["output_tokens"] = int(parsed["outputTokens"])
-    if "totalCostUsd" in parsed:
-        out["cost"] = float(parsed["totalCostUsd"])
-    if "totalToolUseCount" in parsed:
-        out["tool_count"] = int(parsed["totalToolUseCount"])
-    return out if out else None
 
 
 def _format_subagent_footer(stats: dict[str, Any] | None) -> str | None:
@@ -271,17 +271,23 @@ def _format_subagent_footer(stats: dict[str, Any] | None) -> str | None:
     Returns None if stats is None or has no renderable fields, so the caller
     can simply ``if footer := _format_subagent_footer(stats):`` without an
     extra emptiness check.
+
+    Token display: prefer direction-explicit ``input_tokens`` + ``output_tokens``
+    over aggregate ``total_tokens``. Only fall back to total when neither
+    direction is available (R1 engineer #2: prior asymmetric rendering could
+    show both 📥 and 📊 on a stats dict that had input+total).
     """
     if not stats:
         return None
     parts: list[str] = []
     if "cost" in stats:
         parts.append(f"💰 ${stats['cost']:.4f}")
+    has_direction = "input_tokens" in stats or "output_tokens" in stats
     if "input_tokens" in stats:
         parts.append(f"📥 {_fmt_tokens(stats['input_tokens'])}")
     if "output_tokens" in stats:
         parts.append(f"📤 {_fmt_tokens(stats['output_tokens'])}")
-    elif "total_tokens" in stats:
+    if not has_direction and "total_tokens" in stats:
         parts.append(f"📊 {_fmt_tokens(stats['total_tokens'])}")
     if "duration_s" in stats:
         parts.append(f"⏱️ {stats['duration_s']:.1f}s")
@@ -1058,6 +1064,14 @@ class DiscordRenderer:
                                 "Footer edit failed; sending as standalone message"
                             )
                             await self._safe_send(content=footer_text)
+                            # R1 engineer #4: standalone-send updates ``_last_msg``
+                            # to the footer message itself, which would cause the
+                            # NEXT turn (renderer instance is reused across turns
+                            # per thread) to try editing/appending to the footer.
+                            # Clear the shadow so the next turn re-attaches
+                            # cleanly to a fresh cursor message.
+                            self._last_msg = None
+                            self._last_msg_text = ""
                     else:
                         # Edit would blow Discord's 2000-char hard cap; send footer
                         # standalone instead of silently dropping.
@@ -1065,11 +1079,15 @@ class DiscordRenderer:
                             "Footer would exceed DISCORD_MAX_LEN; sending standalone"
                         )
                         await self._safe_send(content=footer_text)
+                        self._last_msg = None  # R1 engineer #4 (see above)
+                        self._last_msg_text = ""
                 else:
                     # No live cursor message (e.g., the turn produced only an
                     # attachment / PNG-only path). Send footer as its own message
                     # so cost/duration still surface.
                     await self._safe_send(content=footer_text)
+                    self._last_msg = None  # R1 engineer #4 (see above)
+                    self._last_msg_text = ""
             except Exception:
                 # #160 Fix B: never silently swallow. Log so future failures
                 # are diagnosable from bot.log.
