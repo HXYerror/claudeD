@@ -403,3 +403,161 @@ async def test_medium_tier_integration_emits_spoiler_embed():
     # Original content lines preserved inside the spoiler
     assert "line 0: some output text here" in detail.description
     assert "line 29: some output text here" in detail.description
+
+
+# ---------------------------------------------------------------------------
+# R1 tester gaps: error+medium-length, multiline-but-short else branch
+# ---------------------------------------------------------------------------
+
+
+def test_medium_tier_error_path_does_not_emit_detail_embed():
+    """When is_err=True and content is medium-length, the rolling log shows
+    the error text (capped at 100 chars), NOT the medium-tier summary, and
+    NO separate detail embed is sent (errors are surfaced inline, not hidden
+    in a spoiler the user has to click to see)."""
+    def is_medium(content, is_err=False, is_short=False):
+        return (
+            not is_short
+            and not is_err
+            and 200 <= len(content) < 3500
+            and content.strip() != ""
+        )
+    error_content = "x" * 500  # medium-length BUT is_err
+    assert not is_medium(error_content, is_err=True), (
+        "is_err must override medium-tier predicate"
+    )
+
+
+def test_multiline_short_content_falls_to_bare_branch():
+    """Content < 200 chars but multiline goes to the bare ``✅ Bash`` branch
+    (not short, not medium). User sees `✅ Bash` with no inline arrow.
+    Architectural choice: multiline short outputs are visually awkward
+    inline; user can run the tool again with more flags if they want detail.
+    """
+    def is_short(content):
+        return (
+            len(content) < 200
+            and "\n" not in content
+            and content.strip() != ""
+        )
+    def is_medium(content, is_err=False, is_short_val=False):
+        return (
+            not is_short_val
+            and not is_err
+            and 200 <= len(content) < 3500
+            and content.strip() != ""
+        )
+    multiline_short = "line 1\nline 2\nline 3"  # 20 chars but multiline
+    assert len(multiline_short) < 200
+    assert "\n" in multiline_short
+    short_result = is_short(multiline_short)
+    medium_result = is_medium(multiline_short, is_short_val=short_result)
+    assert not short_result, "multiline short content must NOT match short tier"
+    assert not medium_result, "multiline short content must NOT match medium tier (len<200)"
+    # → falls through to bare `✅ Bash` (the else branch)
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_detail_send_failure_downgrades_log():
+    """R1 engineer #2 mitigation: if the detail embed send fails (rate-
+    limited, network blip), rewrite the rolling log line to NOT promise
+    a clickable detail. User would otherwise see ``click below to expand``
+    pointing at no follow-up message.
+    """
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self):
+            self.content = ""
+            self.embeds = []
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            return self
+        async def delete(self):
+            return None
+
+    class FailingSendTarget:
+        """Target whose .send() returns None for the detail embed (sim'd
+        rate-limit / network blip) but succeeds for the rolling-log embed."""
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._call_count = 0
+        async def send(self, *args, **kwargs):
+            self._call_count += 1
+            # Rolling-log first send (when tool_log_msg is None) succeeds.
+            # The medium-tier detail embed is sent AFTER tool_log_msg edits,
+            # so distinguish by title:
+            if kwargs.get("embed") and "Tool Activity" in (kwargs["embed"].title or ""):
+                msg = FakeMessage()
+                msg.embeds = [kwargs["embed"]]
+                self._sent.append(msg)
+                return msg
+            # Simulate detail-embed send failure
+            if kwargs.get("embed") and "result" in (kwargs["embed"].title or ""):
+                return None
+            # Fallback (cost footer, etc.)
+            msg = FakeMessage()
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            self._sent.append(msg)
+            return msg
+
+    medium_content = "\n".join(f"line {i}: out" for i in range(50))
+    assert 200 <= len(medium_content) < 3500
+
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-fail",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FailingSendTarget()
+    renderer = DiscordRenderer(target)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls")
+
+    # Find the LAST Tool Activity rolling-log embed
+    rolling_embeds = [m for m in target._sent if m.embeds and "Tool Activity" in (m.embeds[0].title or "")]
+    assert rolling_embeds, "Expected at least one Tool Activity rolling-log embed"
+    final_log_desc = rolling_embeds[-1].embeds[0].description
+    # The rolling log line MUST have been downgraded to NOT say "click below"
+    assert "click below" not in final_log_desc, (
+        f"After detail send failure, rolling log MUST NOT promise a click target; "
+        f"got: {final_log_desc!r}"
+    )
+    # Should mention the failure
+    assert "detail send failed" in final_log_desc, (
+        f"Expected 'detail send failed' in downgraded rolling log; "
+        f"got: {final_log_desc!r}"
+    )

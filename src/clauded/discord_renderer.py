@@ -1137,7 +1137,27 @@ class DiscordRenderer:
                                         description=spoiler_body,
                                         color=COLOR_TOOL_SUCCESS,
                                     )
-                                    await self._safe_send(embed=detail_embed)
+                                    sent = await self._safe_send(embed=detail_embed)
+                                    if sent is None:
+                                        # R1 engineer #2: detail embed send
+                                        # failed (rate-limited, network blip).
+                                        # Rewrite the rolling log line to NOT
+                                        # promise a clickable detail — the
+                                        # user would otherwise see ``click
+                                        # below to expand`` pointing at
+                                        # nothing. Downgrade to bare summary.
+                                        for j in range(len(tool_log_lines) - 1, -1, -1):
+                                            if tool_log_lines[j].startswith(f"{status} {name}:") and "click below" in tool_log_lines[j]:
+                                                tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; detail send failed)"
+                                                break
+                                        # Refresh the rolling log embed so
+                                        # the rewrite reaches the user too.
+                                        refresh_embed = discord.Embed(
+                                            title="🔧 Tool Activity",
+                                            description="\n".join(tool_log_lines[-15:]),
+                                            color=COLOR_TOOL_SUCCESS,
+                                        )
+                                        await self._safe_edit(tool_log_msg, embed=refresh_embed)
                             elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
                                 if is_err:
