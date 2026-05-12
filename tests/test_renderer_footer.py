@@ -274,3 +274,6 @@ def test_extract_subagent_stats_usage_dict_wins_over_flat():
     result = _extract_subagent_stats(mixed_input)
     assert result["input_tokens"] == 10
     assert result["output_tokens"] == 20
+
+
+# ---------------------------------------------------------------------------

@@ -31,7 +31,7 @@ from clauded.claude_bridge import (
     ToolResultBlock,
     ResultMessage,
 )
-from claude_agent_sdk.types import AssistantMessage, StreamEvent
+from claude_agent_sdk.types import AssistantMessage, StreamEvent, UserMessage
 
 
 # ---------------------------------------------------------------------------
@@ -737,3 +737,137 @@ async def test_fallback_inline_when_thread_creation_fails():
     # Should have inline fallback separator embed
     embed_msgs = [m for m in main_thread._messages if m.embeds and "Subtask" in (m.embeds[0].title or "")]
     assert len(embed_msgs) >= 1
+
+
+# ---------------------------------------------------------------------------
+# #172 regression pin: sub-agent footer must read tool_use_result from
+# UserMessage, NOT block.content. Drives full render_response loop with the
+# real SDK shape (UserMessage with tool_use_result dict) and asserts the
+# Subtask Complete embed description contains the mini-footer.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_subagent_footer_renders_from_user_message_tool_use_result():
+    """The bug in #160 Fix C was: helper got block.content (list of text
+    blocks) so silently returned None, mini-footer never rendered. Tests
+    used synthetic JSON strings as helper input — never the real SDK shape.
+
+    This integration test reproduces the actual SDK 0.1.80 event flow:
+      1. AssistantMessage opens Task tool_use
+      2. UserMessage carries the ToolResultBlock AND has tool_use_result
+         attribute populated with the cost/duration/token stats
+      3. ResultMessage closes the turn
+
+    Post-fix: the mini-footer must be in the Subtask Complete embed
+    description (the cost-aware version of "Reviewed 5 files; LGTM.").
+    """
+    parent_channel = FakeChannel()
+    main_thread = FakeMainThread(parent_channel=parent_channel, name="sub-cost")
+
+    # Track sub-threads created during this test (the production code calls
+    # ``anchor.create_thread(...)`` where ``anchor`` is a FakeMessage). The
+    # default FakeMessage.create_thread returns a new FakeSubThread but
+    # doesn't store a reference. We patch it locally so the test can find
+    # the sub-thread embed afterwards.
+    created_sub_threads: list = []
+    original_create_thread = FakeMessage.create_thread
+    async def tracking_create_thread(self, *, name: str, auto_archive_duration: int = 60):
+        thread = await original_create_thread(self, name=name, auto_archive_duration=auto_archive_duration)
+        created_sub_threads.append(thread)
+        return thread
+    FakeMessage.create_thread = tracking_create_thread
+
+    real_tool_use_result = {
+        "status": "completed",
+        "totalDurationMs": 14300,
+        "totalTokens": 2050,
+        "totalToolUseCount": 5,
+        "usage": {"input_tokens": 850, "output_tokens": 1200},
+    }
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(
+                    id="task-1", name="Task",
+                    input={"description": "review files", "prompt": "review"},
+                ),
+            ],
+            model="claude-sonnet",
+            parent_tool_use_id=None,
+        ),
+        # Critical: UserMessage with tool_use_result, NOT AssistantMessage.
+        # The pre-#172 code path read block.content which is the list of
+        # text blocks (the human report); the real stats live on
+        # UserMessage.tool_use_result as a dict.
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="task-1",
+                    content=[{"type": "text", "text": "Reviewed 5 files; LGTM."}],
+                    is_error=False,
+                ),
+            ],
+            parent_tool_use_id=None,
+            tool_use_result=real_tool_use_result,
+        ),
+        ResultMessage(
+            subtype="result",
+            duration_ms=15000,
+            duration_api_ms=14000,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-172",
+            total_cost_usd=0.005,
+        ),
+    ]
+
+    bridge = FakeBridge(events)
+    renderer = DiscordRenderer(main_thread)
+    try:
+        await renderer.render_response(bridge, "kick off Task")
+    finally:
+        # Restore original FakeMessage.create_thread
+        FakeMessage.create_thread = original_create_thread
+
+    # Collect ALL embed-bearing messages: main thread + parent channel +
+    # any sub-thread created during the run.
+    all_msgs = list(main_thread._messages)
+    all_msgs.extend(parent_channel._messages)
+    for thread in created_sub_threads:
+        all_msgs.extend(thread._messages)
+    subtask_embeds = []
+    for m in all_msgs:
+        if m.embeds and "Subtask Complete" in (m.embeds[0].title or ""):
+            subtask_embeds.append(m.embeds[0])
+
+    assert subtask_embeds, (
+        "Expected at least one Subtask Complete embed; got titles: "
+        f"{[(m.embeds[0].title if m.embeds else None) for m in all_msgs]}"
+    )
+    # Look for the mini-footer in the SUB-THREAD embed (per PRD invariant:
+    # main-thread summary stays as pure mention link; footer lives only
+    # in the sub-thread).
+    sub_thread_embed = None
+    for thread in created_sub_threads:
+        for m in thread._messages:
+            if m.embeds and "Subtask Complete" in (m.embeds[0].title or ""):
+                sub_thread_embed = m.embeds[0]
+                break
+        if sub_thread_embed:
+            break
+    assert sub_thread_embed is not None, (
+        "Sub-thread should have its own Subtask Complete embed with the footer"
+    )
+    desc = sub_thread_embed.description or ""
+    # Pre-#172 desc was just the 300-char excerpt: "Reviewed 5 files; LGTM."
+    # Post-#172 it includes a mini-footer like "💰 $0.0050 │ 📥 850 │ ⏱️ 14.3s"
+    assert "14.3s" in desc, (
+        f"Expected ⏱️ 14.3s in mini-footer (from totalDurationMs=14300); "
+        f"got desc: {desc!r}"
+    )
+    # 850 input tokens from usage.input_tokens
+    assert "850" in desc
+    # 1.2k output tokens (1200 humanized)
+    assert "1.2k" in desc
