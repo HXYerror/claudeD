@@ -183,6 +183,14 @@ class ClaudedBot(commands.Bot):
         self.agent_manager = AgentManager()
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
+        # v1.18 #160: runtime-toggleable allow_unbound_fallback. Initialized
+        # from env-derived ``self.config.allow_unbound_fallback`` and
+        # mutated by the ``/unbound-fallback`` admin slash command. Plain
+        # mutable bool matches the sibling ``_debug_logging`` /
+        # ``_pre_tool_notifications`` pattern in this same class; bot
+        # restart re-reads env-default so the flag fails-closed unless
+        # ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` is set in the bot env.
+        self.allow_unbound_fallback: bool = config.allow_unbound_fallback
         self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
 
@@ -227,7 +235,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
-            debug_toggle, notify_toggle,
+            debug_toggle, notify_toggle, unbound_fallback_toggle,
         )
 
         self.tree.add_command(project_group)
@@ -252,6 +260,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(toggle_bare)
         self.tree.add_command(debug_toggle)
         self.tree.add_command(notify_toggle)
+        self.tree.add_command(unbound_fallback_toggle)
         synced = await self.tree.sync()
         log.info("Synced %d application command(s)", len(synced))
 
@@ -362,7 +371,7 @@ class ClaudedBot(commands.Bot):
         # messages in the same channel still silent-return (no spam).
         if (
             not self.project_manager.is_bound(channel.id)
-            and not self.config.allow_unbound_fallback
+            and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(channel.id):
                 try:
@@ -599,7 +608,7 @@ class ClaudedBot(commands.Bot):
         # channels of thread messages don't silent-fail either.
         if (
             not self.project_manager.is_bound(parent_id)
-            and not self.config.allow_unbound_fallback
+            and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(parent_id):
                 try:

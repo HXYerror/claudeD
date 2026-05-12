@@ -162,6 +162,7 @@ def bot(cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Clauded
     bot._debug_logging = False
     bot._pre_tool_notifications = False
     bot._notify_enabled = {}
+    bot.allow_unbound_fallback = bot.config.allow_unbound_fallback
     # Bot identity used by the mention check
     bot._connection = MagicMock()  # placeholder; tests don't talk to it
     fake_user = FakeUser(id=42, name="bot")
@@ -431,6 +432,7 @@ def bot_strict(
     bot._debug_logging = False
     bot._pre_tool_notifications = False
     bot._notify_enabled = {}
+    bot.allow_unbound_fallback = bot.config.allow_unbound_fallback
     bot._connection = MagicMock()
     fake_user = FakeUser(id=42, name="bot")
     monkeypatch.setattr(ClaudedBot, "user", property(lambda self: fake_user))

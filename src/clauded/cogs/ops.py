@@ -372,3 +372,69 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
         ),
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# /unbound-fallback command — runtime toggle for unbound-channel fallback
+# ---------------------------------------------------------------------------
+
+@app_commands.command(
+    name="unbound-fallback",
+    description="Toggle CLAUDED_ALLOW_UNBOUND_FALLBACK at runtime (admin; no restart needed).",
+)
+@app_commands.describe(
+    enabled="True: unbound channels fall back to ~ (operator's home). False: refuse with hint."
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def unbound_fallback_toggle(
+    interaction: discord.Interaction, enabled: bool
+) -> None:
+    """Runtime override of ``Config.allow_unbound_fallback``.
+
+    Not persisted: bot restart re-loads the env-default. This is intentional —
+    the flag controls a security-relevant gate (Discord channel-write
+    permission ≠ shell access in operator's $HOME), so it fails-closed on
+    every restart unless ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` is set in the
+    bot environment (the env-persistent path).
+    """
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    # Defense-in-depth: ``default_permissions`` is Discord-UI default only and
+    # is admin-reassignable. Re-check at the callback so a permission-overridden
+    # role still gets gated. (R1 security #1 + #4.)
+    member = interaction.user
+    perms = getattr(member, "guild_permissions", None)
+    if perms is None or not perms.administrator:
+        await interaction.response.send_message(
+            "❌ Administrator permission required.", ephemeral=True
+        )
+        return
+    previous = bot.allow_unbound_fallback
+    bot.allow_unbound_fallback = enabled
+    # Reset the refuse-hint set so the next unbound @bot will surface a hint
+    # again under the new policy.
+    bot.project_manager._refused_unbound_channels.clear()
+    # SEC AUDIT TRAIL (R1 security #5 blocking): every flip of this flag is
+    # forensic-worthy. Log WARNING with WHO/WHERE/WHAT-CHANGED so operators can
+    # reconstruct unbound-fallback policy changes post-hoc.
+    log.warning(
+        "SECURITY: allow_unbound_fallback %s -> %s by user=%s(id=%s) guild=%s channel=%s",
+        previous, enabled,
+        getattr(member, "name", "?"), getattr(member, "id", "?"),
+        interaction.guild_id, interaction.channel_id,
+    )
+    state = "ON (fallback to ~)" if enabled else "OFF (refuse with hint)"
+    persist_note = (
+        "ℹ️ Runtime only — set `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` in the bot "
+        "environment for the setting to survive restart."
+    )
+    embed = discord.Embed(
+        title=f"🔓 Unbound fallback: {state}",
+        description=persist_note,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
