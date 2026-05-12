@@ -4,9 +4,19 @@ set -uo pipefail
 HEARTBEAT="$HOME/Library/Caches/clauded/heartbeat"
 RESTART_COUNTER="$HOME/Library/Caches/clauded/restart-count"
 ALERTS_LOG="$HOME/Library/Logs/clauded/alerts.log"
+HEALTHCHECK_LOG="$HOME/Library/Logs/clauded/healthcheck.log"
 STALE_THRESHOLD_SECS=120
 
 mkdir -p "$(dirname "$HEARTBEAT")" "$(dirname "$ALERTS_LOG")"
+
+# #168 acceptance: every script invocation produces at least one log line
+# so operators can confirm the healthcheck is actually firing on schedule.
+# Previously a healthy run (heartbeat fresh, no kickstart) was completely
+# silent, making it impossible to distinguish "running but healthy" from
+# "never running at all" (which #168 root-caused as a stale launchd load).
+log_line() {
+    echo "$(date '+%F %T') $*" >> "$HEALTHCHECK_LOG"
+}
 
 # Skip if system woke <60s ago (avoid false positive from sleep/wake).
 #
@@ -28,7 +38,7 @@ else
 fi
 NOW=$(date +%s)
 if [ "$WAKE_TS" -gt 0 ] && [ $((NOW - WAKE_TS)) -lt 60 ]; then
-    echo "$(date '+%F %T') skip — recent wake" >> "$(dirname "$ALERTS_LOG")/healthcheck.log"
+    log_line "skip — recent wake (wake_age=$((NOW - WAKE_TS))s)"
     exit 0
 fi
 
@@ -41,6 +51,7 @@ else
 fi
 
 if [ "$AGE" -gt "$STALE_THRESHOLD_SECS" ]; then
+    log_line "heartbeat stale ($AGE s); kickstarting com.hxy.clauded"
     echo "$(date '+%F %T') heartbeat stale ($AGE s); kickstarting com.hxy.clauded" >> "$ALERTS_LOG"
     launchctl kickstart -k "gui/$(id -u)/com.hxy.clauded" 2>/dev/null || true
 
@@ -60,4 +71,8 @@ if [ "$AGE" -gt "$STALE_THRESHOLD_SECS" ]; then
         echo "$(date '+%F %T') ALERT $MSG" >> "$ALERTS_LOG"
         osascript -e "display notification \"$MSG\" with title \"claudeD\"" 2>/dev/null || true
     fi
+else
+    # Healthy run — emit a log line so operators can confirm the
+    # healthcheck IS firing (was zero-output before #168).
+    log_line "ok — heartbeat age ${AGE}s (threshold ${STALE_THRESHOLD_SECS}s)"
 fi
