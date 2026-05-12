@@ -406,7 +406,13 @@ async def test_multiple_subtasks_get_separate_threads():
         assert "[multi]" in msg.embeds[0].title
 
     # Two summary embeds in main thread (edited to "Complete")
-    subtask_embeds = [m for m in main_thread._messages if m.embeds and "Subtask" in (m.embeds[0].title or "") or "Complete" in (m.embeds[0].title or "")]
+    subtask_embeds = [
+        m for m in main_thread._messages
+        if m.embeds and (
+            "Subtask" in (m.embeds[0].title or "")
+            or "Complete" in (m.embeds[0].title or "")
+        )
+    ]
     assert len(subtask_embeds) >= 2
 
 
