@@ -12,8 +12,6 @@ import discord
 # Discord HTTPException status codes that indicate retry-worthy errors.
 # Public so ``_http_retry`` can reuse the same set (single source of truth).
 TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
-# Backwards-compat alias for callers that imported the underscored name.
-_TRANSIENT_HTTP_STATUSES = TRANSIENT_HTTP_STATUSES
 
 # Subset of ``aiohttp.ClientError`` that's actually transient-shaped. The
 # previous ``isinstance(exc, aiohttp.ClientError)`` was too broad and
@@ -33,8 +31,8 @@ _TRANSIENT_AIOHTTP_CLASSES: tuple[type[BaseException], ...] = (
 def is_transient_discord_error(exc: BaseException) -> bool:
     """Return True if exc is a recoverable Discord-side issue (network blip, rate limit, 5xx).
 
-    Also accepted by ``_http_retry._is_retryable`` so renderer/bot/retry-loop
-    classify identically.
+    Also accepted by ``_http_retry.safe_http`` (called inline) so
+    renderer/bot/retry-loop classify identically.
     """
     if isinstance(exc, asyncio.TimeoutError):
         return True

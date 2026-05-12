@@ -19,13 +19,8 @@ from ._errors import is_transient_discord_error
 
 log = logging.getLogger("clauded.http_retry")
 
-# Re-export for legacy importers; predicate-by-isinstance now lives in _errors.
-from ._errors import TRANSIENT_HTTP_STATUSES, _TRANSIENT_HTTP_STATUSES  # noqa: F401,E402
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    """Thin alias of ``_errors.is_transient_discord_error`` (#148 R3 architect dedup)."""
-    return is_transient_discord_error(exc)
+# Single source of truth for transient classification lives in ``_errors``.
+from ._errors import TRANSIENT_HTTP_STATUSES  # noqa: F401,E402  re-exported for legacy importers
 
 
 async def safe_http(
@@ -47,7 +42,7 @@ async def safe_http(
         try:
             return await op()
         except BaseException as exc:  # noqa: BLE001 — selective re-raise below
-            if not _is_retryable(exc):
+            if not is_transient_discord_error(exc):
                 raise
             last_exc = exc
             delay = backoff * (2 ** attempt)

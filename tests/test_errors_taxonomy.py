@@ -142,19 +142,18 @@ def test_client_response_error_is_NOT_transient():
     assert is_transient_discord_error(exc) is False
 
 
-def test_is_retryable_alias_matches_taxonomy():
-    """_http_retry._is_retryable now delegates to is_transient_discord_error
-    (#148 R3 architect dedup). Verify the two return identical answers across
-    the parametrize set."""
-    from clauded._http_retry import _is_retryable
-    import aiohttp
-    samples = [
-        aiohttp.ServerDisconnectedError(),
-        aiohttp.InvalidURL("bad"),
-        ValueError("not http"),
-        TimeoutError("asyncio"),
-    ]
-    for exc in samples:
-        assert _is_retryable(exc) == is_transient_discord_error(exc), (
-            f"divergence on {type(exc).__name__}"
-        )
+def test_is_transient_discord_error_used_inline_by_safe_http():
+    """Cross-module consistency pin: ``safe_http`` calls
+    ``is_transient_discord_error`` directly (no separate ``_is_retryable``
+    indirection — simplicity #3 inlining). Verifies the import resolves and
+    the taxonomy callable is the one used in the retry loop."""
+    import inspect
+    from clauded import _http_retry
+    from clauded._errors import is_transient_discord_error as expected
+
+    src = inspect.getsource(_http_retry.safe_http)
+    assert "is_transient_discord_error" in src, (
+        "safe_http should call is_transient_discord_error directly"
+    )
+    # The function must be importable from _http_retry's namespace.
+    assert _http_retry.is_transient_discord_error is expected

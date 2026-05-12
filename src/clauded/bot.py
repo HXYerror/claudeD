@@ -627,7 +627,6 @@ class ClaudedBot(commands.Bot):
                     # #148 architect §3 — retry-aware send (transient blip survival).
                     await safe_send_message(message.channel, embed=err_embed)
                     return
-                    return
 
             # Feature #66: Add hourglass reaction
             try:
