@@ -33,7 +33,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
 import discord
@@ -208,6 +208,88 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1000:
         return f"{n/1000:.1f}k"
     return str(n)
+
+
+def _extract_subagent_stats(content: Any) -> dict[str, Any] | None:
+    """Extract stats from a Task/Agent ToolResultBlock.content.
+
+    The Claude SDK's `ToolResultBlock.content` for sub-agent tools (Task,
+    Agent) is typically a JSON-shaped string with fields like
+    ``totalDurationMs``, ``totalTokens``, ``totalToolUseCount``, and sometimes
+    ``totalCostUsd``. The exact shape varies across SDK versions; this helper
+    parses defensively and returns ``None`` if no recognisable stats are
+    present — callers should treat ``None`` as "don't render a mini-footer"
+    rather than crashing.
+
+    #160 Fix C: sub-agent threads previously had NO footer at all. The user
+    runs ``/crew`` workflows that spawn 5-10 sub-threads per turn; surfacing
+    per-sub-thread cost is the highest-value half of this fix.
+    """
+    if content is None:
+        return None
+    text = content if isinstance(content, str) else str(content)
+    # Try JSON first; common SDK shape is `{"totalDurationMs": ..., ...}`.
+    import json
+    import re
+    parsed: dict[str, Any] | None = None
+    try:
+        candidate = json.loads(text)
+        if isinstance(candidate, dict):
+            parsed = candidate
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    # Fallback: scrape `key=val` or `"key": val` from free-form content.
+    if parsed is None:
+        scraped: dict[str, Any] = {}
+        for key in ("totalDurationMs", "totalTokens", "totalCostUsd",
+                    "totalToolUseCount", "inputTokens", "outputTokens"):
+            m = re.search(rf'"{key}":\s*([\d.]+)', text)
+            if m:
+                scraped[key] = float(m.group(1)) if "." in m.group(1) else int(m.group(1))
+        parsed = scraped if scraped else None
+    if not parsed:
+        return None
+    out: dict[str, Any] = {}
+    if "totalDurationMs" in parsed:
+        out["duration_s"] = float(parsed["totalDurationMs"]) / 1000
+    if "totalTokens" in parsed:
+        out["total_tokens"] = int(parsed["totalTokens"])
+    if "inputTokens" in parsed:
+        out["input_tokens"] = int(parsed["inputTokens"])
+    if "outputTokens" in parsed:
+        out["output_tokens"] = int(parsed["outputTokens"])
+    if "totalCostUsd" in parsed:
+        out["cost"] = float(parsed["totalCostUsd"])
+    if "totalToolUseCount" in parsed:
+        out["tool_count"] = int(parsed["totalToolUseCount"])
+    return out if out else None
+
+
+def _format_subagent_footer(stats: dict[str, Any] | None) -> str | None:
+    """Render a sub-agent stats dict into a one-line Discord small-text footer.
+
+    Returns None if stats is None or has no renderable fields, so the caller
+    can simply ``if footer := _format_subagent_footer(stats):`` without an
+    extra emptiness check.
+    """
+    if not stats:
+        return None
+    parts: list[str] = []
+    if "cost" in stats:
+        parts.append(f"💰 ${stats['cost']:.4f}")
+    if "input_tokens" in stats:
+        parts.append(f"📥 {_fmt_tokens(stats['input_tokens'])}")
+    if "output_tokens" in stats:
+        parts.append(f"📤 {_fmt_tokens(stats['output_tokens'])}")
+    elif "total_tokens" in stats:
+        parts.append(f"📊 {_fmt_tokens(stats['total_tokens'])}")
+    if "duration_s" in stats:
+        parts.append(f"⏱️ {stats['duration_s']:.1f}s")
+    if "tool_count" in stats:
+        parts.append(f"🔧 {stats['tool_count']}")
+    if not parts:
+        return None
+    return "-# " + " │ ".join(parts)
 
 
 class DiscordRenderer:
@@ -813,15 +895,29 @@ class DiscordRenderer:
                                                 sr._sub_msg, sr._sub_buffer[:DISCORD_MAX_LEN],
                                             )
 
+                                    # #160 Fix C: extract sub-agent stats from
+                                    # ToolResultBlock.content. Falls back to
+                                    # ``None`` when missing — mini-footer simply
+                                    # not appended in that case.
+                                    sub_stats = _extract_subagent_stats(block.content)
+                                    sub_footer = _format_subagent_footer(sub_stats)
+
                                     # Completion embed in sub-thread
+                                    description = str(block.content)[:300] if block.content else "Done"
+                                    if sub_footer:
+                                        description = f"{description}\n\n{sub_footer}"
                                     done = discord.Embed(
                                         title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
-                                        description=str(block.content)[:300] if block.content else "Done",
+                                        description=description,
                                         color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
                                     )
                                     await subagent_renderers[tool_id]._safe_send(embed=done)
 
-                                    # Update main thread summary
+                                    # Update main thread summary — keep it as a
+                                    # pure mention-link per PRD invariant; the
+                                    # mini-footer lives only in the sub-thread
+                                    # so users browsing the main thread aren't
+                                    # double-shown the cost data.
                                     if tool_id in tool_msgs:
                                         summary = discord.Embed(
                                             title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
@@ -830,10 +926,18 @@ class DiscordRenderer:
                                         )
                                         await self._safe_edit(tool_msgs[tool_id], embed=summary)
                                 elif tool_id in tool_msgs:
-                                    # Fallback: inline completion (no sub-thread was created)
+                                    # Fallback: inline completion (no sub-thread was created).
+                                    # #160 Fix C: also surface mini-footer here —
+                                    # without a sub-thread the inline embed is
+                                    # the user's only window into per-subtask cost.
+                                    sub_stats = _extract_subagent_stats(block.content)
+                                    sub_footer = _format_subagent_footer(sub_stats)
+                                    description = str(block.content)[:300] if block.content else "Done"
+                                    if sub_footer:
+                                        description = f"{description}\n\n{sub_footer}"
                                     done_embed = discord.Embed(
                                         title=f"{'✅' if not is_err else '❌'} Subtask Complete",
-                                        description=str(block.content)[:300] if block.content else "Done",
+                                        description=description,
                                         color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
                                     )
                                     await self._safe_edit(tool_msgs[tool_id], embed=done_embed)
@@ -917,23 +1021,62 @@ class DiscordRenderer:
         # Stream finished cleanly. Flush whatever is left.
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
 
-        # Append cost/stats footer to the last sent message
-        if self._last_msg and stats and stats.get('cost', 0) > 0:
+        # Append cost/stats footer to the last sent message.
+        # #160 Fix B: split the prior 3-way AND so each condition gets a sane
+        # fallback. Old code dropped the entire footer when any of
+        # _last_msg/stats/cost was missing AND swallowed every Discord error;
+        # users observed "好多消息都没显示尾巴". Now:
+        #   - stats missing → log.warning, skip (no data to render)
+        #   - cost == 0 with tokens/duration available → render anyway
+        #   - _last_msg missing → send footer as a separate thread message
+        #   - edit/send fails → log.warning with reason (no silent swallow)
+        if not stats:
+            log.warning("Footer skipped: no stats (stream ended without ResultMessage)")
+        else:
             try:
-                # Read the shadow, not _last_msg.content (stale; see #113).
-                current = self._last_msg_text.rstrip(CURSOR)
-                duration_s = stats['duration_ms'] / 1000
-                footer = (
-                    f"\n\n-# 💰 ${stats['cost']:.4f}"
-                    f" │ 📥 {_fmt_tokens(stats['input_tokens'])}"
-                    f" │ 📤 {_fmt_tokens(stats['output_tokens'])}"
+                duration_s = stats.get("duration_ms", 0) / 1000
+                cost = stats.get("cost", 0.0)
+                footer_text = (
+                    f"-# 💰 ${cost:.4f}"
+                    f" │ 📥 {_fmt_tokens(stats.get('input_tokens', 0))}"
+                    f" │ 📤 {_fmt_tokens(stats.get('output_tokens', 0))}"
                     f" │ ⏱️ {duration_s:.1f}s"
                 )
                 if _last_stop_reason and _last_stop_reason != "end_turn":
-                    footer += f" │ ⚠️ {_last_stop_reason}"
-                await self._safe_edit(self._last_msg, content=current + footer)
+                    footer_text += f" │ ⚠️ {_last_stop_reason}"
+
+                if self._last_msg is not None:
+                    # Try to append to the last user-visible message.
+                    current = self._last_msg_text.rstrip(CURSOR)
+                    candidate = current + "\n\n" + footer_text
+                    if len(candidate) <= DISCORD_MAX_LEN:
+                        ok = await self._safe_edit(self._last_msg, content=candidate)
+                        if not ok:
+                            # Edit refused (4xx/5xx exhausted retry budget). Fall
+                            # through to standalone-send so footer still reaches user.
+                            log.warning(
+                                "Footer edit failed; sending as standalone message"
+                            )
+                            await self._safe_send(content=footer_text)
+                    else:
+                        # Edit would blow Discord's 2000-char hard cap; send footer
+                        # standalone instead of silently dropping.
+                        log.debug(
+                            "Footer would exceed DISCORD_MAX_LEN; sending standalone"
+                        )
+                        await self._safe_send(content=footer_text)
+                else:
+                    # No live cursor message (e.g., the turn produced only an
+                    # attachment / PNG-only path). Send footer as its own message
+                    # so cost/duration still surface.
+                    await self._safe_send(content=footer_text)
             except Exception:
-                pass
+                # #160 Fix B: never silently swallow. Log so future failures
+                # are diagnosable from bot.log.
+                log.warning(
+                    "Footer render failed (continuing)",
+                    exc_info=True,
+                )
 
     # ------------------------------------------------------------------
     # Streaming helpers
