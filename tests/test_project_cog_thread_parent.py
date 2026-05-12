@@ -180,3 +180,142 @@ async def test_set_mention_required_unbound_channel_friendly_error(
     assert "❌" in msg
     # Channel state untouched
     assert pm.get_mention_required(60001) is True
+
+
+# ---------------------------------------------------------------------------
+# v1.18 #156 follow-up — discoverability + unbind surfacing (#153 R1 product)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_project_info_always_shows_mention_setting(
+    pm: ProjectManager, projects_root: Path
+) -> None:
+    """/project info now ALWAYS shows mention status (was: only on non-default).
+
+    Closes #153 R1 product §3 discoverability gap — new users couldn't find
+    the toggle without reading docs.
+    """
+    channel_id = 70001
+    proj = projects_root / "demo"
+    proj.mkdir()
+    pm.bind(channel_id, str(proj))
+
+    bot = MagicMock(spec=ClaudedBot)
+    bot.project_manager = pm
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = MagicMock(spec=discord.TextChannel)
+    interaction.channel.id = channel_id
+    interaction.channel_id = channel_id
+    interaction.guild_id = 9999
+    interaction.client = bot
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+
+    from clauded.cogs.project import project_info
+    await project_info.callback(interaction)
+
+    sent = interaction.response.send_message.call_args[0][0]
+    # Default mention_required=True path
+    assert "Mention: required" in sent, f"expected 'Mention: required' in: {sent!r}"
+    assert "set-mention-required false" in sent, "expected discoverability hint"
+
+
+@pytest.mark.asyncio
+async def test_project_info_shows_not_required_when_set_false(
+    pm: ProjectManager, projects_root: Path
+) -> None:
+    """When mention_required=False is set, /project info reflects it
+    (regression pin for the non-default branch)."""
+    channel_id = 70002
+    proj = projects_root / "demo2"
+    proj.mkdir()
+    pm.bind(channel_id, str(proj))
+    pm.set_mention_required(channel_id, False)
+
+    bot = MagicMock(spec=ClaudedBot)
+    bot.project_manager = pm
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = MagicMock(spec=discord.TextChannel)
+    interaction.channel.id = channel_id
+    interaction.channel_id = channel_id
+    interaction.guild_id = 9999
+    interaction.client = bot
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+
+    from clauded.cogs.project import project_info
+    await project_info.callback(interaction)
+
+    sent = interaction.response.send_message.call_args[0][0]
+    assert "not required" in sent
+    assert "responds to all messages" in sent
+
+
+@pytest.mark.asyncio
+async def test_project_unbind_surfaces_preserved_mention(
+    pm: ProjectManager, projects_root: Path
+) -> None:
+    """When mention_required=False is set and user unbinds, surface that
+    the setting survives so rebind isn't a surprise (#153 R1 product §4)."""
+    channel_id = 70003
+    proj = projects_root / "demo3"
+    proj.mkdir()
+    pm.bind(channel_id, str(proj))
+    pm.set_mention_required(channel_id, False)
+
+    bot = MagicMock(spec=ClaudedBot)
+    bot.project_manager = pm
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = MagicMock(spec=discord.TextChannel)
+    interaction.channel.id = channel_id
+    interaction.channel_id = channel_id
+    interaction.guild_id = 9999
+    interaction.client = bot
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+
+    from clauded.cogs.project import project_unbind
+    await project_unbind.callback(interaction)
+
+    sent = interaction.response.send_message.call_args[0][0]
+    assert "Removed this channel" in sent
+    assert "preserved across rebind" in sent
+    assert "set-mention-required true" in sent
+    # And the setting indeed survived
+    assert pm.get_mention_required(channel_id) is False
+
+
+@pytest.mark.asyncio
+async def test_project_unbind_silent_when_mention_at_default(
+    pm: ProjectManager, projects_root: Path
+) -> None:
+    """When mention_required stays at default True, unbind doesn't add the
+    preservation footnote (avoids noise on the common case)."""
+    channel_id = 70004
+    proj = projects_root / "demo4"
+    proj.mkdir()
+    pm.bind(channel_id, str(proj))
+    # NOT setting mention_required → stays at default True
+
+    bot = MagicMock(spec=ClaudedBot)
+    bot.project_manager = pm
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = MagicMock(spec=discord.TextChannel)
+    interaction.channel.id = channel_id
+    interaction.channel_id = channel_id
+    interaction.guild_id = 9999
+    interaction.client = bot
+    interaction.response = MagicMock()
+    interaction.response.send_message = AsyncMock()
+
+    from clauded.cogs.project import project_unbind
+    await project_unbind.callback(interaction)
+
+    sent = interaction.response.send_message.call_args[0][0]
+    assert "Removed this channel" in sent
+    assert "preserved across rebind" not in sent

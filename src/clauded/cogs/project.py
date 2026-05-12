@@ -76,7 +76,9 @@ async def project_info(interaction: discord.Interaction) -> None:
     if mode != "thread":
         lines.append(f"🔀 Channel mode: `{mode}`")
     mention_required = bot.project_manager.get_mention_required(channel_id)
-    if not mention_required:
+    if mention_required:
+        lines.append("💬 Mention: required (default — use `/project set-mention-required false` to opt out)")
+    else:
         lines.append("💬 Mention: not required (responds to all messages)")
     guild_root = bot.project_manager.get_guild_root(interaction.guild_id)
     if interaction.guild_id and str(interaction.guild_id) in bot.project_manager._guild_roots:
@@ -95,8 +97,18 @@ async def project_unbind(interaction: discord.Interaction) -> None:
         return
 
     if bot.project_manager.unbind(channel_id):
+        # v1.18 product carry: surface that mention preference survives unbind
+        # so users aren't surprised when a rebind silently restores the
+        # "responds to all messages" mode (#153 R1 product §4).
+        mention_required = bot.project_manager.get_mention_required(channel_id)
+        message_parts = ["✅ Removed this channel's project binding."]
+        if not mention_required:
+            message_parts.append(
+                "\n🔔 Note: `mention not required` preference is preserved "
+                "across rebind. Use `/project set-mention-required true` to reset."
+            )
         await interaction.response.send_message(
-            "✅ Removed this channel's project binding.", ephemeral=True
+            "".join(message_parts), ephemeral=True
         )
     else:
         await interaction.response.send_message(
