@@ -421,7 +421,7 @@ def test_medium_tier_error_path_does_not_emit_detail_message():
         return (
             not is_short
             and not is_err
-            and 200 <= len(content) < 1900
+            and 200 <= len(content) < 8000
             and content.strip() != ""
         )
     error_content = "x" * 500  # medium-length BUT is_err
@@ -446,7 +446,7 @@ def test_multiline_short_content_falls_to_bare_branch():
         return (
             not is_short_val
             and not is_err
-            and 200 <= len(content) < 1900
+            and 200 <= len(content) < 8000
             and content.strip() != ""
         )
     multiline_short = "line 1\nline 2\nline 3"  # 20 chars but multiline

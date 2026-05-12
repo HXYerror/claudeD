@@ -1125,12 +1125,10 @@ class DiscordRenderer:
                                     color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS,
                                 )
                                 await self._safe_edit(tool_log_msg, embed=tool_embed)
-                                # #161 medium tier: send the spoiler-wrapped
-                                # detail embed AFTER updating the rolling log so
-                                # the order in the channel is summary-then-detail.
-                                # Use 4-backtick fence so any ``` in content
-                                # doesn't escape the fence (mirrors /diff PR
-                                # #170 R2 fix).
+                                # #161 medium tier: send the detail file
+                                # attachment AFTER updating the rolling log
+                                # so the order in the channel is summary-
+                                # then-detail.
                                 if is_medium and not is_err:
                                     # #161 medium tier: send as .txt file
                                     # attachment below the rolling log.
