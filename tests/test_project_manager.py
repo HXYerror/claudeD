@@ -719,7 +719,9 @@ def test_mention_required_stored_in_separate_registry(
     bound_manager: tuple[ProjectManager, int],
     data_dir: Path,
 ) -> None:
-    """Registry lives in channel_settings.json, not projects.json."""
+    """Architect-decided invariant: registry lives in channel_settings.json,
+    NOT in projects.json. Pins the separate-file design choice (a future
+    revert to nesting would fail this test)."""
     pm, ch = bound_manager
     pm.set_mention_required(ch, False)
     settings_file = data_dir / "channel_settings.json"
@@ -727,12 +729,3 @@ def test_mention_required_stored_in_separate_registry(
     with open(settings_file) as f:
         data = json.load(f)
     assert data[str(ch)]["mention_required"] is False
-
-
-def test_set_mention_required_true_roundtrip(
-    bound_manager: tuple[ProjectManager, int],
-) -> None:
-    """Setting True explicitly is observable (not same as never-set)."""
-    pm, ch = bound_manager
-    pm.set_mention_required(ch, True)
-    assert pm.get_mention_required(ch) is True

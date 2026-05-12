@@ -272,13 +272,20 @@ async def project_set_mention_required(
     )
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
+    # Thread invocation → settings live on the parent channel (matches
+    # /project bind, system_prompt, env, etc. sibling patterns).
+    channel = interaction.channel
+    if isinstance(channel, discord.Thread):
+        channel_id = channel.parent_id or interaction.channel_id
+    else:
+        channel_id = interaction.channel_id
     if channel_id is None:
         await interaction.response.send_message("No channel context.", ephemeral=True)
         return
     try:
         bot.project_manager.set_mention_required(channel_id, required)
-    except RuntimeError as exc:
+    except ValueError as exc:
+        # _assert_bound rejects unbound channels with ValueError.
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
     description = (
