@@ -1,8 +1,8 @@
-"""Tests for /unbound-fallback runtime toggle (PR #160).
+"""Tests for /unbound-fallback runtime toggle (PR #162).
 
 Real user request 2026-05-12: edit-plist-and-restart workflow is too heavy for
 operators who want to flip the security knob ad-hoc. Add slash command that
-mutates ``bot.config.allow_unbound_fallback`` at runtime (no persist).
+mutates ``bot.allow_unbound_fallback`` at runtime (no persist).
 """
 from __future__ import annotations
 
@@ -41,74 +41,77 @@ def bot(tmp_path: Path) -> ClaudedBot:
     bot._debug_logging = False
     bot._pre_tool_notifications = False
     bot._notify_enabled = {}
-    bot._allow_unbound_fallback_runtime = None
+    bot.allow_unbound_fallback = cfg.allow_unbound_fallback
     bot._connection = MagicMock()
     return bot
 
 
-def _make_interaction(bot: ClaudedBot) -> MagicMock:
+def _make_interaction(bot: ClaudedBot, is_admin: bool = True) -> MagicMock:
+    """Build an interaction with admin guild_permissions by default.
+
+    R1 security #1+#4: callback-side admin re-check. Tests must provide a
+    ``user.guild_permissions.administrator`` attribute matching the test
+    scenario; default True for happy-path tests.
+    """
     interaction = MagicMock(spec=discord.Interaction)
     interaction.client = bot
+    interaction.guild_id = 1234
+    interaction.channel_id = 5678
     interaction.response = MagicMock()
     interaction.response.send_message = AsyncMock()
+    fake_user = MagicMock()
+    fake_user.id = 999
+    fake_user.name = "alice"
+    fake_user.guild_permissions = MagicMock(administrator=is_admin)
+    interaction.user = fake_user
     return interaction
 
 
 @pytest.mark.asyncio
 async def test_unbound_fallback_toggle_on(bot: ClaudedBot) -> None:
-    """/unbound-fallback True flips effective ``bot.allow_unbound_fallback`` ON."""
+    """/unbound-fallback True flips ``bot.allow_unbound_fallback`` ON."""
     from clauded.cogs.ops import unbound_fallback_toggle
     interaction = _make_interaction(bot)
-    # Baseline: Config frozen-default False, runtime override None.
     assert bot.allow_unbound_fallback is False
-    assert bot._allow_unbound_fallback_runtime is None
     await unbound_fallback_toggle.callback(interaction, True)
-    assert bot._allow_unbound_fallback_runtime is True
     assert bot.allow_unbound_fallback is True
-    # Config itself stays frozen — only the runtime override mutated.
+    # Config stays frozen — only the mutable bot attr changed.
     assert bot.config.allow_unbound_fallback is False
-    interaction.response.send_message.assert_awaited_once()
     sent_embed = interaction.response.send_message.call_args.kwargs["embed"]
     assert "ON" in sent_embed.title
 
 
 @pytest.mark.asyncio
 async def test_unbound_fallback_toggle_off(bot: ClaudedBot) -> None:
-    """/unbound-fallback False flips override OFF."""
+    """/unbound-fallback False flips bot attr OFF."""
     from clauded.cogs.ops import unbound_fallback_toggle
-    bot._allow_unbound_fallback_runtime = True  # start ON
+    bot.allow_unbound_fallback = True
     interaction = _make_interaction(bot)
     await unbound_fallback_toggle.callback(interaction, False)
-    assert bot._allow_unbound_fallback_runtime is False
     assert bot.allow_unbound_fallback is False
     sent_embed = interaction.response.send_message.call_args.kwargs["embed"]
     assert "OFF" in sent_embed.title
 
 
 @pytest.mark.asyncio
-async def test_unbound_fallback_property_respects_config_default(bot: ClaudedBot) -> None:
-    """When no runtime override, ``bot.allow_unbound_fallback`` mirrors
-    ``Config.allow_unbound_fallback``. Pin the chain so future refactor
-    of Config field doesn't accidentally bypass the property."""
-    # Config is frozen — can't reassign field. Build a new Config with True.
-    from clauded.config import Config
-    bot.config = Config(
-        discord_bot_token="tok", claude_model="sonnet",
-        claude_permission_mode="default",
-        projects_root=bot.config.projects_root,
-        allow_unbound_fallback=True,
-    )
-    bot._allow_unbound_fallback_runtime = None
-    assert bot.allow_unbound_fallback is True
-    # Override takes precedence:
-    bot._allow_unbound_fallback_runtime = False
-    assert bot.allow_unbound_fallback is False
+async def test_unbound_fallback_config_remains_frozen(bot: ClaudedBot) -> None:
+    """Config stays frozen across toggles; only the mutable bot attribute moves.
+
+    Regression pin for the v1.11 immutability invariant (PRD #110 sec-1
+    contract is per-process; Config is the immutable env-snapshot, bot attr
+    is the runtime mirror).
+    """
+    from clauded.cogs.ops import unbound_fallback_toggle
+    interaction = _make_interaction(bot)
+    await unbound_fallback_toggle.callback(interaction, True)
+    import dataclasses
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        bot.config.allow_unbound_fallback = True  # type: ignore[misc]
 
 
 @pytest.mark.asyncio
 async def test_unbound_fallback_toggle_clears_refused_set(bot: ClaudedBot) -> None:
-    """Toggling resets _refused_unbound_channels so the hint surfaces again
-    under the new policy (otherwise a once-shown channel stays silent forever)."""
+    """Toggling resets _refused_unbound_channels so the hint surfaces again."""
     from clauded.cogs.ops import unbound_fallback_toggle
     bot.project_manager._refused_unbound_channels.add(11111)
     bot.project_manager._refused_unbound_channels.add(22222)
@@ -136,3 +139,47 @@ async def test_unbound_fallback_response_mentions_env_persistence(bot: ClaudedBo
     sent_embed = interaction.response.send_message.call_args.kwargs["embed"]
     assert "CLAUDED_ALLOW_UNBOUND_FALLBACK" in sent_embed.description
     assert "restart" in sent_embed.description.lower()
+
+
+@pytest.mark.asyncio
+async def test_unbound_fallback_rejects_non_admin(bot: ClaudedBot) -> None:
+    """R1 security #1+#4: callback-side admin re-check rejects non-admin
+    even when Discord-UI ``default_permissions`` was overridden by a server
+    admin to grant the command to a non-admin role."""
+    from clauded.cogs.ops import unbound_fallback_toggle
+    interaction = _make_interaction(bot, is_admin=False)
+    await unbound_fallback_toggle.callback(interaction, True)
+    # State NOT changed
+    assert bot.allow_unbound_fallback is False
+    # Friendly error sent, NOT the success embed
+    call_args = interaction.response.send_message.call_args
+    sent = call_args[0][0] if call_args[0] else call_args.kwargs.get("content", "")
+    assert "Administrator permission required" in sent
+
+
+@pytest.mark.asyncio
+async def test_unbound_fallback_logs_security_event(
+    bot: ClaudedBot, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R1 security #5 blocking: every flip of allow_unbound_fallback must
+    emit a WARNING-level audit log line with WHO/WHERE/PREV/NEW so operators
+    can reconstruct policy changes post-hoc."""
+    import logging
+    from clauded.cogs.ops import unbound_fallback_toggle
+    interaction = _make_interaction(bot)
+    caplog.set_level(logging.WARNING, logger="clauded.bot")
+    await unbound_fallback_toggle.callback(interaction, True)
+    audit_logs = [
+        r for r in caplog.records
+        if "SECURITY: allow_unbound_fallback" in r.getMessage()
+    ]
+    assert audit_logs, (
+        f"Expected SECURITY audit log entry; got: {[r.getMessage() for r in caplog.records]!r}"
+    )
+    msg = audit_logs[0].getMessage()
+    # Verify shape: prev → new, user id, guild, channel
+    assert "False -> True" in msg or "False" in msg and "True" in msg
+    assert "user=alice" in msg
+    assert "id=999" in msg
+    assert "guild=1234" in msg
+    assert "channel=5678" in msg

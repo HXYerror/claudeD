@@ -386,6 +386,7 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
     enabled="True: unbound channels fall back to ~ (operator's home). False: refuse with hint."
 )
 @app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
 async def unbound_fallback_toggle(
     interaction: discord.Interaction, enabled: bool
 ) -> None:
@@ -402,26 +403,38 @@ async def unbound_fallback_toggle(
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bot._allow_unbound_fallback_runtime = enabled
+    # Defense-in-depth: ``default_permissions`` is Discord-UI default only and
+    # is admin-reassignable. Re-check at the callback so a permission-overridden
+    # role still gets gated. (R1 security #1 + #4.)
+    member = interaction.user
+    perms = getattr(member, "guild_permissions", None)
+    if perms is None or not perms.administrator:
+        await interaction.response.send_message(
+            "❌ Administrator permission required.", ephemeral=True
+        )
+        return
+    previous = bot.allow_unbound_fallback
+    bot.allow_unbound_fallback = enabled
     # Reset the refuse-hint set so the next unbound @bot will surface a hint
-    # again under the new policy (when enabled=True the hint never fires
-    # because the gate doesn't trip; when enabled=False the user gets a fresh
-    # nudge on the next attempt). Without this, a process that's already
-    # shown the hint once before the operator toggled the policy would stay
-    # silent on the next message even though the policy now warrants surfacing.
+    # again under the new policy.
     bot.project_manager._refused_unbound_channels.clear()
+    # SEC AUDIT TRAIL (R1 security #5 blocking): every flip of this flag is
+    # forensic-worthy. Log INFO with WHO/WHERE/WHAT-CHANGED so operators can
+    # reconstruct unbound-fallback policy changes post-hoc.
+    log.warning(
+        "SECURITY: allow_unbound_fallback %s -> %s by user=%s(id=%s) guild=%s channel=%s",
+        previous, enabled,
+        getattr(member, "name", "?"), getattr(member, "id", "?"),
+        interaction.guild_id, interaction.channel_id,
+    )
     state = "ON (fallback to ~)" if enabled else "OFF (refuse with hint)"
     persist_note = (
-        "\nℹ️ Runtime only — set `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` in the bot "
+        "ℹ️ Runtime only — set `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` in the bot "
         "environment for the setting to survive restart."
     )
     embed = discord.Embed(
         title=f"🔓 Unbound fallback: {state}",
-        description=(
-            "Bot will create sessions in `~` for unbound channels."
-            if enabled
-            else "Bot will refuse unbound channels and direct user to `/project bind`."
-        ) + persist_note,
+        description=persist_note,
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

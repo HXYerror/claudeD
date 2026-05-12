@@ -183,25 +183,16 @@ class ClaudedBot(commands.Bot):
         self.agent_manager = AgentManager()
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
-        # v1.18 #160: runtime override for allow_unbound_fallback. None = use
-        # ``self.config.allow_unbound_fallback`` (env-derived). When set via
-        # ``/unbound-fallback`` slash command, takes effect immediately and
-        # survives until process restart (Config is frozen by design; this
-        # mirror lives on the mutable bot instance instead).
-        self._allow_unbound_fallback_runtime: bool | None = None
+        # v1.18 #160: runtime-toggleable allow_unbound_fallback. Initialized
+        # from env-derived ``self.config.allow_unbound_fallback`` and
+        # mutated by the ``/unbound-fallback`` admin slash command. Plain
+        # mutable bool matches the sibling ``_debug_logging`` /
+        # ``_pre_tool_notifications`` pattern in this same class; bot
+        # restart re-reads env-default so the flag fails-closed unless
+        # ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` is set in the bot env.
+        self.allow_unbound_fallback: bool = config.allow_unbound_fallback
         self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
-
-    @property
-    def allow_unbound_fallback(self) -> bool:
-        """Effective unbound-fallback policy: runtime override > config default.
-
-        Toggle via ``/unbound-fallback`` (admin slash command, runtime only) or
-        set ``CLAUDED_ALLOW_UNBOUND_FALLBACK=1`` in the bot env (persistent).
-        """
-        if self._allow_unbound_fallback_runtime is not None:
-            return self._allow_unbound_fallback_runtime
-        return self.config.allow_unbound_fallback
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
