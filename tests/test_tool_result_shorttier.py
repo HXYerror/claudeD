@@ -555,11 +555,116 @@ async def test_toolresults_view_rejects_non_author_click():
     assert kwargs.get("ephemeral") is True
 
 
-def test_toolresults_view_has_finite_default_timeout():
-    """R1 architect: persistent views (timeout=None) accumulate over
-    long bot uptimes since discord.py never garbage-collects them.
-    Default timeout is now 24h (86400s) so abandoned views from past
-    turns get released."""
+def test_toolresults_view_has_none_timeout_for_persistence():
+    """R2 fix: discord.py's bot.add_view requires timeout=None for
+    persistent dispatch. Buttons carry stable custom_ids so clicks route
+    via the bot's view store. We tried timeout=86400 first per the R1
+    architect note but bot.add_view raised ValueError forcing the
+    revert. The orphan-accumulation concern is now handled by the view
+    store's own lifecycle (discord.py replaces same-message-id views).
+    """
     from clauded.discord_renderer import ToolResultsView
     v = ToolResultsView()
-    assert v.timeout == 86400.0
+    assert v.timeout is None
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_registers_view_via_bot_add_view():
+    """R2 fix for #161 user-reported "点击没获取到": Message.edit(view=v)
+    alone is insufficient for click-routing — clicks were dropping
+    silently because the view was not in the bot's persistent view store.
+    Fix: after edit, call bot.add_view(view, message_id=msg.id). This
+    test pins that call so a regression can't drop it."""
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer, ToolResultsView
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self, msg_id=12345):
+            self.id = msg_id
+            self.content = ""
+            self.embeds = []
+            self.attached_view = None
+        async def edit(self, **kwargs):
+            if "content" in kwargs:
+                self.content = kwargs["content"]
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._next_id = 99000
+        async def send(self, *args, **kwargs):
+            self._next_id += 1
+            msg = FakeMessage(msg_id=self._next_id)
+            if "content" in kwargs:
+                msg.content = kwargs["content"]
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
+            self._sent.append(msg)
+            return msg
+
+    class FakeBot:
+        """Captures add_view calls."""
+        def __init__(self):
+            self.add_view_calls = []
+        def add_view(self, view, *, message_id=None):
+            self.add_view_calls.append((view, message_id))
+
+    medium_content = "\n".join(f"line {i}" for i in range(30))
+
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-pv",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    bot = FakeBot()
+    renderer = DiscordRenderer(target, bot=bot)
+    bridge = FakeBridge(events)
+    await renderer.render_response(bridge, "ls")
+
+    # bot.add_view MUST have been called with the ToolResultsView and a
+    # message_id pointing at the rolling-log message.
+    assert bot.add_view_calls, (
+        "Expected bot.add_view to be called for medium-tier view persistence; "
+        "without it, button clicks are silently dropped (user reported "
+        "'点击没获取到')."
+    )
+    view, msg_id = bot.add_view_calls[-1]
+    assert isinstance(view, ToolResultsView), f"Expected ToolResultsView; got {type(view).__name__}"
+    assert msg_id is not None, "add_view must be called with message_id= to scope the persistence"
+    assert msg_id > 0

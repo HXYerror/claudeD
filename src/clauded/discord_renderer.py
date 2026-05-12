@@ -327,8 +327,20 @@ def _format_subagent_footer(stats: dict[str, Any] | None) -> str | None:
 class DiscordRenderer:
     """Render a Claude streaming response into a Discord channel/thread."""
 
-    def __init__(self, target: discord.abc.Messageable) -> None:
+    def __init__(
+        self,
+        target: discord.abc.Messageable,
+        *,
+        bot: discord.Client | None = None,
+    ) -> None:
         self.target = target
+        # Optional bot reference — when provided, persistent views (e.g.
+        # :class:`ToolResultsView` from #161) are registered via
+        # ``bot.add_view(view, message_id=...)`` so button-click routing
+        # works even after the in-memory View instance is gc'd or the bot
+        # restarts (discord.py only re-dispatches custom_id interactions
+        # to views that are in the client's persistent view store).
+        self._bot = bot
         self._last_msg: discord.Message | None = None
         # Shadow of the text we last wrote to ``_last_msg``. discord.py 2.0+
         # Message.edit() is not in-place; reading msg.content post-edit returns
@@ -723,7 +735,7 @@ class DiscordRenderer:
 
                                     if tool_id:
                                         subagent_threads[tool_id] = sub_thread
-                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread)
+                                        subagent_renderers[tool_id] = DiscordRenderer(sub_thread, bot=self._bot)
 
                                     # Compact summary in main thread
                                     summary_embed = discord.Embed(
@@ -1154,20 +1166,18 @@ class DiscordRenderer:
                                 if is_medium and not is_err and tool_id:
                                     medium_results[tool_id] = (name, content_str)
                                     if tool_results_view is None:
-                                        # R1 architect: finite timeout so
-                                        # orphan views (rolling-log msg from
-                                        # a past turn nobody clicked) are
-                                        # garbage-collected by discord.py
-                                        # after 24h instead of accumulating
-                                        # forever in long-running bots.
-                                        # R1 security: author_id restricts
+                                        # R2: timeout=None required by
+                                        # ``bot.add_view`` for persistent
+                                        # dispatch. Buttons carry stable
+                                        # custom_ids derived from
+                                        # tool_use_id so clicks route to
+                                        # this view instance via the bot's
+                                        # view store. author_id restricts
                                         # ephemeral followups to the turn's
-                                        # original requester; same-channel
-                                        # third parties cannot read another
-                                        # user's tool output via the button.
+                                        # original requester.
                                         tool_results_view = ToolResultsView(
                                             author_id=author_id,
-                                            timeout=86400.0,
+                                            timeout=None,
                                         )
                                     # Idempotent: add_result skips if id
                                     # already present (defends against
@@ -1185,6 +1195,31 @@ class DiscordRenderer:
                                     embed=tool_embed,
                                     view=edit_view_kwarg,
                                 )
+                                # #161 R2 fix: register the view in the
+                                # bot's persistent-view store so button
+                                # clicks route to this View instance even
+                                # after gc / bot restart. Without this,
+                                # ``Message.edit(view=v)`` stores the view
+                                # only weakly and clicks were getting
+                                # dropped silently (user-reported). Idem-
+                                # potent: discord.py de-dups by
+                                # (custom_id, message_id).
+                                if (
+                                    edit_ok
+                                    and tool_results_view is not None
+                                    and self._bot is not None
+                                    and tool_log_msg is not None
+                                ):
+                                    try:
+                                        self._bot.add_view(
+                                            tool_results_view,
+                                            message_id=tool_log_msg.id,
+                                        )
+                                    except Exception:
+                                        log.exception(
+                                            "Failed to register ToolResultsView "
+                                            "for persistence"
+                                        )
                                 if not edit_ok and is_medium and not is_err and tool_id:
                                     # Edit failed permanently (rate-limit /
                                     # message deleted). Downgrade the
@@ -2531,7 +2566,13 @@ class ToolResultsView(discord.ui.View):
     # cap; we never hit content-length issues because the body lives in
     # the attachment.
 
-    def __init__(self, *, author_id: int | None = None, timeout: float | None = 86400.0) -> None:
+    def __init__(self, *, author_id: int | None = None, timeout: float | None = None) -> None:
+        # discord.py requires ``timeout=None`` for persistent views
+        # (those registered via ``bot.add_view``). Per-instance items'
+        # ``custom_id`` is the unique routing key; the view is dispatch-
+        # ed from the bot's view store keyed on (custom_id, message_id).
+        # Since the buttons in this view have stable custom_ids derived
+        # from ``tool_use_id``, ``timeout=None`` is the correct choice.
         super().__init__(timeout=timeout)
         self._author_id = author_id
         self._results: dict[str, tuple[str, str]] = {}  # id -> (name, content)
@@ -2558,6 +2599,10 @@ class ToolResultsView(discord.ui.View):
         )
 
         async def _callback(interaction: discord.Interaction) -> None:
+            log.info(
+                "ToolResultsView click: tool_use_id=%s user_id=%s",
+                tool_use_id, interaction.user.id,
+            )
             await self._dispatch(interaction, tool_use_id)
 
         button.callback = _callback  # type: ignore[assignment]
