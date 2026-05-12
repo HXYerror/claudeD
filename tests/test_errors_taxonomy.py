@@ -82,3 +82,78 @@ def test_connection_closed_is_transient():
     exc = discord.errors.ConnectionClosed.__new__(discord.errors.ConnectionClosed)
     BaseException.__init__(exc)
     assert is_transient_discord_error(exc) is True
+
+
+# ---------------------------------------------------------------------------
+# v1.18 narrowed aiohttp.ClientError regression pins (#148 R3 engineer #2)
+# ---------------------------------------------------------------------------
+# The v1.14 PRD risk-table mitigation said "not catching bare ClientError".
+# v1.14 shipped bare anyway; v1.18 narrows. These tests pin the new set so a
+# future revert to bare ClientError fails loudly.
+
+
+def test_client_connector_error_is_transient():
+    """ClientConnectorError = real network blip → transient."""
+    import aiohttp
+    # ClientConnectorError signature requires (key, os_error).
+    exc = aiohttp.ClientConnectorError.__new__(aiohttp.ClientConnectorError)
+    BaseException.__init__(exc)
+    assert is_transient_discord_error(exc) is True
+
+
+def test_server_disconnected_is_transient():
+    """ServerDisconnectedError = blip during request → transient."""
+    import aiohttp
+    exc = aiohttp.ServerDisconnectedError()
+    assert is_transient_discord_error(exc) is True
+
+
+def test_server_timeout_is_transient():
+    """ServerTimeoutError = slow blip → transient."""
+    import aiohttp
+    exc = aiohttp.ServerTimeoutError()
+    assert is_transient_discord_error(exc) is True
+
+
+def test_invalid_url_is_NOT_transient():
+    """InvalidURL = programming error, NOT transient.
+    
+    Regression pin for v1.18: bare `aiohttp.ClientError` (v1.14) would have
+    classified this as transient and silently swallowed the bug.
+    """
+    import aiohttp
+    exc = aiohttp.InvalidURL("not a url")
+    assert is_transient_discord_error(exc) is False
+
+
+def test_client_response_error_is_NOT_transient():
+    """ClientResponseError = 4xx-shape payload error, NOT transient.
+
+    Regression pin: bare ClientError would have caught this; narrowed set
+    excludes it so auth/payload bugs surface instead of looping forever.
+    """
+    import aiohttp
+    exc = aiohttp.ClientResponseError(
+        request_info=None,  # type: ignore[arg-type]
+        history=(),
+        status=403,
+        message="Forbidden",
+    )
+    assert is_transient_discord_error(exc) is False
+
+
+def test_is_transient_discord_error_used_inline_by_safe_http():
+    """Cross-module consistency pin: ``safe_http`` calls
+    ``is_transient_discord_error`` directly (no separate ``_is_retryable``
+    indirection — simplicity #3 inlining). Verifies the import resolves and
+    the taxonomy callable is the one used in the retry loop."""
+    import inspect
+    from clauded import _http_retry
+    from clauded._errors import is_transient_discord_error as expected
+
+    src = inspect.getsource(_http_retry.safe_http)
+    assert "is_transient_discord_error" in src, (
+        "safe_http should call is_transient_discord_error directly"
+    )
+    # The function must be importable from _http_retry's namespace.
+    assert _http_retry.is_transient_discord_error is expected

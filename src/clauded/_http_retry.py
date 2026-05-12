@@ -13,25 +13,14 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Optional
 
-import aiohttp
 import discord
+
+from ._errors import is_transient_discord_error
 
 log = logging.getLogger("clauded.http_retry")
 
-_TRANSIENT_HTTP_STATUSES = frozenset({429, 500, 502, 503, 504})
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    if isinstance(exc, asyncio.TimeoutError):
-        return True
-    if isinstance(exc, aiohttp.ClientError):
-        return True
-    if isinstance(exc, discord.errors.RateLimited):
-        return True
-    if isinstance(exc, discord.errors.HTTPException):
-        status = getattr(exc, "status", None)
-        return status in _TRANSIENT_HTTP_STATUSES
-    return False
+# Single source of truth for transient classification lives in ``_errors``.
+from ._errors import TRANSIENT_HTTP_STATUSES  # noqa: F401,E402  re-exported for legacy importers
 
 
 async def safe_http(
@@ -53,7 +42,7 @@ async def safe_http(
         try:
             return await op()
         except BaseException as exc:  # noqa: BLE001 — selective re-raise below
-            if not _is_retryable(exc):
+            if not is_transient_discord_error(exc):
                 raise
             last_exc = exc
             delay = backoff * (2 ** attempt)
