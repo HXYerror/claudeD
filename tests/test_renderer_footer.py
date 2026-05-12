@@ -194,3 +194,83 @@ async def test_footer_logs_warning_when_stats_missing(
         "Footer skipped: no stats" in rec.getMessage()
         for rec in caplog.records
     )
+
+
+# ---------------------------------------------------------------------------
+# #172 regression pins — real SDK shape (dict from UserMessage.tool_use_result)
+# ---------------------------------------------------------------------------
+# Prior #160 Fix C tests used synthetic JSON strings, which made the helper
+# pass tests but silently fail in production on real SDK output (list of
+# TextBlock dicts in block.content; the actual stats live on UserMessage's
+# tool_use_result attribute as a dict).
+
+
+def test_extract_subagent_stats_real_sdk_tool_use_result_dict():
+    """Pin the exact shape produced by claude-agent-sdk 0.1.80.
+
+    Verified against jsonl in
+    ~/.claude/projects/.../bac18417-c2d9-46ab-94df-7cff32a3c795.jsonl
+    (per #172 root cause analysis).
+    """
+    from clauded.discord_renderer import _extract_subagent_stats
+    real_input = {
+        "status": "completed",
+        "totalDurationMs": 340388,
+        "totalTokens": 2094,
+        "totalToolUseCount": 17,
+        "usage": {"input_tokens": 735, "output_tokens": 1359},
+    }
+    result = _extract_subagent_stats(real_input)
+    assert result is not None
+    assert result["duration_s"] == pytest.approx(340.388)
+    assert result["total_tokens"] == 2094
+    assert result["tool_count"] == 17
+    # Critical: input/output_tokens come from the nested usage dict
+    assert result["input_tokens"] == 735
+    assert result["output_tokens"] == 1359
+
+
+def test_extract_subagent_stats_block_content_list_returns_none():
+    """Negative pin: SDK ToolResultBlock.content is a list[dict] of text
+    blocks, not a stats dict. The pre-#172 code passed this here and got
+    silent None. We pin the same return value but with the new contract:
+    callers must NOT pass block.content; they must pass tool_use_result.
+    Still returning None on list input keeps the helper fail-soft."""
+    from clauded.discord_renderer import _extract_subagent_stats
+    fake_block_content = [
+        {"type": "text", "text": "Sub-agent finished the review."},
+    ]
+    assert _extract_subagent_stats(fake_block_content) is None
+
+
+def test_extract_subagent_stats_flat_input_output_tokens():
+    """Older SDK shape: ``inputTokens``/``outputTokens`` flat at top level
+    (no nested ``usage`` dict). Both shapes coexist across SDK versions."""
+    from clauded.discord_renderer import _extract_subagent_stats
+    flat_input = {
+        "totalDurationMs": 12000,
+        "totalTokens": 500,
+        "inputTokens": 200,
+        "outputTokens": 300,
+    }
+    result = _extract_subagent_stats(flat_input)
+    assert result is not None
+    assert result["input_tokens"] == 200
+    assert result["output_tokens"] == 300
+
+
+def test_extract_subagent_stats_usage_dict_wins_over_flat():
+    """When BOTH ``usage`` dict and flat ``inputTokens``/``outputTokens`` are
+    present (rare cross-version overlap), prefer the nested ``usage`` (more
+    accurate; flat may be a fallback / approximation)."""
+    from clauded.discord_renderer import _extract_subagent_stats
+    mixed_input = {
+        "totalDurationMs": 100,
+        "totalTokens": 50,
+        "inputTokens": 999,  # should be ignored
+        "outputTokens": 999,  # should be ignored
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+    }
+    result = _extract_subagent_stats(mixed_input)
+    assert result["input_tokens"] == 10
+    assert result["output_tokens"] == 20
