@@ -466,6 +466,24 @@ class ClaudedBot(commands.Bot):
         # concurrent thread message that Discord delivers out of order can't
         # race in and replace+disconnect the bridge we're about to build.
         async with self.session_manager.get_lock(thread.id):
+            # Re-check active-session AFTER acquiring the lock (#150 R1
+            # engineer important). The pre-lock check at the 160004 recovery
+            # branch protects only the gateway-duplicate case; a separate
+            # in-flight-create_session race can still leak through when two
+            # `MESSAGE_CREATE` dispatches both see `get_session() == None`
+            # pre-lock, both reach get_lock(), the waiter then stomps the
+            # winner's freshly-bound bridge. Re-checking inside the lock
+            # closes the TOCTOU window. Suppress duplicate without doing any
+            # of the per-session work (no SessionConfig, no bridge, no
+            # render).
+            existing = self.session_manager.get_session(thread.id)
+            if existing is not None and existing.is_active:
+                log.info(
+                    "Thread-race (inside lock): duplicate dispatch on thread %d "
+                    "— winner already holds an active bridge; skipping",
+                    thread.id,
+                )
+                return
             try:
                 handler = InteractionHandler(thread)
                 system_prompt = self.project_manager.get_system_prompt(channel.id)
