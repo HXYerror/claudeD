@@ -9,12 +9,10 @@ Errors: not-a-git-repo, subprocess failure, channel not bound.
 """
 from __future__ import annotations
 
-import asyncio
-import io
 import shutil
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -25,6 +23,16 @@ from clauded.cost_tracker import CostTracker
 from clauded.project_manager import ProjectManager
 from clauded.session_manager import SessionManager
 from clauded.session_store import SessionStore
+
+
+# Skip the whole module if git isn't available on PATH (CI sandbox / minimal
+# Docker). R1 tester suggestion: production cog DOES require git too, so a
+# git-less host wouldn't be a valid deployment anyway; skipping the tests
+# rather than failing them keeps the suite clean across environments.
+pytestmark = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="git not on PATH; /diff tests need real git subprocess",
+)
 
 
 @pytest.fixture
@@ -257,3 +265,31 @@ async def test_diff_response_is_ephemeral(bot: ClaudedBot, tmp_path: Path) -> No
     interaction = _make_interaction(bot, channel_id)
     await diff_cmd.callback(interaction)
     assert interaction.followup.send.call_args.kwargs.get("ephemeral") is True
+
+
+@pytest.mark.asyncio
+async def test_diff_short_handles_triple_backticks_in_content(
+    bot: ClaudedBot, tmp_path: Path
+) -> None:
+    """R1 tester + simplicity convergent finding: diff containing literal
+    ```` ``` ```` (e.g. modifying a markdown file with code examples) must
+    not break the outer code fence. R2: use 4-backtick outer fence
+    (CommonMark §4.5: outer fence longer than any inner fence)."""
+    from clauded.cogs.diff import diff_cmd
+    repo = _make_real_git_repo(tmp_path, modify=False)
+    # Modify a file to contain triple backticks (markdown code example)
+    (repo / "foo.txt").write_text("hello\n```python\nprint('hi')\n```\n")
+
+    channel_id = 78901
+    bot.project_manager.bind(channel_id, str(repo))
+    interaction = _make_interaction(bot, channel_id)
+    await diff_cmd.callback(interaction)
+    embed = interaction.followup.send.call_args.kwargs.get("embed")
+    assert embed is not None, "short diff should still render as embed"
+    # Outer fence must be 4 backticks so inner 3-backticks don't close it
+    assert embed.description.startswith("````diff\n"), (
+        f"outer fence should be 4 backticks; got: {embed.description[:30]!r}"
+    )
+    assert embed.description.endswith("\n````")
+    # Inner 3-backticks preserved
+    assert "```python" in embed.description

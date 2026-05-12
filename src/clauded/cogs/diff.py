@@ -169,11 +169,15 @@ async def diff_cmd(interaction: discord.Interaction) -> None:
 
     # Tier 1: short → embed with code fence
     if len(diff_text) < _DIFF_EMBED_THRESHOLD:
-        # ```diff at start, ``` at end — Discord renders diff syntax
-        # highlighting in desktop + recent mobile clients.
+        # CommonMark §4.5 / Discord rendering: use a 4-backtick outer fence
+        # so any 3-backtick sequences inside the diff content (legitimate
+        # in diffs of markdown / python / shell files containing code
+        # examples) don't close the outer fence early. R1 tester +
+        # simplicity flagged this as a fence-escape risk; pinning with a
+        # dedicated test (test_diff_short_handles_triple_backticks).
         embed = discord.Embed(
             title=f"📋 Diff ({source_label})",
-            description=f"```diff\n{diff_text}\n```",
+            description=f"````diff\n{diff_text}\n````",
             color=COLOR_INFO,
         )
         embed.set_footer(text=f"{project_path}")
