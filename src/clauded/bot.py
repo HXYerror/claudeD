@@ -322,15 +322,18 @@ class ClaudedBot(commands.Bot):
         hint nudging the user to ``/project bind``. When False (default,
         v1.0 behavior), silently ignore the message.
         """
-        # Only trigger if bot is mentioned
-        # Accept real @mention, role mention, or text containing bot name
-        bot_mentioned = self.user and self.user.id in [m.id for m in message.mentions]
-        role_mentioned = any(r.name and self.user and self.user.name and r.name.lower() == self.user.name.lower() for r in message.role_mentions)
-        bot_name_in_text = self.user and self.user.name and self.user.name.lower() in message.content.lower()
-        if not bot_mentioned and not role_mentioned and not bot_name_in_text:
-            return
-
+        # Only trigger if bot is mentioned (v1.1 baseline) — unless the
+        # channel opted out via ``/project set-mention-required false`` (v1.17 #138).
+        # Accept real @mention, role mention, or text containing bot name.
         channel = message.channel
+        if self.project_manager.get_mention_required(channel.id):
+            bot_mentioned = self.user and self.user.id in [m.id for m in message.mentions]
+            role_mentioned = any(r.name and self.user and self.user.name and r.name.lower() == self.user.name.lower() for r in message.role_mentions)
+            bot_name_in_text = self.user and self.user.name and self.user.name.lower() in message.content.lower()
+            if not bot_mentioned and not role_mentioned and not bot_name_in_text:
+                return
+        # else: mention gate bypassed — every non-bot message in this channel triggers Claude.
+
         # SECURITY (sec-1): unbound fallback is off by default. v1.0 behavior
         # is to silently ignore @bot in unbound channels. Operators opt in via
         # CLAUDED_ALLOW_UNBOUND_FALLBACK=1 to enable the $HOME fallback.
