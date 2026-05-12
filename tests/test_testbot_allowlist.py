@@ -77,3 +77,16 @@ async def test_on_message_allowlisted_bot_passes_early_filter(monkeypatch, caplo
         pass
     info_records = [r for r in caplog.records if r.name == "clauded.bot" and "on_message" in r.message]
     assert info_records, "Allowlisted testbot was wrongly short-circuited before the on_message log"
+
+
+@pytest.mark.asyncio
+async def test_on_message_empty_env_treated_as_unset(monkeypatch):
+    """R1 tester gap: CLAUDED_TESTBOT_ID="" must behave like unset (truthy
+    check on the env value handles this — pin so a refactor doesn't break
+    it by using `os.environ.get(...) is not None`).
+    """
+    from clauded.bot import ClaudedBot
+    monkeypatch.setenv("CLAUDED_TESTBOT_ID", "")
+    msg = _make_msg(author_id=12345, author_is_bot=True)
+    result = await ClaudedBot.on_message(_Stub(), msg)
+    assert result is None  # empty env → no allowlist → other bots skipped

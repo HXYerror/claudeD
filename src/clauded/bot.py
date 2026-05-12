@@ -322,8 +322,12 @@ class ClaudedBot(commands.Bot):
         if message.author.id == getattr(self.user, "id", None):
             return
         # Ignore other bots, except an opt-in testbot allowlist for smoke
-        # testing (set CLAUDED_TESTBOT_ID to the bot account's user id;
-        # leave unset in production).
+        # testing. Set CLAUDED_TESTBOT_ID to the bot account's user id to
+        # let it drive on_message (e.g. for end-to-end smoke runs).
+        # **MUST be unset in production** — if the env value leaks to a
+        # hostile bot account in the same guild, that bot could drive
+        # arbitrary user-facing turns. Self-skip above prevents the obvious
+        # misconfig where env=bot's own id (would loop infinitely).
         if message.author.bot:
             testbot_id = os.environ.get("CLAUDED_TESTBOT_ID")
             if not (testbot_id and str(message.author.id) == testbot_id):
