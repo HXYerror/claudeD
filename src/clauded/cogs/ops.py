@@ -419,7 +419,7 @@ async def unbound_fallback_toggle(
     # again under the new policy.
     bot.project_manager._refused_unbound_channels.clear()
     # SEC AUDIT TRAIL (R1 security #5 blocking): every flip of this flag is
-    # forensic-worthy. Log INFO with WHO/WHERE/WHAT-CHANGED so operators can
+    # forensic-worthy. Log WARNING with WHO/WHERE/WHAT-CHANGED so operators can
     # reconstruct unbound-fallback policy changes post-hoc.
     log.warning(
         "SECURITY: allow_unbound_fallback %s -> %s by user=%s(id=%s) guild=%s channel=%s",
