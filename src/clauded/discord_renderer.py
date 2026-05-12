@@ -49,7 +49,7 @@ from .claude_bridge import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_agent_sdk.types import StreamEvent
+from claude_agent_sdk.types import StreamEvent, UserMessage
 from .stream_logger import log_event as _log_stream
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
@@ -211,48 +211,74 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
-def _extract_subagent_stats(content: Any) -> dict[str, Any] | None:
-    """Extract stats from a Task/Agent ToolResultBlock.content.
+def _extract_subagent_stats(input_value: Any) -> dict[str, Any] | None:
+    """Extract stats from a sub-agent ``UserMessage.tool_use_result`` payload.
 
-    The Claude SDK's `ToolResultBlock.content` for sub-agent tools (Task,
-    Agent) is typically a JSON-shaped string with fields like
-    ``totalDurationMs``, ``totalTokens``, ``totalToolUseCount``, and sometimes
-    ``totalCostUsd``. The exact shape varies across SDK versions; this helper
-    parses defensively and returns ``None`` if no recognisable stats are
-    present — callers should treat ``None`` as "don't render a mini-footer"
-    rather than crashing.
+    The Claude SDK 0.1.80 attaches sub-agent (Task/Agent tool) cost / token /
+    duration stats to the ``UserMessage.tool_use_result`` attribute as a
+    ``dict``, NOT to ``ToolResultBlock.content`` (which is a ``list[dict]``
+    of text blocks — the human-readable report, not the metrics).
 
-    Fails-soft: ANY exception during parsing (malformed JSON, deep nesting
-    RecursionError, non-numeric values) yields ``None``. This is the
-    boundary between SDK output (attacker-controllable via sub-agent stdout)
-    and the renderer's fatal-error path; we MUST NOT let a malformed stats
-    string tear down the whole turn (R1 engineer #1 + security #1).
+    #172 fix: prior call sites passed ``block.content`` here, so this
+    helper saw lists of TextBlock dicts and always returned ``None`` —
+    Fix C's sub-thread mini-footer never rendered in production. Tests
+    used synthetic JSON strings that never matched real SDK shape and so
+    falsely passed. Callers now pass ``getattr(event, 'tool_use_result',
+    None)`` from the parent ``UserMessage``.
 
-    #160 Fix C: sub-agent threads previously had NO footer at all. The user
-    runs ``/crew`` workflows that spawn 5-10 sub-threads per turn; surfacing
-    per-sub-thread cost is the highest-value half of this fix.
+    Real SDK shape (verified against jsonl):
+
+    .. code-block:: python
+
+        {
+            "status": "completed",
+            "totalDurationMs": 340388,
+            "totalTokens": 2094,
+            "totalToolUseCount": 17,
+            "usage": {"input_tokens": 735, "output_tokens": 1359},
+        }
+
+    Fails-soft: ANY exception during parsing (malformed dict, deep
+    nesting RecursionError, non-numeric values) yields ``None``. This
+    is the boundary between SDK output (attacker-controllable via sub-
+    agent stdout) and the renderer's fatal-error path; we MUST NOT let
+    a malformed stats payload tear down the whole turn.
+
+    #160 Fix C: sub-agent threads previously had NO footer at all. The
+    user runs ``/crew`` workflows that spawn 5-10 sub-threads per turn;
+    surfacing per-sub-thread cost is the highest-value half of this fix.
     """
-    if content is None:
+    if input_value is None:
         return None
     try:
-        text = content if isinstance(content, str) else str(content)
-        # JSON-only — the regex scrape fallback from R1 was dropped per
-        # simplicity/engineer/security feedback: free-form text containing
-        # quoted stat keys (e.g. ``"totalTokens": 999999`` in a Claude
-        # narrative) was producing false positives, and the regex's
-        # ``[\d.]+`` over-matched values like ``1.2.3`` causing ``float()``
-        # to crash and tear down the whole turn.
-        parsed = json.loads(text)
-        if not isinstance(parsed, dict):
+        # Accept dict directly (real SDK shape) or JSON-encoded string
+        # (legacy v1.18 R1 contract; preserved for callers that already
+        # serialized the dict).
+        if isinstance(input_value, dict):
+            parsed: dict = input_value
+        elif isinstance(input_value, str):
+            parsed = json.loads(input_value)
+            if not isinstance(parsed, dict):
+                return None
+        else:
             return None
         out: dict[str, Any] = {}
         if "totalDurationMs" in parsed:
             out["duration_s"] = float(parsed["totalDurationMs"]) / 1000
         if "totalTokens" in parsed:
             out["total_tokens"] = int(parsed["totalTokens"])
-        if "inputTokens" in parsed:
+        # SDK 0.1.80 nests input/output under ``usage`` dict; older shapes
+        # had flat ``inputTokens`` / ``outputTokens`` at the top level.
+        # Accept both.
+        usage = parsed.get("usage")
+        if isinstance(usage, dict):
+            if "input_tokens" in usage:
+                out["input_tokens"] = int(usage["input_tokens"])
+            if "output_tokens" in usage:
+                out["output_tokens"] = int(usage["output_tokens"])
+        if "inputTokens" in parsed and "input_tokens" not in out:
             out["input_tokens"] = int(parsed["inputTokens"])
-        if "outputTokens" in parsed:
+        if "outputTokens" in parsed and "output_tokens" not in out:
             out["output_tokens"] = int(parsed["outputTokens"])
         if "totalCostUsd" in parsed:
             out["cost"] = float(parsed["totalCostUsd"])
@@ -260,7 +286,7 @@ def _extract_subagent_stats(content: Any) -> dict[str, Any] | None:
             out["tool_count"] = int(parsed["totalToolUseCount"])
         return out if out else None
     except Exception:
-        # Malformed JSON / unexpected types / recursion / encoding errors:
+        # Malformed input / unexpected types / recursion / encoding errors:
         # treat as "no stats" and let the caller skip the mini-footer.
         return None
 
@@ -378,6 +404,13 @@ class DiscordRenderer:
         # Sub-agent threads: tool_use_id -> discord.Thread / DiscordRenderer
         subagent_threads: dict[str, discord.Thread] = {}
         subagent_renderers: dict[str, "DiscordRenderer"] = {}
+        # #172: capture Task/Agent sub-agent stats from UserMessage's
+        # ``tool_use_result`` attribute. Keyed by tool_use_id so the
+        # downstream AssistantMessage ToolResultBlock handler (which is
+        # what actually renders the Subtask Complete embed) can pull the
+        # right stats. Populated in the UserMessage branch below; consumed
+        # at line ~915 / ~944.
+        tool_use_results: dict[str, dict[str, Any]] = {}
 
         try:
             async for event in bridge.send_message(user_text):
@@ -540,7 +573,37 @@ class DiscordRenderer:
 
                 # Only render AssistantMessage content — skip UserMessage
                 # (UserMessage contains injected context like skill files)
-                if isinstance(content, list) and isinstance(event, AssistantMessage):
+                # #172: but BEFORE we skip, capture any
+                # ``tool_use_result`` attribute the SDK attached to a
+                # UserMessage. Task/Agent sub-agents emit their
+                # cost/duration/token stats here (NOT inside
+                # ToolResultBlock.content). We key by the matching
+                # ToolResultBlock.tool_use_id so the downstream
+                # AssistantMessage handler can pull the stats by id.
+                if isinstance(event, UserMessage):
+                    tur = getattr(event, "tool_use_result", None)
+                    if isinstance(tur, dict) and isinstance(content, list):
+                        for block in content:
+                            if isinstance(block, ToolResultBlock):
+                                tid = getattr(block, "tool_use_id", None)
+                                if tid:
+                                    tool_use_results[tid] = tur
+                # Only render AssistantMessage content for the regular
+                # ToolUseBlock / TextBlock / ThinkingBlock path. ToolResultBlock
+                # (#172 root-cause analysis verified via jsonl) ALWAYS arrives
+                # on UserMessage from the SDK — it's how the agent passes the
+                # sub-agent / tool output back into the conversation. We thus
+                # process BOTH event classes here, but only walk the blocks
+                # the respective event class actually carries:
+                #   - AssistantMessage: TextBlock, ThinkingBlock, ToolUseBlock
+                #     (ToolResultBlock would never appear here in real SDK
+                #     output but the tests below historically synthesized it
+                #     this way; keep the path for back-compat with those
+                #     tests — the if isinstance(block, ToolResultBlock):
+                #     branch is defensive)
+                #   - UserMessage: ToolResultBlock (with stats on
+                #     event.tool_use_result that we already captured above)
+                if isinstance(content, list) and isinstance(event, (AssistantMessage, UserMessage)):
                     for block in content:
                         if isinstance(block, ThinkingBlock):
                             thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
@@ -901,11 +964,20 @@ class DiscordRenderer:
                                                 sr._sub_msg, sr._sub_buffer[:DISCORD_MAX_LEN],
                                             )
 
-                                    # #160 Fix C: extract sub-agent stats from
-                                    # ToolResultBlock.content. Falls back to
-                                    # ``None`` when missing — mini-footer simply
-                                    # not appended in that case.
-                                    sub_stats = _extract_subagent_stats(block.content)
+                                    # #160 Fix C / #172: extract sub-agent
+                                    # stats from the matching UserMessage's
+                                    # ``tool_use_result`` (captured in the
+                                    # UserMessage branch above, keyed by
+                                    # tool_use_id). The SDK delivers Task
+                                    # results in TWO events: UserMessage
+                                    # carries the stats dict; AssistantMessage
+                                    # carries the ToolResultBlock. We render
+                                    # here (Assistant branch) but the data
+                                    # source is the captured Assistant->User
+                                    # mapping.
+                                    sub_stats = _extract_subagent_stats(
+                                        tool_use_results.get(tool_id)
+                                    )
                                     sub_footer = _format_subagent_footer(sub_stats)
 
                                     # Completion embed in sub-thread
@@ -933,10 +1005,13 @@ class DiscordRenderer:
                                         await self._safe_edit(tool_msgs[tool_id], embed=summary)
                                 elif tool_id in tool_msgs:
                                     # Fallback: inline completion (no sub-thread was created).
-                                    # #160 Fix C: also surface mini-footer here —
-                                    # without a sub-thread the inline embed is
-                                    # the user's only window into per-subtask cost.
-                                    sub_stats = _extract_subagent_stats(block.content)
+                                    # #160 Fix C / #172: same UserMessage
+                                    # tool_use_result source as the sub-
+                                    # thread path above; just rendered
+                                    # inline when no sub-thread exists.
+                                    sub_stats = _extract_subagent_stats(
+                                        tool_use_results.get(tool_id)
+                                    )
                                     sub_footer = _format_subagent_footer(sub_stats)
                                     description = str(block.content)[:300] if block.content else "Done"
                                     if sub_footer:
