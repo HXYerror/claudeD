@@ -30,7 +30,7 @@ from .session_config import SessionConfig
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
-from .cogs._unbound import UNBOUND_HINT_MESSAGE
+from .cogs._unbound import UNBOUND_HINT_MESSAGE, UNBOUND_REFUSE_MESSAGE
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
 from ._http_retry import (
@@ -365,7 +365,6 @@ class ClaudedBot(commands.Bot):
             and not self.config.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(channel.id):
-                from .cogs._unbound import UNBOUND_REFUSE_MESSAGE
                 try:
                     await message.reply(UNBOUND_REFUSE_MESSAGE)
                 except discord.HTTPException:
@@ -603,7 +602,6 @@ class ClaudedBot(commands.Bot):
             and not self.config.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(parent_id):
-                from .cogs._unbound import UNBOUND_REFUSE_MESSAGE
                 try:
                     await message.reply(UNBOUND_REFUSE_MESSAGE)
                 except discord.HTTPException:
