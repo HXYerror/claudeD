@@ -75,6 +75,9 @@ async def project_info(interaction: discord.Interaction) -> None:
     mode = bot.project_manager.get_channel_mode(channel_id)
     if mode != "thread":
         lines.append(f"🔀 Channel mode: `{mode}`")
+    mention_required = bot.project_manager.get_mention_required(channel_id)
+    if not mention_required:
+        lines.append("💬 Mention: not required (responds to all messages)")
     guild_root = bot.project_manager.get_guild_root(interaction.guild_id)
     if interaction.guild_id and str(interaction.guild_id) in bot.project_manager._guild_roots:
         lines.append(f"🏠 Guild root: `{guild_root}`")
@@ -247,6 +250,55 @@ async def project_set_mode(interaction: discord.Interaction, mode: app_commands.
     await interaction.response.send_message(
         f"✅ Channel mode set to `{mode.value}`", ephemeral=True
     )
+
+
+@project_group.command(
+    name="set-mention-required",
+    description="Toggle whether @ClaudeBot mention is required in this channel.",
+)
+@app_commands.describe(required="True (default) requires @bot. False responds to all messages.")
+async def project_set_mention_required(
+    interaction: discord.Interaction, required: bool
+) -> None:
+    """v1.17 #138 — per-channel mention-required toggle.
+
+    Thread messages are NEVER affected by this setting (matches v1.1 PRD F1).
+    Setting persists across unbind/rebind via the separate
+    ``_channel_settings`` registry in ``ProjectManager``.
+    """
+    log.info(
+        "/project set-mention-required required=%s channel=%s",
+        required, interaction.channel_id,
+    )
+    from ..bot import ClaudedBot
+    bot: ClaudedBot = interaction.client  # type: ignore[assignment]
+    # Thread invocation → settings live on the parent channel (matches
+    # /project bind, system_prompt, env, etc. sibling patterns).
+    channel = interaction.channel
+    if isinstance(channel, discord.Thread):
+        channel_id = channel.parent_id or interaction.channel_id
+    else:
+        channel_id = interaction.channel_id
+    if channel_id is None:
+        await interaction.response.send_message("No channel context.", ephemeral=True)
+        return
+    try:
+        bot.project_manager.set_mention_required(channel_id, required)
+    except ValueError as exc:
+        # _assert_bound rejects unbound channels with ValueError.
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    description = (
+        "Bot will respond only when @-mentioned (default)."
+        if required
+        else "Bot will respond to every non-bot message in this channel."
+    )
+    embed = discord.Embed(
+        title=f"✅ Mention required: {required}",
+        description=description,
+        color=COLOR_INFO,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @project_group.command(name="set-root", description="Set per-guild projects root directory")

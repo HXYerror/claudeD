@@ -653,3 +653,79 @@ def test_mutators_succeed_on_bound_channel(
     pm.add_extra_dir(ch, str(extra))
     assert str(extra.resolve()) in pm.get_extra_dirs(ch)
     assert pm.remove_extra_dir(ch, str(extra)) is True
+
+
+# ---------------------------------------------------------------------------
+# Mention-required toggle (v1.17 #138)
+# ---------------------------------------------------------------------------
+
+
+def test_get_mention_required_default_true(manager: ProjectManager) -> None:
+    """Never-set channel returns True (zero regression default)."""
+    assert manager.get_mention_required(99999) is True
+
+
+def test_set_mention_required_persists(
+    bound_manager: tuple[ProjectManager, int],
+    data_dir: Path,
+    projects_root: Path,
+) -> None:
+    """Set False, reload manager from disk, get back False."""
+    pm, ch = bound_manager
+    pm.set_mention_required(ch, False)
+    assert pm.get_mention_required(ch) is False
+    # Reload from disk
+    pm2 = ProjectManager(data_dir=str(data_dir), projects_root=str(projects_root))
+    assert pm2.get_mention_required(ch) is False
+
+
+def test_set_mention_required_unbound_raises(manager: ProjectManager) -> None:
+    """Unbound channel rejection mirrors set_channel_mode / set_system_prompt."""
+    with pytest.raises(ValueError):
+        manager.set_mention_required(12345, False)
+
+
+def test_unbind_preserves_mention_required(
+    bound_manager: tuple[ProjectManager, int],
+    projects_root: Path,
+) -> None:
+    """v1.17 invariant: mention_required survives unbind/rebind (intentional stick)."""
+    pm, ch = bound_manager
+    pm.set_mention_required(ch, False)
+    pm.unbind(ch)
+    # Rebind same channel
+    proj = projects_root / "boundproj"  # same path used by bound_manager fixture
+    pm.bind(ch, str(proj))
+    assert pm.get_mention_required(ch) is False
+
+
+def test_unbind_does_not_preserve_other_settings(
+    bound_manager: tuple[ProjectManager, int],
+    projects_root: Path,
+) -> None:
+    """v1.17 invariant pin: only mention_required survives unbind; system_prompt does not."""
+    pm, ch = bound_manager
+    pm.set_system_prompt(ch, "sticky prompt")
+    pm.set_mention_required(ch, False)
+    pm.unbind(ch)
+    proj = projects_root / "boundproj"
+    pm.bind(ch, str(proj))
+    # system_prompt wiped, mention_required kept
+    assert pm.get_system_prompt(ch) is None
+    assert pm.get_mention_required(ch) is False
+
+
+def test_mention_required_stored_in_separate_registry(
+    bound_manager: tuple[ProjectManager, int],
+    data_dir: Path,
+) -> None:
+    """Architect-decided invariant: registry lives in channel_settings.json,
+    NOT in projects.json. Pins the separate-file design choice (a future
+    revert to nesting would fail this test)."""
+    pm, ch = bound_manager
+    pm.set_mention_required(ch, False)
+    settings_file = data_dir / "channel_settings.json"
+    assert settings_file.exists()
+    with open(settings_file) as f:
+        data = json.load(f)
+    assert data[str(ch)]["mention_required"] is False

@@ -33,11 +33,17 @@ class ProjectManager:
         self._path = Path(self.path)
         self._projects: dict[str, dict[str, str]] = {}
         self._guild_roots: dict[str, str] = {}
+        # Per-channel settings that survive unbind/rebind (v1.17 #138).
+        # Stored separately from ``_projects`` so ``unbind`` semantics stay
+        # unchanged for system_prompt/budget/etc. Default-True at lookup
+        # time means an empty registry preserves v1.1 baseline behavior.
+        self._channel_settings: dict[str, dict] = {}
         # Channels that have already been shown the "unbound, falling back to
         # ~" hint this process. In-memory only — bot restart re-arms the hint.
         self._hinted_unbound_channels: set[int] = set()
         self._load()
         self._load_guild_roots()
+        self._load_channel_settings()
 
     # ------------------------------------------------------------------
     # Persistence
@@ -372,6 +378,58 @@ class ProjectManager:
     def get_channel_mode(self, channel_id: int) -> str:
         """Return the channel mode ('thread' or 'forum') for ``channel_id``."""
         return self._projects.get(str(channel_id), {}).get("channel_mode", "thread")
+
+    # ------------------------------------------------------------------
+    # Mention-required toggle — v1.17 #138
+    # ------------------------------------------------------------------
+    def set_mention_required(self, channel_id: int, required: bool) -> None:
+        """Set whether @bot mention is required for this channel to trigger.
+
+        Stored in ``_channel_settings`` (a separate registry from
+        ``_projects``) so the value survives unbind/rebind. Other
+        channel-level settings (system_prompt, budget, etc.) follow the
+        existing ``unbind``-wipes-all semantics — only this single
+        setting is intentionally sticky.
+        """
+        self._assert_bound(channel_id)
+        key = str(channel_id)
+        settings = self._channel_settings.setdefault(key, {})
+        settings["mention_required"] = bool(required)
+        self._save_channel_settings()
+
+    def get_mention_required(self, channel_id: int) -> bool:
+        """Return mention-required setting; defaults to True for unset channels.
+
+        Default True preserves the v1.1 baseline (zero regression for users
+        who never touch this knob).
+        """
+        settings = self._channel_settings.get(str(channel_id))
+        if settings is None:
+            return True
+        return settings.get("mention_required", True)
+
+    def _load_channel_settings(self) -> None:
+        p = os.path.join(self.data_dir, "channel_settings.json")
+        if not os.path.isfile(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._channel_settings = data
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Failed to load channel_settings.json: %s — starting empty", exc)
+            self._channel_settings = {}
+
+    def _save_channel_settings(self) -> None:
+        os.makedirs(self.data_dir, exist_ok=True)
+        p = Path(self.data_dir) / "channel_settings.json"
+        tmp_path = p.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(self._channel_settings, f, indent=2, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, p)
 
     # ------------------------------------------------------------------
     # Per-guild project root — #91
