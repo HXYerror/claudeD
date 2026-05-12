@@ -282,22 +282,23 @@ def test_medium_tier_content_preserves_raw_bytes():
 
 
 @pytest.mark.asyncio
-async def test_medium_tier_integration_emits_file_attachment():
+async def test_medium_tier_integration_attaches_view_button():
     """Integration: drive render_response with a medium-tier Bash result
     (multiline) and verify:
-      1. Rolling log embed updated with summary line ('N lines / M chars
-         (see attached file)')
-      2. Separate message sent with a discord.File attachment whose body
-         contains the raw tool output verbatim (no spoiler escape).
+      1. Rolling log embed updated with summary line ending '(⬇ click
+         to view)' — no separate detail message
+      2. The same rolling-log message edit attaches a ToolResultsView
+         containing 1 button labeled with the tool name and ordinal
+      3. The view holds the raw content; clicking would dispatch an
+         ephemeral with the .txt file attachment
     """
-    import sys, io
+    import sys
     sys.path.insert(0, "src")
     from unittest.mock import MagicMock
-    import discord
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
-    from clauded.discord_renderer import DiscordRenderer
+    from clauded.discord_renderer import DiscordRenderer, ToolResultsView
 
     class FakeBridge:
         def __init__(self, events):
@@ -312,13 +313,14 @@ async def test_medium_tier_integration_emits_file_attachment():
         def __init__(self):
             self.content = ""
             self.embeds = []
-            self.attachments = []
-            self.sent_kwargs = None
+            self.attached_view = None
         async def edit(self, **kwargs):
             if "content" in kwargs:
                 self.content = kwargs["content"]
             if "embed" in kwargs:
                 self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
             return self
         async def delete(self):
             return None
@@ -329,45 +331,34 @@ async def test_medium_tier_integration_emits_file_attachment():
             self._sent = []
         async def send(self, *args, **kwargs):
             msg = FakeMessage()
-            msg.sent_kwargs = kwargs
             if "content" in kwargs:
                 msg.content = kwargs["content"]
             if "embed" in kwargs:
                 msg.embeds = [kwargs["embed"]]
-            if "file" in kwargs:
-                msg.attachments = [kwargs["file"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
             self._sent.append(msg)
             return msg
 
-    # Medium-tier output: 30-line Bash stdout (~500 chars)
     medium_content = "\n".join(f"line {i}: some output text here" for i in range(30))
     assert 200 <= len(medium_content) < 8000
 
     events = [
         AssistantMessage(
             content=[
-                ToolUseBlock(
-                    id="tool-1", name="Bash",
-                    input={"command": "ls -la"},
-                ),
+                ToolUseBlock(id="tool-1", name="Bash", input={"command": "ls -la"}),
             ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
+            model="claude-sonnet", parent_tool_use_id=None,
         ),
         AssistantMessage(
             content=[
                 ToolResultBlock(tool_use_id="tool-1", content=medium_content, is_error=False),
             ],
-            model="claude-sonnet",
-            parent_tool_use_id=None,
+            model="claude-sonnet", parent_tool_use_id=None,
         ),
         ResultMessage(
-            subtype="result",
-            duration_ms=100,
-            duration_api_ms=80,
-            is_error=False,
-            num_turns=1,
-            session_id="sess-medium",
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-medium",
             total_cost_usd=0.001,
         ),
     ]
@@ -377,34 +368,47 @@ async def test_medium_tier_integration_emits_file_attachment():
     bridge = FakeBridge(events)
     await renderer.render_response(bridge, "ls -la")
 
-    # 1) rolling log embed
-    rolling_log_embeds = [
+    # Find the rolling-log message (it's the one with the Tool Activity
+    # embed and a ToolResultsView attached).
+    rolling_log_msgs = [
         m for m in target._sent
         if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
     ]
-    assert rolling_log_embeds, (
-        f"Expected Tool Activity rolling-log embed; got: "
-        f"{[(m.embeds[0].title if m.embeds else None) for m in target._sent]}"
+    assert rolling_log_msgs, (
+        f"Expected Tool Activity rolling-log msg; got: "
+        f"{[(m.embeds[0].title if m.embeds else None, type(m.attached_view).__name__) for m in target._sent]}"
     )
-    final_log = rolling_log_embeds[-1].embeds[0].description
-    assert "30 lines" in final_log
-    assert "see attached file" in final_log
-
-    # 2) file attachment message
-    file_msgs = [
+    rolling = rolling_log_msgs[-1]
+    # Summary line on the embed
+    desc = rolling.embeds[0].description
+    assert "30 lines" in desc
+    assert "click to view" in desc
+    # View attached with the button
+    assert isinstance(rolling.attached_view, ToolResultsView), (
+        f"Expected ToolResultsView attached to rolling log; got: "
+        f"{type(rolling.attached_view).__name__}"
+    )
+    view: ToolResultsView = rolling.attached_view
+    assert len(view._results) == 1
+    name, content = view._results["tool-1"]
+    assert name == "Bash"
+    assert content == medium_content
+    # Button label includes ordinal + tool name
+    button = view._buttons["tool-1"]
+    assert "#1" in button.label
+    assert "Bash" in button.label
+    # NO separate detail message was sent
+    other_msgs = [
         m for m in target._sent
-        if m.attachments and isinstance(m.attachments[0], discord.File)
+        if not (m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity")
     ]
-    assert file_msgs, f"Expected a discord.File attachment for medium tier; got: {target._sent}"
-    file_msg = file_msgs[0]
-    # Label content present
-    assert "Bash result" in file_msg.content
-    assert f"{len(medium_content)} chars" in file_msg.content
-    # File payload preserves content verbatim
-    detail_file = file_msg.attachments[0]
-    assert detail_file.filename == "bash_result.txt"
-    detail_file.fp.seek(0)
-    assert detail_file.fp.read().decode("utf-8") == medium_content
+    # `other_msgs` may contain cost-footer-style messages; assert none has
+    # the old separate-file-attachment shape.
+    for m in other_msgs:
+        assert not (m.content and m.content.startswith("📄 ")), (
+            f"Medium-tier should NOT send a separate 📄 message anymore; got: "
+            f"{m.content[:120]!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -460,99 +464,57 @@ def test_multiline_short_content_falls_to_bare_branch():
 
 
 @pytest.mark.asyncio
-async def test_medium_tier_detail_send_failure_downgrades_log():
-    """R1 engineer #2 mitigation: if the detail embed send fails (rate-
-    limited, network blip), rewrite the rolling log line to NOT promise
-    a clickable detail. User would otherwise see ``click below to expand``
-    pointing at no follow-up message.
+async def test_toolresults_view_add_result_idempotent_and_capped():
+    """v1.18 R3: replace the old send-failure test (file-attachment
+    fallback is gone). Pin the ToolResultsView contract directly:
+
+    - add_result is idempotent on tool_use_id (same id twice → single
+      button, second call returns False)
+    - 25-button cap honored (Discord per-view limit). Once full,
+      add_result returns False and the view stops accepting new ones.
+    - Button label includes ordinal (#N) and tool name (truncated to
+      18 chars to fit Discord's 80-char label cap with the prefix).
     """
-    import sys
-    sys.path.insert(0, "src")
-    from unittest.mock import MagicMock
-    from claude_agent_sdk.types import (
-        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
-    )
-    from clauded.discord_renderer import DiscordRenderer
+    from clauded.discord_renderer import ToolResultsView
 
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
+    view = ToolResultsView()
 
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            return self
-        async def delete(self):
-            return None
+    # First add succeeds, second add (same id) is no-op
+    assert view.add_result(tool_use_id="id-1", tool_name="Bash", content="x" * 500) is True
+    assert view.add_result(tool_use_id="id-1", tool_name="Bash", content="x" * 500) is False
+    assert len(view._results) == 1
+    assert len(view._buttons) == 1
+    btn = view._buttons["id-1"]
+    assert "#1" in btn.label
+    assert "Bash" in btn.label
 
-    class FailingSendTarget:
-        """Target whose .send() returns None for the file-attachment msg
-        (sim'd rate-limit / network blip) but succeeds for embed-only
-        sends (rolling log)."""
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-            self._call_count = 0
-        async def send(self, *args, **kwargs):
-            self._call_count += 1
-            # File-attachment sends fail (medium-tier detail)
-            if kwargs.get("file") is not None:
-                return None
-            # Embed-only sends succeed (rolling log creation)
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            self._sent.append(msg)
-            return msg
+    # Different id → new button at ordinal #2
+    assert view.add_result(tool_use_id="id-2", tool_name="Read", content="x" * 500) is True
+    assert "#2" in view._buttons["id-2"].label
 
-    medium_content = "\n".join(f"line {i}: out" for i in range(50))
-    assert 200 <= len(medium_content) < 8000
+    # Fill to cap (25)
+    for i in range(3, 26):
+        ok = view.add_result(tool_use_id=f"id-{i}", tool_name="Tool", content="x" * 500)
+        assert ok is True
+    assert len(view._results) == 25
 
-    events = [
-        AssistantMessage(
-            content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
-            model="claude-sonnet", parent_tool_use_id=None,
-        ),
-        AssistantMessage(
-            content=[ToolResultBlock(tool_use_id="t1", content=medium_content, is_error=False)],
-            model="claude-sonnet", parent_tool_use_id=None,
-        ),
-        ResultMessage(
-            subtype="result", duration_ms=100, duration_api_ms=80,
-            is_error=False, num_turns=1, session_id="sess-fail",
-            total_cost_usd=0.001,
-        ),
-    ]
+    # 26th add: refused
+    assert view.add_result(tool_use_id="id-overflow", tool_name="Tool", content="x" * 500) is False
+    assert len(view._results) == 25
 
-    target = FailingSendTarget()
-    renderer = DiscordRenderer(target)
-    bridge = FakeBridge(events)
-    await renderer.render_response(bridge, "ls")
 
-    # Find the LAST Tool Activity rolling-log embed
-    rolling_embeds = [m for m in target._sent if m.embeds and "Tool Activity" in (m.embeds[0].title or "")]
-    assert rolling_embeds, "Expected at least one Tool Activity rolling-log embed"
-    final_log_desc = rolling_embeds[-1].embeds[0].description
-    # The rolling log line MUST have been downgraded to NOT say "click below"
-    assert "click below" not in final_log_desc, (
-        f"After detail send failure, rolling log MUST NOT promise a click target; "
-        f"got: {final_log_desc!r}"
-    )
-    # Should mention the failure
-    assert "detail send failed" in final_log_desc, (
-        f"Expected 'detail send failed' in downgraded rolling log; "
-        f"got: {final_log_desc!r}"
-    )
+@pytest.mark.asyncio
+async def test_toolresults_view_button_label_truncates_long_tool_name():
+    """Discord button labels max 80 chars. Tool names can be arbitrary
+    SDK strings (Task, ExitPlanMode, plus future MCP tools). The view
+    truncates the name segment to 18 chars so the full label fits as
+    ``📄 #N <name[:18]>`` (≄30 chars total)."""
+    from clauded.discord_renderer import ToolResultsView
+
+    view = ToolResultsView()
+    long_name = "VeryLongHypotheticalToolName_That_Will_Get_Truncated"
+    view.add_result(tool_use_id="id-x", tool_name=long_name, content="x" * 500)
+    label = view._buttons["id-x"].label
+    assert len(label) <= 80, f"Discord button label cap exceeded: {len(label)}"
+    # First 18 chars of name preserved
+    assert long_name[:18] in label
