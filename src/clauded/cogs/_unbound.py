@@ -17,7 +17,10 @@ import discord
 
 UNBOUND_REFUSE_MESSAGE = (
     "❌ This channel isn't bound to a project. "
-    "Run `/project bind <path>` first, then retry."
+    "Run `/project bind <path>` first, then retry. "
+    "— Operator alternative: set `CLAUDED_ALLOW_UNBOUND_FALLBACK=1` "
+    "in the bot environment to globally allow unbound channels "
+    "(falls back to `~`)."
 )
 
 UNBOUND_HINT_MESSAGE = (
