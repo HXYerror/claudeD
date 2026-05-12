@@ -1077,19 +1077,26 @@ class DiscordRenderer:
                                         and "\n" not in content_str
                                         and content_str.strip() != ""
                                     )
-                                    # #161 medium tier: 200 <= len(content) <
-                                    # 3500 chars — send a separate detail embed
-                                    # with ``||spoiler||`` so user can click to
-                                    # reveal the output without it bloating the
-                                    # rolling tool log. Multiline allowed here
-                                    # (Read 30-line file, Grep 7-match output,
-                                    # short Bash stdout). PRD R2: per-tool
-                                    # thresholds finer-tuned later; v1.18 ships
-                                    # the default 200/3500 boundary.
+                                    # #161 medium tier: 200 <= len(content)
+                                    # — send as a .txt FILE ATTACHMENT below
+                                    # the rolling log. Discord renders file
+                                    # attachments as a single-line link/icon
+                                    # that the user can click to view in a
+                                    # side-pane, which is the actual collapse
+                                    # UX (verified post-R1: both embed-desc
+                                    # spoilers AND message-content spoilers
+                                    # only BLUR text — they don't reduce
+                                    # vertical height, so an 80-line output
+                                    # remained an 80-line gray block).
+                                    # Upper bound 8000 chars: covers nearly
+                                    # all real Bash/Read outputs; xlong tier
+                                    # (>8000) can compress or paginate in
+                                    # a follow-up. No 2000-char content cap
+                                    # because file payload is separate.
                                     is_medium = (
                                         not is_short
                                         and not is_err
-                                        and 200 <= len(content_str) < 3500
+                                        and 200 <= len(content_str) < 8000
                                         and content_str.strip() != ""
                                     )
                                     if is_err:
@@ -1102,11 +1109,11 @@ class DiscordRenderer:
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
                                     elif is_medium:
                                         # Rolling log shows summary only;
-                                        # detail embed follows below.
+                                        # file attachment follows below.
                                         line_count = content_str.count("\n") + 1
                                         tool_log_lines[i] = (
                                             f"{status} {name}: {line_count} lines / "
-                                            f"{len(content_str)} chars (click below to expand)"
+                                            f"{len(content_str)} chars (see attached file)"
                                         )
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
@@ -1125,29 +1132,34 @@ class DiscordRenderer:
                                 # doesn't escape the fence (mirrors /diff PR
                                 # #170 R2 fix).
                                 if is_medium and not is_err:
-                                    detail = content_str.replace("||", "\\|\\|")
-                                    # Discord spoiler `||...||` works inside
-                                    # code blocks but the code block doesn't
-                                    # auto-collapse on mobile. Prefer the
-                                    # ``||\n```\n...\n```\n||`` shape that
-                                    # collapses cleanly across clients.
-                                    spoiler_body = f"||\n````\n{detail}\n````\n||"
-                                    detail_embed = discord.Embed(
-                                        title=f"📄 {name} result ({len(content_str)} chars)",
-                                        description=spoiler_body,
-                                        color=COLOR_TOOL_SUCCESS,
+                                    # #161 medium tier: send as .txt file
+                                    # attachment below the rolling log.
+                                    # Discord file attachments render as a
+                                    # single-line preview card that the user
+                                    # clicks to expand — the actual collapse
+                                    # UX. Spoiler-text hacks (`||...||`)
+                                    # only blur text, they don't reduce
+                                    # vertical height.
+                                    label = f"📄 **{name} result** \u2014 {len(content_str)} chars / {content_str.count(chr(10)) + 1} lines"
+                                    file_bytes = content_str.encode("utf-8", errors="replace")
+                                    file_name = f"{name.lower()}_result.txt"
+                                    detail_file = discord.File(
+                                        fp=io.BytesIO(file_bytes),
+                                        filename=file_name,
                                     )
-                                    sent = await self._safe_send(embed=detail_embed)
+                                    sent = await self._safe_send(
+                                        content=label, file=detail_file
+                                    )
                                     if sent is None:
-                                        # R1 engineer #2: detail embed send
-                                        # failed (rate-limited, network blip).
+                                        # R1 engineer #2: detail send failed
+                                        # (rate-limited, network blip).
                                         # Rewrite the rolling log line to NOT
-                                        # promise a clickable detail — the
-                                        # user would otherwise see ``click
-                                        # below to expand`` pointing at
+                                        # promise an attached file — the
+                                        # user would otherwise see ``see
+                                        # attached file`` pointing at
                                         # nothing. Downgrade to bare summary.
                                         for j in range(len(tool_log_lines) - 1, -1, -1):
-                                            if tool_log_lines[j].startswith(f"{status} {name}:") and "click below" in tool_log_lines[j]:
+                                            if tool_log_lines[j].startswith(f"{status} {name}:") and "see attached file" in tool_log_lines[j]:
                                                 tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; detail send failed)"
                                                 break
                                         # Refresh the rolling log embed so

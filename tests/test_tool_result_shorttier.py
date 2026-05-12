@@ -219,14 +219,16 @@ async def test_short_tier_integration_via_render_response():
 
 
 def test_medium_tier_threshold_boundaries():
-    """The medium-tier predicate matches 200 ≤ len(content) < 3500, with
-    content non-empty and is_err False. Test the boundaries directly so a
-    future refactor of the threshold constants doesn't silently regress."""
+    """Medium-tier predicate: 200 ≤ len(content) < 8000, non-error,
+    non-empty, non-short. R1-R2 history: 3500 → 1900 (when we thought
+    plain-content spoilers collapsed) → 8000 (after user confirmed both
+    spoiler styles just blur text). Final medium tier sends a .txt file
+    attachment which has no message-content size constraint."""
     def is_medium(content, is_err=False, is_short=False):
         return (
             not is_short
             and not is_err
-            and 200 <= len(content) < 3500
+            and 200 <= len(content) < 8000
             and content.strip() != ""
         )
 
@@ -236,62 +238,62 @@ def test_medium_tier_threshold_boundaries():
     assert is_medium("x" * 200)
     # Mid-range → medium
     assert is_medium("x" * 1000)
-    # Just under 3500 → still medium
-    assert is_medium("x" * 3499)
-    # Exactly 3500 → not medium (long tier's domain)
-    assert not is_medium("x" * 3500)
-    # Empty → not medium
+    # Just under 8000 → still medium
+    assert is_medium("x" * 7999)
+    # Exactly 8000 → not medium (xlong tier's domain)
+    assert not is_medium("x" * 8000)
+    # Empty / whitespace-only
     assert not is_medium("")
-    assert not is_medium("   " * 100)  # whitespace-only
-    # is_err overrides → not medium
+    assert not is_medium("   " * 100)
+    # is_err / is_short overrides
     assert not is_medium("x" * 500, is_err=True)
-    # Short overrides → not medium (predicates are exclusive)
     assert not is_medium("x" * 500, is_short=True)
 
 
-def test_medium_tier_spoiler_wrapper_shape():
-    """The medium-tier detail embed wraps content in
-    ``||\n````\n{content}\n````\n||`` so Discord renders it as a spoiler
-    containing a 4-backtick fenced code block. 4-backtick outer fence
-    prevents ``` in content from breaking the inner fence (same fix as
-    /diff PR #170 R2)."""
+def test_medium_tier_file_attachment_shape():
+    """The medium-tier detail message uses a discord.File attachment, not
+    embed description / plain-content spoilers. Both spoiler styles only
+    blur text — they don't reduce vertical height (verified twice on user
+    side: 80-line `seq 1 80` rendered as 80-line gray block in both).
+    File attachments render as a single-line preview card."""
+    import discord, io
     content = "line 1\nline 2\nsome ```triple backticks``` inside\nline 4"
-    detail = content.replace("||", "\\|\\|")
-    spoiler_body = f"||\n````\n{detail}\n````\n||"
-    # Outer spoiler markers present
-    assert spoiler_body.startswith("||\n")
-    assert spoiler_body.endswith("\n||")
-    # 4-backtick fence (not 3) so inner triple-backticks don't escape
-    assert "````\n" in spoiler_body
-    assert "```triple backticks```" in spoiler_body, (
-        f"3-backtick content must survive verbatim inside 4-backtick fence; "
-        f"got: {spoiler_body!r}"
+    file_bytes = content.encode("utf-8")
+    detail_file = discord.File(
+        fp=io.BytesIO(file_bytes), filename="bash_result.txt"
     )
+    # File object constructible — byte content preserved
+    detail_file.fp.seek(0)
+    assert detail_file.fp.read() == file_bytes
+    assert detail_file.filename == "bash_result.txt"
 
 
-def test_medium_tier_existing_double_pipe_escape():
-    """If content contains literal ``||`` (Discord's spoiler marker), escape
-    it so the inner spoilers don't terminate the outer wrapper early."""
-    content = "before ||not a spoiler|| after"
-    detail = content.replace("||", "\\|\\|")
-    assert "\\|\\|" in detail
-    assert "||" not in detail
+def test_medium_tier_content_preserves_raw_bytes():
+    """Content sent as a file attachment preserves bytes verbatim — no
+    spoiler-escape transforms, no ``||`` replacement, no fence wrapping.
+    Triple-backticks, literal ``||``, and CommonMark special chars all
+    survive intact (unlike the spoiler-embed approach which had to
+    escape ``||`` to ``\\|\\|``)."""
+    import io
+    payload = "```python\nprint('||hello||')\n```\n— also: \u00a0\u202f"
+    file_bytes = payload.encode("utf-8")
+    # roundtrip
+    assert io.BytesIO(file_bytes).read().decode("utf-8") == payload
 
 
 @pytest.mark.asyncio
-async def test_medium_tier_integration_emits_spoiler_embed():
+async def test_medium_tier_integration_emits_file_attachment():
     """Integration: drive render_response with a medium-tier Bash result
-    (200-3500 chars, multiline) and verify TWO embeds reach the target:
-      1. Rolling log embed with summary line ('N lines / M chars (click...)')
-      2. Separate detail embed with title '📄 Bash result (M chars)' and
-         description containing ``||\n````\n...`` spoiler-fenced content.
-
-    Catches future regressions where the medium-tier branch is silently
-    skipped or the detail embed format drifts.
+    (multiline) and verify:
+      1. Rolling log embed updated with summary line ('N lines / M chars
+         (see attached file)')
+      2. Separate message sent with a discord.File attachment whose body
+         contains the raw tool output verbatim (no spoiler escape).
     """
-    import sys
+    import sys, io
     sys.path.insert(0, "src")
     from unittest.mock import MagicMock
+    import discord
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
@@ -310,6 +312,8 @@ async def test_medium_tier_integration_emits_spoiler_embed():
         def __init__(self):
             self.content = ""
             self.embeds = []
+            self.attachments = []
+            self.sent_kwargs = None
         async def edit(self, **kwargs):
             if "content" in kwargs:
                 self.content = kwargs["content"]
@@ -325,16 +329,19 @@ async def test_medium_tier_integration_emits_spoiler_embed():
             self._sent = []
         async def send(self, *args, **kwargs):
             msg = FakeMessage()
+            msg.sent_kwargs = kwargs
             if "content" in kwargs:
                 msg.content = kwargs["content"]
             if "embed" in kwargs:
                 msg.embeds = [kwargs["embed"]]
+            if "file" in kwargs:
+                msg.attachments = [kwargs["file"]]
             self._sent.append(msg)
             return msg
 
     # Medium-tier output: 30-line Bash stdout (~500 chars)
     medium_content = "\n".join(f"line {i}: some output text here" for i in range(30))
-    assert 200 <= len(medium_content) < 3500
+    assert 200 <= len(medium_content) < 8000
 
     events = [
         AssistantMessage(
@@ -370,39 +377,34 @@ async def test_medium_tier_integration_emits_spoiler_embed():
     bridge = FakeBridge(events)
     await renderer.render_response(bridge, "ls -la")
 
-    # Find the rolling-log embed AND the detail embed.
+    # 1) rolling log embed
     rolling_log_embeds = [
         m for m in target._sent
         if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
     ]
-    detail_embeds = [
-        m for m in target._sent
-        if m.embeds and (m.embeds[0].title or "").startswith("📄 ")
-    ]
-
     assert rolling_log_embeds, (
-        f"Expected a Tool Activity rolling-log embed; got titles: "
+        f"Expected Tool Activity rolling-log embed; got: "
         f"{[(m.embeds[0].title if m.embeds else None) for m in target._sent]}"
     )
-    # Rolling log final state should have the 'N lines / M chars' summary
     final_log = rolling_log_embeds[-1].embeds[0].description
-    assert "30 lines" in final_log or f"{len(medium_content)} chars" in final_log, (
-        f"Rolling log should show medium-tier summary line; got: {final_log!r}"
-    )
+    assert "30 lines" in final_log
+    assert "see attached file" in final_log
 
-    assert detail_embeds, (
-        f"Expected a separate ‘📄 Bash result (… chars)’ detail embed; "
-        f"got titles: {[(m.embeds[0].title if m.embeds else None) for m in target._sent]}"
-    )
-    detail = detail_embeds[0].embeds[0]
-    assert f"Bash result" in detail.title
-    assert f"{len(medium_content)} chars" in detail.title
-    # Description must wrap content in ``||\n````\n...\n````\n||`` spoiler+fence
-    assert detail.description.startswith("||\n````\n")
-    assert detail.description.endswith("\n````\n||")
-    # Original content lines preserved inside the spoiler
-    assert "line 0: some output text here" in detail.description
-    assert "line 29: some output text here" in detail.description
+    # 2) file attachment message
+    file_msgs = [
+        m for m in target._sent
+        if m.attachments and isinstance(m.attachments[0], discord.File)
+    ]
+    assert file_msgs, f"Expected a discord.File attachment for medium tier; got: {target._sent}"
+    file_msg = file_msgs[0]
+    # Label content present
+    assert "Bash result" in file_msg.content
+    assert f"{len(medium_content)} chars" in file_msg.content
+    # File payload preserves content verbatim
+    detail_file = file_msg.attachments[0]
+    assert detail_file.filename == "bash_result.txt"
+    detail_file.fp.seek(0)
+    assert detail_file.fp.read().decode("utf-8") == medium_content
 
 
 # ---------------------------------------------------------------------------
@@ -410,16 +412,16 @@ async def test_medium_tier_integration_emits_spoiler_embed():
 # ---------------------------------------------------------------------------
 
 
-def test_medium_tier_error_path_does_not_emit_detail_embed():
+def test_medium_tier_error_path_does_not_emit_detail_message():
     """When is_err=True and content is medium-length, the rolling log shows
     the error text (capped at 100 chars), NOT the medium-tier summary, and
-    NO separate detail embed is sent (errors are surfaced inline, not hidden
-    in a spoiler the user has to click to see)."""
+    NO separate spoiler-content message is sent (errors are surfaced
+    inline, not hidden in a spoiler the user has to click to see)."""
     def is_medium(content, is_err=False, is_short=False):
         return (
             not is_short
             and not is_err
-            and 200 <= len(content) < 3500
+            and 200 <= len(content) < 1900
             and content.strip() != ""
         )
     error_content = "x" * 500  # medium-length BUT is_err
@@ -444,7 +446,7 @@ def test_multiline_short_content_falls_to_bare_branch():
         return (
             not is_short_val
             and not is_err
-            and 200 <= len(content) < 3500
+            and 200 <= len(content) < 1900
             and content.strip() != ""
         )
     multiline_short = "line 1\nline 2\nline 3"  # 20 chars but multiline
@@ -495,26 +497,19 @@ async def test_medium_tier_detail_send_failure_downgrades_log():
             return None
 
     class FailingSendTarget:
-        """Target whose .send() returns None for the detail embed (sim'd
-        rate-limit / network blip) but succeeds for the rolling-log embed."""
+        """Target whose .send() returns None for the file-attachment msg
+        (sim'd rate-limit / network blip) but succeeds for embed-only
+        sends (rolling log)."""
         def __init__(self):
             self.id = 1
             self._sent = []
             self._call_count = 0
         async def send(self, *args, **kwargs):
             self._call_count += 1
-            # Rolling-log first send (when tool_log_msg is None) succeeds.
-            # The medium-tier detail embed is sent AFTER tool_log_msg edits,
-            # so distinguish by title:
-            if kwargs.get("embed") and "Tool Activity" in (kwargs["embed"].title or ""):
-                msg = FakeMessage()
-                msg.embeds = [kwargs["embed"]]
-                self._sent.append(msg)
-                return msg
-            # Simulate detail-embed send failure
-            if kwargs.get("embed") and "result" in (kwargs["embed"].title or ""):
+            # File-attachment sends fail (medium-tier detail)
+            if kwargs.get("file") is not None:
                 return None
-            # Fallback (cost footer, etc.)
+            # Embed-only sends succeed (rolling log creation)
             msg = FakeMessage()
             if "content" in kwargs:
                 msg.content = kwargs["content"]
@@ -524,7 +519,7 @@ async def test_medium_tier_detail_send_failure_downgrades_log():
             return msg
 
     medium_content = "\n".join(f"line {i}: out" for i in range(50))
-    assert 200 <= len(medium_content) < 3500
+    assert 200 <= len(medium_content) < 8000
 
     events = [
         AssistantMessage(
