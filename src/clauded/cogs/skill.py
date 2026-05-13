@@ -9,6 +9,7 @@ content of ``~/.claude/skills/`` and ``<project>/.claude/skills/``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
@@ -21,6 +22,12 @@ from ..skill_parser import classify_command
 from ._unbound import NO_CHANNEL_MESSAGE, resolve_channel_id
 
 log = logging.getLogger("clauded.bot")
+
+# Defensive cap on Path B subprocess spawn + query (#197). The cold-start
+# of a transient ClaudeSDKClient can hang when the parent turn is hammering
+# the host. Past this budget, surface a friendly error instead of letting
+# Discord's interaction window lapse.
+_PATH_B_TIMEOUT_S = 10
 
 
 skill_group = app_commands.Group(
@@ -123,20 +130,35 @@ async def skill_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
 
+    # Fix C — defer BEFORE any potentially slow operation. If anything
+    # between here and the followup raises, Discord still shows
+    # "thinking…" instead of "did not respond".
     await interaction.response.defer(ephemeral=True)
 
-    channel_id = resolve_channel_id(interaction)
-    if channel_id is None:
+    # Fix A — split binding lookup id from session lookup id (#197).
+    #   binding_id: parent_id in a thread → correct for project binding
+    #               (a thread inherits its parent's bound state).
+    #   session_id: thread_id in a thread → correct for session lookup
+    #               (session_manager is keyed by thread id, not parent id).
+    # In a bare channel both are channel_id, so behavior unchanged.
+    binding_id = resolve_channel_id(interaction)
+    if binding_id is None:
         await interaction.followup.send(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
+    session_id = interaction.channel_id
 
-    cwd, is_bound = bot.project_manager.get_path_or_default(channel_id)
+    cwd, is_bound = bot.project_manager.get_path_or_default(binding_id)
 
     info: dict | None = None
     info_err: Exception | None = None
+    timed_out: bool = False
 
     # Path A: piggyback the live bridge if there is one.
-    bridge = bot.session_manager.get_session(channel_id)
+    bridge = (
+        bot.session_manager.get_session(session_id)
+        if session_id is not None
+        else None
+    )
     try:
         if bridge is not None:
             info = await bridge.get_server_info()
@@ -148,14 +170,35 @@ async def skill_list(interaction: discord.Interaction) -> None:
     if info is None:
         setting_sources = ["user", "project", "local"] if is_bound else ["user"]
         try:
-            async with ClaudeSDKClient(
-                options=ClaudeAgentOptions(
-                    cwd=str(cwd), setting_sources=setting_sources
-                )
-            ) as tmp:
-                info = await tmp.get_server_info()
-        except Exception as exc:  # noqa: BLE001 — any failure → friendly red embed
+            # Fix B — cap subprocess spawn + query at 10s (#197). The
+            # cold-start can hang when the parent turn is hammering the
+            # host; without this guard Discord's interaction window lapses.
+            async with asyncio.timeout(_PATH_B_TIMEOUT_S):
+                async with ClaudeSDKClient(
+                    options=ClaudeAgentOptions(
+                        cwd=str(cwd), setting_sources=setting_sources
+                    )
+                ) as tmp:
+                    info = await tmp.get_server_info()
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("/skill list Path B timed out after %ss", _PATH_B_TIMEOUT_S)
+            timed_out = True
+        except Exception as exc:  # noqa: BLE001 — any other failure → friendly red embed
             info_err = exc
+
+    if timed_out:
+        embed = discord.Embed(
+            title="⚠️ Skill list unavailable",
+            description=(
+                "Couldn't query the skill list in time "
+                f"({_PATH_B_TIMEOUT_S}s timeout). "
+                "This usually happens when the bot is processing a large turn. "
+                "Try again once the active turn completes."
+            ),
+            color=COLOR_TOOL_FAILURE,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
 
     if info_err is not None or info is None:
         if info_err is None:

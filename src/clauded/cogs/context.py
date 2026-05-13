@@ -35,6 +35,7 @@ are out of scope for v1; they'd bloat the embed. v1.19 can add
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
@@ -51,6 +52,12 @@ from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ._unbound import NO_CHANNEL_MESSAGE, resolve_channel_id
 
 log = logging.getLogger("clauded.bot")
+
+# Defensive cap on Path B subprocess spawn + query. The cold-start of a
+# transient ClaudeSDKClient can hang when the parent turn is hammering
+# the host (heavy CPU/IO). Past this budget, surface a friendly error
+# rather than letting Discord's interaction time out.
+_PATH_B_TIMEOUT_S = 10
 
 
 _PROGRESS_BAR_WIDTH = 20
@@ -151,17 +158,29 @@ async def context_cmd(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("❌ Bot not ready.", ephemeral=True)
         return
 
-    channel_id = resolve_channel_id(interaction)
-    if channel_id is None:
-        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
-        return
-
-    # Defer immediately — Path B can take 2-4 s for cold CLI startup, and
-    # Discord's 3s response deadline would otherwise time out.
+    # Fix C — defer BEFORE any potentially slow operation (incl. id resolution,
+    # binding/session lookups). If anything between here and the followup
+    # raises, Discord still shows "thinking…" instead of "did not respond".
     await interaction.response.defer(ephemeral=True)
 
+    # Fix A — split the two id meanings:
+    #   binding_id: parent_id when in a thread → correct for project binding
+    #               lookup (a thread inherits its parent's bound state).
+    #   session_id: thread_id when in a thread → correct for session lookup
+    #               (session_manager is keyed by thread id, not parent id).
+    # In a bare channel both are channel_id, so behavior is unchanged.
+    binding_id = resolve_channel_id(interaction)
+    if binding_id is None:
+        await interaction.followup.send(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    session_id = interaction.channel_id
+
     # Path A: active bridge piggyback (cheap, ~tens of ms).
-    bridge = bot.session_manager.get_session(channel_id)
+    bridge = (
+        bot.session_manager.get_session(session_id)
+        if session_id is not None
+        else None
+    )
     usage = None
     source_label = "active session"
     if bridge is not None:
@@ -174,13 +193,33 @@ async def context_cmd(interaction: discord.Interaction) -> None:
     # Path B: temp client fallback (mirrors /skill list pattern).
     if usage is None:
         source_label = "fresh session (model baseline)"
-        cwd, is_bound = bot.project_manager.get_path_or_default(channel_id)
+        cwd, is_bound = bot.project_manager.get_path_or_default(binding_id)
         setting_sources = ["user", "project", "local"] if is_bound else ["user"]
         try:
-            async with ClaudeSDKClient(
-                ClaudeAgentOptions(cwd=str(cwd), setting_sources=setting_sources)
-            ) as tmp:
-                usage = await tmp.get_context_usage()
+            # Fix B — cap subprocess spawn + query at 10s. The cold-start
+            # can hang when the parent turn is hammering the host. Without
+            # this guard, Discord's interaction window would lapse.
+            async with asyncio.timeout(_PATH_B_TIMEOUT_S):
+                async with ClaudeSDKClient(
+                    ClaudeAgentOptions(cwd=str(cwd), setting_sources=setting_sources)
+                ) as tmp:
+                    usage = await tmp.get_context_usage()
+        except (asyncio.TimeoutError, TimeoutError):
+            log.warning("/context Path B timed out after %ss", _PATH_B_TIMEOUT_S)
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="⚠️ Context unavailable",
+                    description=(
+                        "Couldn't query context window in time "
+                        f"({_PATH_B_TIMEOUT_S}s timeout). "
+                        "This usually happens when the bot is processing a large turn. "
+                        "Try again once the active turn completes."
+                    ),
+                    color=COLOR_TOOL_FAILURE,
+                ),
+                ephemeral=True,
+            )
+            return
         except (CLINotFoundError, CLIConnectionError, Exception) as exc:  # noqa: BLE001
             log.warning("/context Path B failed", exc_info=True)
             await interaction.followup.send(
