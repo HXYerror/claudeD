@@ -415,3 +415,113 @@ def test_model_source_unset_when_all_none() -> None:
 
     bridge = _bridge_for_case(override=None, env_model=None, sdk_model=None)
     assert _model_source_for_bridge(bridge) == ("unset", None)
+
+
+# ---------------------------------------------------------------------------
+# R1 architect finding: persistence-loop fix
+# ---------------------------------------------------------------------------
+#
+# Before this PR, ``save_session_state`` read ``bridge.model`` (collapsed
+# property) which falls back to ``_sdk_model`` after the first
+# ResultMessage. The persisted value then re-injected as ``model_override``
+# on resume, forming a cross-restart loop and ignoring the user's
+# ``~/.claude/settings.json`` updates. PRD §Design line 92 explicitly
+# warned against feeding ``_sdk_model`` back into the SDK input — this
+# test pins the persistence boundary against that regression.
+
+
+def test_explicit_model_override_returns_user_choice_only():
+    """``ClaudeBridge.explicit_model_override`` reflects ONLY
+    ``_model_override`` — never ``_sdk_model`` or ``config.claude_model``.
+    """
+    from unittest.mock import MagicMock
+    from clauded.claude_bridge import ClaudeBridge
+
+    cfg = MagicMock()
+    cfg.claude_model = "sonnet"  # env-set scenario
+    cfg.claude_permission_mode = "default"
+    cfg.projects_root = "/tmp"
+
+    bridge = ClaudeBridge(project_path="/tmp", config=cfg)
+
+    # No explicit override yet → None
+    assert bridge.explicit_model_override is None
+    # _sdk_model populated post-ResultMessage → still None
+    bridge._sdk_model = "claude-haiku-4-5"
+    assert bridge.explicit_model_override is None
+    # User switches → reflects the user value
+    bridge._model_override = "opus"
+    assert bridge.explicit_model_override == "opus"
+
+
+def test_save_session_state_persists_only_explicit_override_no_sdk_loop():
+    """Pin the persistence-loop fix: ``save_session_state`` writes the
+    user-explicit override (or None when unset), never the SDK-observed
+    ``_sdk_model``. Without this fix, a user with no env / no /model
+    switch would get their CLI default locked in on resume even after
+    changing ``settings.json``.
+    """
+    from unittest.mock import MagicMock
+    from clauded.session_manager import SessionManager
+
+    # Build a bridge stub with the canonical "user did not switch" state:
+    # - _model_override is None
+    # - _sdk_model is what the SDK reported back (CLI default)
+    bridge = MagicMock()
+    bridge.session_id = "sess-abc"
+    bridge.project_path = "/tmp/proj"
+    bridge.system_prompt = ""
+    bridge._model_override = None
+    bridge._sdk_model = "claude-haiku-4-5"
+    bridge.explicit_model_override = None  # the new accessor
+
+    sm = SessionManager(MagicMock())
+    sm._sessions[42] = bridge
+
+    # Capture what gets passed to the store
+    captured: dict = {}
+
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+        captured.update(
+            thread_id=thread_id, session_id=session_id, project_path=project_path,
+            model=model, system_prompt=system_prompt,
+        )
+
+    sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
+    sm.save_session_state(42)
+
+    # The persisted model MUST be the explicit override (None), NOT the
+    # SDK-observed value. Without this, future resumes lock to
+    # "claude-haiku-4-5" even when user changes settings.json.
+    assert captured["model"] is None, (
+        f"save_session_state must persist user-explicit override only, "
+        f"not _sdk_model. Got: {captured['model']!r} (expected None for "
+        f"the no-override case). This is the architect-flagged "
+        f"persistence-loop bug from #198 R1 review."
+    )
+
+
+def test_save_session_state_persists_user_override_when_set():
+    """Positive case: when user has switched to 'opus', persistence
+    correctly carries that across restart."""
+    from unittest.mock import MagicMock
+    from clauded.session_manager import SessionManager
+
+    bridge = MagicMock()
+    bridge.session_id = "sess-xyz"
+    bridge.project_path = "/tmp/proj"
+    bridge.system_prompt = ""
+    bridge.explicit_model_override = "opus"
+
+    sm = SessionManager(MagicMock())
+    sm._sessions[99] = bridge
+
+    captured: dict = {}
+
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+        captured["model"] = model
+
+    sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
+    sm.save_session_state(99)
+
+    assert captured["model"] == "opus"

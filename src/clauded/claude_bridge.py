@@ -165,6 +165,20 @@ class ClaudeBridge:
         )
 
     @property
+    def explicit_model_override(self) -> str | None:
+        """The user-explicit ``/model switch <name>`` value, or ``None``.
+
+        Public read-only accessor for ``_model_override`` so consumers that
+        need to persist *only* the user's explicit choice (e.g.,
+        :class:`SessionManager.save_session_state`) can avoid the
+        collapsed :attr:`model` property, which would write back the
+        SDK-observed ``_sdk_model`` and form a cross-restart input loop
+        (#198 PRD §Design line 92). Returns ``None`` when the user has
+        not switched and the SDK's CLI-default should govern.
+        """
+        return self._model_override
+
+    @property
     def is_active(self) -> bool:
         """True iff the underlying client is currently connected."""
         return self._active
