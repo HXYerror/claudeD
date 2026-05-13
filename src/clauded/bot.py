@@ -14,7 +14,6 @@ import tempfile
 import time
 import sys
 import asyncio
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import discord
@@ -38,6 +37,12 @@ from ._http_retry import (
     safe_remove_reaction,
     safe_add_reaction,
 )
+from ._logging_setup import (
+    _LOG_DIR,
+    _CACHE_DIR,
+    _ensure_runtime_dirs,
+    _configure_logging,
+)
 
 # Re-export SystemPromptModal so existing ``from clauded.bot import
 # SystemPromptModal`` continues to work (tests rely on this).
@@ -57,27 +62,10 @@ _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 # repo for the matching string in those files.
 # --------------------------------------------------------------------------
 _LAUNCHD_LABEL = "com.hxy.clauded"
-_LOG_DIR = Path.home() / "Library" / "Logs" / "clauded"
-_CACHE_DIR = Path.home() / "Library" / "Caches" / "clauded"
+# _LOG_DIR and _CACHE_DIR live in _logging_setup.py (v1.18 stage-28 trim);
+# imported above. _HEARTBEAT_PATH stays here because it belongs to the
+# heartbeat task, not to logging setup.
 _HEARTBEAT_PATH = _CACHE_DIR / "heartbeat"
-
-
-def _ensure_runtime_dirs() -> None:
-    """Create ``_LOG_DIR`` and ``_CACHE_DIR`` once at process start.
-
-    Replaces the per-tick ``parent.mkdir`` calls in ``_touch_heartbeat`` and
-    ``_configure_logging`` so a 30 s heartbeat loop and a 1-call logging-setup
-    don't each redo the dir checks (PR #149 R2 engineer suggestion). Swallows
-    ``OSError`` so a read-only or sandboxed home doesn't crash startup; the
-    individual write call sites handle the consequence.
-    """
-    if sys.platform != "darwin":
-        return
-    for d in (_LOG_DIR, _CACHE_DIR):
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
 
 
 def _touch_heartbeat() -> None:
@@ -1065,44 +1053,6 @@ class ClaudedBot(commands.Bot):
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
-
-def _configure_logging() -> None:
-    """Set up app logging — RotatingFileHandler in production, stderr-only in tests.
-
-    Detects pytest via ``PYTEST_CURRENT_TEST`` so test runs don't pollute
-    ``~/Library/Logs/clauded/``. In production on macOS, attaches a 10 MB × 7
-    rotating file handler plus a stderr handler so launchd's
-    ``StandardErrorPath`` still captures boot diagnostics. On non-Darwin
-    (Linux/Windows dev boxes) and on ``OSError`` (e.g. read-only ``$HOME``)
-    falls back to ``basicConfig`` to stderr — same path as pytest — to avoid
-    silently creating macOS-shaped junk directories outside macOS.
-    """
-    fmt = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        logging.basicConfig(level=logging.INFO, format=fmt)
-        return
-    if sys.platform != "darwin":
-        logging.basicConfig(level=logging.INFO, format=fmt)
-        return
-    # _LOG_DIR was created at startup by _ensure_runtime_dirs(); if it's still
-    # absent (e.g. read-only home, sandboxed test runner) fall back to stderr.
-    if not _LOG_DIR.exists():
-        logging.basicConfig(level=logging.INFO, format=fmt)
-        return
-    handler = RotatingFileHandler(
-        _LOG_DIR / "clauded.log",
-        maxBytes=10 * 1024 * 1024,
-        backupCount=7,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter(fmt))
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(logging.Formatter(fmt))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
-    root.addHandler(stderr_handler)
-
 
 def main() -> None:
     """Console-script entry point: load config and run the bot."""
