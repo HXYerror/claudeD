@@ -114,3 +114,4 @@ def test_setup_hook_source_has_no_global_tree_sync():
             f"GLOBALLY, which is what caused #185 (every command appeared "
             f"twice in autocomplete). Per-guild sync from on_ready instead."
         )
+

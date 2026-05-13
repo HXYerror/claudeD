@@ -151,7 +151,6 @@ async def skill_list(interaction: discord.Interaction) -> None:
 
     info: dict | None = None
     info_err: Exception | None = None
-    timed_out: bool = False
 
     # Path A: piggyback the live bridge if there is one.
     bridge = (
@@ -181,24 +180,23 @@ async def skill_list(interaction: discord.Interaction) -> None:
                 ) as tmp:
                     info = await tmp.get_server_info()
         except (asyncio.TimeoutError, TimeoutError):
+            # Mirror /context Path B: emit the timeout embed inline and
+            # return, instead of routing through a `timed_out` flag.
             log.warning("/skill list Path B timed out after %ss", _PATH_B_TIMEOUT_S)
-            timed_out = True
+            embed = discord.Embed(
+                title="⚠️ Skill list unavailable",
+                description=(
+                    "Couldn't query the skill list in time "
+                    f"({_PATH_B_TIMEOUT_S}s timeout). "
+                    "This usually happens when the bot is processing a large turn. "
+                    "Try again once the active turn completes."
+                ),
+                color=COLOR_TOOL_FAILURE,
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
         except Exception as exc:  # noqa: BLE001 — any other failure → friendly red embed
             info_err = exc
-
-    if timed_out:
-        embed = discord.Embed(
-            title="⚠️ Skill list unavailable",
-            description=(
-                "Couldn't query the skill list in time "
-                f"({_PATH_B_TIMEOUT_S}s timeout). "
-                "This usually happens when the bot is processing a large turn. "
-                "Try again once the active turn completes."
-            ),
-            color=COLOR_TOOL_FAILURE,
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
 
     if info_err is not None or info is None:
         if info_err is None:
