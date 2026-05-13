@@ -253,6 +253,99 @@ def _format_context_segment(stats: dict[str, Any] | None) -> str | None:
     return f" │ {emoji} {int(pct_f)}%"
 
 
+# ---------------------------------------------------------------------------
+# #192 Fix A: normalize SDK ToolResultBlock.content shapes to plain text.
+# ---------------------------------------------------------------------------
+# Claude SDK 0.1.80 returns ``ToolResultBlock.content`` in 3 shapes depending
+# on the tool:
+#   - ``str``                            — most Bash/Read/Grep results
+#   - ``list[dict]`` with TextBlock dicts — Task/Agent tool family, async
+#     sub-agents, multi-modal results: ``[{"type": "text", "text": "..."}]``
+#   - ``dict``                            — rare; some structured responses
+#
+# Before #192, the renderer did ``str(block.content)``, which produced the
+# Python repr (``[{'type': 'text', 'text': '...'}]``) on shape #2 — user saw
+# raw brackets + quotes + ``\n`` literals. Prod-impact concentrated on the
+# Subtask Complete embed (#161 D.1 latent bug, escalated to P0 via #192).
+
+# Pre-compiled patterns for CLI-internal meta-instructions that leak into
+# user-facing text. Claude CLI scaffolds async-agent / Task tool results
+# with hints intended for the LLM's reasoning ("do not mention to user"),
+# never for display. Strip best-effort; the pattern list is extensible.
+_INTERNAL_META_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # ``(internal ID - do not mention to user. Use SendMessage with to:
+    # 'xxx' to continue this agent.)`` — wrapped in parens
+    re.compile(r"\((?:internal ID|internal id) - do not mention to user[^)]*\)", re.IGNORECASE),
+    # Standalone ``do not mention ... to user ...`` sentence (no paren
+    # wrapping). Bounded by sentence end so we don't eat following content.
+    re.compile(r"\bdo not mention[^.]*?to user[^.]*?\.", re.IGNORECASE),
+)
+
+
+def _extract_block_content_text(content: Any) -> str:
+    """Normalize a ``ToolResultBlock.content`` payload to a plain text string.
+
+    Handles SDK's documented shapes (#192 Fix A):
+    - ``None``                                 → ``""`` (no-op)
+    - ``str``                                  → the string itself
+    - ``list[dict]`` with ``{"type":"text","text":"..."}``  → join ``text``s
+    - ``list[str]``                            → join with ``"\\n"``
+    - ``list[mixed]``                          → best-effort element repr
+    - ``dict`` with ``"text"`` key             → return that
+    - anything else                            → ``str(content)`` fallback
+
+    No exception escapes; the worst-case fallback (``str``) preserves the
+    pre-#192 behavior for unrecognized shapes.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if "text" in item:
+                    parts.append(str(item["text"]))
+                else:
+                    parts.append(str(item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(content, dict) and "text" in content:
+        return str(content["text"])
+    return str(content)
+
+
+def _strip_internal_metadata(text: str) -> str:
+    """Remove known CLI-internal meta-instruction phrases from user-facing
+    text (#192 Fix B). Best-effort — pattern list lives at module scope
+    (``_INTERNAL_META_PATTERNS``) for easy extension as new CLI quirks
+    surface. Idempotent on already-clean text.
+    """
+    if not text:
+        return text
+    for pat in _INTERNAL_META_PATTERNS:
+        text = pat.sub("", text)
+    # Collapse any double-space artifacts left behind
+    text = re.sub(r"  +", " ", text)
+    return text.strip()
+
+
+def _is_async_agent_dispatch(text: str) -> bool:
+    """Detect async-agent launch acknowledgments (#192 Fix C).
+
+    Claude CLI's async-agent tool emits a ``Async agent launched
+    successfully.`` text payload as a tool RESULT (not a completion).
+    The actual sub-agent work continues in the background. Marking this
+    as "✅ Subtask Complete" was misleading; the renderer instead shows
+    "🚀 Sub-agent dispatched" so users know the work is still running.
+    """
+    if not text:
+        return False
+    return "async agent launched" in text.lower()
+
+
 def _extract_subagent_stats(input_value: Any) -> dict[str, Any] | None:
     """Extract stats from a sub-agent ``UserMessage.tool_use_result`` payload.
 
@@ -1122,14 +1215,35 @@ class DiscordRenderer:
                                     )
                                     sub_footer = _format_subagent_footer(sub_stats)
 
-                                    # Completion embed in sub-thread
-                                    description = str(block.content)[:300] if block.content else "Done"
+                                    # #192 Fix A: extract list-of-dict
+                                    # content to plain text (was leaking
+                                    # Python repr). Fix B: strip CLI's
+                                    # "do not mention to user" meta
+                                    # instructions. Fix C: detect async-
+                                    # agent dispatch and label it as such
+                                    # rather than "Complete".
+                                    raw_text = _extract_block_content_text(block.content)
+                                    cleaned = _strip_internal_metadata(raw_text)
+                                    is_dispatch = (
+                                        not is_err
+                                        and _is_async_agent_dispatch(cleaned)
+                                    )
+                                    description = (cleaned[:300] if cleaned else "Done")
                                     if sub_footer:
                                         description = f"{description}\n\n{sub_footer}"
+                                    if is_dispatch:
+                                        embed_title = "🚀 Sub-agent dispatched (running in background)"
+                                        embed_color = COLOR_INFO
+                                    elif is_err:
+                                        embed_title = "❌ Subtask Failed"
+                                        embed_color = COLOR_TOOL_FAILURE
+                                    else:
+                                        embed_title = "✅ Subtask Complete"
+                                        embed_color = COLOR_TOOL_SUCCESS
                                     done = discord.Embed(
-                                        title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                        title=embed_title,
                                         description=description,
-                                        color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                        color=embed_color,
                                     )
                                     await subagent_renderers[tool_id]._safe_send(embed=done)
 
@@ -1139,10 +1253,13 @@ class DiscordRenderer:
                                     # so users browsing the main thread aren't
                                     # double-shown the cost data.
                                     if tool_id in tool_msgs:
+                                        # Mirror the title computed above
+                                        # so main-thread summary matches
+                                        # the sub-thread completion state.
                                         summary = discord.Embed(
-                                            title="✅ Subtask Complete" if not is_err else "❌ Subtask Failed",
+                                            title=embed_title,
                                             description=f"📎 {sub_thread.mention}",
-                                            color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                            color=embed_color,
                                         )
                                         await self._safe_edit(tool_msgs[tool_id], embed=summary)
                                 elif tool_id in tool_msgs:
@@ -1155,13 +1272,29 @@ class DiscordRenderer:
                                         tool_use_results.get(tool_id)
                                     )
                                     sub_footer = _format_subagent_footer(sub_stats)
-                                    description = str(block.content)[:300] if block.content else "Done"
+                                    # #192 Fix A/B/C applied here too.
+                                    raw_text = _extract_block_content_text(block.content)
+                                    cleaned = _strip_internal_metadata(raw_text)
+                                    is_dispatch = (
+                                        not is_err
+                                        and _is_async_agent_dispatch(cleaned)
+                                    )
+                                    description = (cleaned[:300] if cleaned else "Done")
                                     if sub_footer:
                                         description = f"{description}\n\n{sub_footer}"
+                                    if is_dispatch:
+                                        embed_title = "🚀 Sub-agent dispatched (running in background)"
+                                        embed_color = COLOR_INFO
+                                    elif is_err:
+                                        embed_title = "❌ Subtask Failed"
+                                        embed_color = COLOR_TOOL_FAILURE
+                                    else:
+                                        embed_title = "✅ Subtask Complete"
+                                        embed_color = COLOR_TOOL_SUCCESS
                                     done_embed = discord.Embed(
-                                        title=f"{'✅' if not is_err else '❌'} Subtask Complete",
+                                        title=embed_title,
                                         description=description,
-                                        color=COLOR_TOOL_SUCCESS if not is_err else COLOR_TOOL_FAILURE,
+                                        color=embed_color,
                                     )
                                     await self._safe_edit(tool_msgs[tool_id], embed=done_embed)
                                 continue
@@ -1219,7 +1352,7 @@ class DiscordRenderer:
                                     # collapse to ``line1 │ line2 │ line3``
                                     # so they fit in the rolling-log embed
                                     # without ballooning vertical height.
-                                    content_str = str(block.content) if block.content else ""
+                                    content_str = _extract_block_content_text(block.content)
                                     is_short = (
                                         len(content_str) < 200
                                         and content_str.strip() != ""
@@ -1398,7 +1531,7 @@ class DiscordRenderer:
                                         title=f"❌ {name}",
                                         color=COLOR_TOOL_FAILURE,
                                     )
-                                    error_text = str(block.content)[:500] if block.content else "Failed"
+                                    error_text = _extract_block_content_text(block.content)[:500] or "Failed"
                                     result_embed.description = f"```\n{error_text}\n```"
                                 else:
                                     result_embed = discord.Embed(
