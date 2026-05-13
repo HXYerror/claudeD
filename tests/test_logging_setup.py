@@ -39,6 +39,10 @@ def test_configure_logging_without_pytest_env_attaches_rotating_handler(
 
     v1.18: _configure_logging no longer mkdirs; _ensure_runtime_dirs owns that.
     The test must pre-create the dir to match the new contract.
+
+    v1.18 stage-28: _LOG_DIR + _configure_logging now live in
+    ``clauded._logging_setup``; monkeypatch the source module so the
+    function reads our temp path.
     """
     _reset_root_logger()
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
@@ -47,9 +51,9 @@ def test_configure_logging_without_pytest_env_attaches_rotating_handler(
     # directly rather than Path.home (which only affects new resolutions).
     log_dir = tmp_path / "Library" / "Logs" / "clauded"
     log_dir.mkdir(parents=True)  # contract: _ensure_runtime_dirs would do this at startup
-    from clauded import bot as bot_mod
-    monkeypatch.setattr(bot_mod, "_LOG_DIR", log_dir)
-    bot_mod._configure_logging()
+    from clauded import _logging_setup as logging_mod
+    monkeypatch.setattr(logging_mod, "_LOG_DIR", log_dir)
+    logging_mod._configure_logging()
     root = logging.getLogger()
     rotating = [h for h in root.handlers if isinstance(h, RotatingFileHandler)]
     assert len(rotating) == 1, "production mode should add RotatingFileHandler"
@@ -67,15 +71,18 @@ def test_configure_logging_fallback_on_oserror(
     and falls back to basicConfig when absent. Previously this branch was
     tested by raising OSError on mkdir; now it's tested by simply pointing
     at a path that doesn't exist.
+
+    v1.18 stage-28: monkeypatch ``_logging_setup._LOG_DIR`` (the source
+    of truth post-extraction).
     """
     _reset_root_logger()
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setattr(sys, "platform", "darwin")
-    from clauded import bot as bot_mod
+    from clauded import _logging_setup as logging_mod
     # Path doesn't exist; _ensure_runtime_dirs() not called. _configure_logging
     # must fall back to basicConfig instead of crashing.
-    monkeypatch.setattr(bot_mod, "_LOG_DIR", tmp_path / "nonexistent")
-    bot_mod._configure_logging()  # should not raise
+    monkeypatch.setattr(logging_mod, "_LOG_DIR", tmp_path / "nonexistent")
+    logging_mod._configure_logging()  # should not raise
     root = logging.getLogger()
     rotating = [h for h in root.handlers if isinstance(h, RotatingFileHandler)]
     assert len(rotating) == 0, "missing _LOG_DIR should NOT attach RotatingFileHandler"
@@ -142,13 +149,18 @@ def test_ensure_runtime_dirs_creates_both_on_darwin(
 ) -> None:
     """`_ensure_runtime_dirs` creates `_LOG_DIR` AND `_CACHE_DIR` once at startup
     so subsequent `_touch_heartbeat` and `_configure_logging` calls don't redo
-    the mkdir per tick (engineer R2 mkdir-on-every-tick nit)."""
+    the mkdir per tick (engineer R2 mkdir-on-every-tick nit).
+
+    v1.18 stage-28: function + dirs moved to ``_logging_setup``; the
+    bot ``_HEARTBEAT_PATH`` binding still lives in ``bot.py``.
+    """
     from clauded import bot as bot_mod
-    monkeypatch.setattr(bot_mod, "_LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(bot_mod, "_CACHE_DIR", tmp_path / "caches")
+    from clauded import _logging_setup as logging_mod
+    monkeypatch.setattr(logging_mod, "_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(logging_mod, "_CACHE_DIR", tmp_path / "caches")
     monkeypatch.setattr(bot_mod, "_HEARTBEAT_PATH", tmp_path / "caches" / "heartbeat")
-    monkeypatch.setattr(bot_mod.sys, "platform", "darwin")
-    bot_mod._ensure_runtime_dirs()
+    monkeypatch.setattr(logging_mod.sys, "platform", "darwin")
+    logging_mod._ensure_runtime_dirs()
     assert (tmp_path / "logs").is_dir()
     assert (tmp_path / "caches").is_dir()
 
@@ -157,11 +169,11 @@ def test_ensure_runtime_dirs_noop_on_non_darwin(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Linux/Windows dev box → no `~/Library/` pollution."""
-    from clauded import bot as bot_mod
-    monkeypatch.setattr(bot_mod, "_LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(bot_mod, "_CACHE_DIR", tmp_path / "caches")
-    monkeypatch.setattr(bot_mod.sys, "platform", "linux")
-    bot_mod._ensure_runtime_dirs()
+    from clauded import _logging_setup as logging_mod
+    monkeypatch.setattr(logging_mod, "_LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(logging_mod, "_CACHE_DIR", tmp_path / "caches")
+    monkeypatch.setattr(logging_mod.sys, "platform", "linux")
+    logging_mod._ensure_runtime_dirs()
     assert not (tmp_path / "logs").exists()
     assert not (tmp_path / "caches").exists()
 
@@ -174,7 +186,9 @@ def test_touch_heartbeat_no_longer_creates_parent(
     If the cache dir doesn't exist, _touch_heartbeat silently no-ops via OSError."""
     from clauded import bot as bot_mod
     cache_dir = tmp_path / "caches"  # deliberately NOT created
-    monkeypatch.setattr(bot_mod, "_CACHE_DIR", cache_dir)
+    # NOTE: only `_HEARTBEAT_PATH` is read by `_touch_heartbeat`. After
+    # the stage-28 trim moved `_CACHE_DIR` to `_logging_setup`, patching
+    # `bot._CACHE_DIR` had no effect here — dropped per R1 engineer.
     monkeypatch.setattr(bot_mod, "_HEARTBEAT_PATH", cache_dir / "heartbeat")
     monkeypatch.setattr(bot_mod.sys, "platform", "darwin")
     bot_mod._touch_heartbeat()

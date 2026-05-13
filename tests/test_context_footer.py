@@ -2,9 +2,10 @@
 import pytest
 import sys
 sys.path.insert(0, "src")
-from unittest.mock import MagicMock, AsyncMock
 
 from clauded.discord_renderer import _format_context_segment
+
+from tests.conftest import FakeBridge, FakeTarget  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -79,40 +80,6 @@ async def test_footer_includes_context_segment_e2e():
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
     from clauded.discord_renderer import DiscordRenderer
 
-    class FakeBridge:
-        def __init__(self, events, ctx):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-            self._ctx = ctx
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-        async def get_context_usage(self):
-            return self._ctx
-
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-        async def send(self, *args, **kwargs):
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            self._sent.append(msg)
-            return msg
-
     events = [
         AssistantMessage(
             content=[TextBlock(text="response text")],
@@ -136,7 +103,7 @@ async def test_footer_includes_context_segment_e2e():
         "rawMaxTokens": 200000,
         "model": "claude-sonnet-4-5",
     }
-    bridge = FakeBridge(events, ctx_response)
+    bridge = FakeBridge(events, get_context_usage_returns=ctx_response)
     await renderer.render_response(bridge, "hello")
 
     # Collect all message content
@@ -154,39 +121,6 @@ async def test_footer_omits_context_segment_on_get_context_usage_failure():
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
     from clauded.discord_renderer import DiscordRenderer
 
-    class FailingBridge:
-        is_active = True
-        _client = MagicMock()
-        def __init__(self, events):
-            self._events = events
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-        async def get_context_usage(self):
-            raise RuntimeError("synthetic CLI failure")
-
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        id = 1
-        def __init__(self):
-            self._sent = []
-        async def send(self, *args, **kwargs):
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            self._sent.append(msg)
-            return msg
-
     events = [
         AssistantMessage(
             content=[TextBlock(text="result")],
@@ -201,7 +135,9 @@ async def test_footer_omits_context_segment_on_get_context_usage_failure():
     ]
     target = FakeTarget()
     renderer = DiscordRenderer(target)
-    bridge = FailingBridge(events)
+    bridge = FakeBridge(
+        events, get_context_usage_raises=RuntimeError("synthetic CLI failure")
+    )
     # MUST NOT raise
     await renderer.render_response(bridge, "hello")
     all_content = " ".join(m.content for m in target._sent if m.content)
@@ -223,39 +159,6 @@ async def test_footer_omits_context_when_get_context_usage_returns_none():
     from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
     from clauded.discord_renderer import DiscordRenderer
 
-    class NoneBridge:
-        is_active = True
-        _client = MagicMock()
-        def __init__(self, events):
-            self._events = events
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-        async def get_context_usage(self):
-            return None
-
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        id = 1
-        def __init__(self):
-            self._sent = []
-        async def send(self, *args, **kwargs):
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            self._sent.append(msg)
-            return msg
-
     events = [
         AssistantMessage(
             content=[TextBlock(text="result")],
@@ -270,7 +173,8 @@ async def test_footer_omits_context_when_get_context_usage_returns_none():
     ]
     target = FakeTarget()
     renderer = DiscordRenderer(target)
-    bridge = NoneBridge(events)
+    # Default: get_context_usage_returns=None (matches the old NoneBridge)
+    bridge = FakeBridge(events)
     await renderer.render_response(bridge, "hi")
     all_content = " ".join(m.content for m in target._sent if m.content)
     assert "🧠" not in all_content

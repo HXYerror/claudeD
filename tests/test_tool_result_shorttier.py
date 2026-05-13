@@ -14,6 +14,11 @@ from __future__ import annotations
 
 import pytest
 
+# v1.18 stage-28: pulled-in shared fakes. Five inline copies collapsed
+# into a single import. ``FailingAddViewBot`` stays inline (test-local
+# customization of bot.add_view).
+from tests.conftest import FakeBridge, FakeTarget
+
 
 def test_bonus_bug_websearch_pattern_match():
     """Regression pin: WebSearch's rolling-log line starts with '🔄 🔍 query'.
@@ -127,46 +132,10 @@ async def test_short_tier_integration_via_render_response():
     """
     import sys
     sys.path.insert(0, "src")
-    from unittest.mock import MagicMock, AsyncMock
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
     from clauded.discord_renderer import DiscordRenderer
-
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, text):
-            for ev in self._events:
-                yield ev
-
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-        async def send(self, *args, **kwargs):
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            self._sent.append(msg)
-            return msg
 
     events = [
         AssistantMessage(
@@ -301,51 +270,10 @@ async def test_medium_tier_integration_attaches_view_button():
     """
     import sys
     sys.path.insert(0, "src")
-    from unittest.mock import MagicMock
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
     from clauded.discord_renderer import DiscordRenderer, ToolResultsView
-
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-
-    class FakeMessage:
-        def __init__(self):
-            self.content = ""
-            self.embeds = []
-            self.attached_view = None
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                self.attached_view = kwargs["view"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-        async def send(self, *args, **kwargs):
-            msg = FakeMessage()
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                msg.attached_view = kwargs["view"]
-            self._sent.append(msg)
-            return msg
 
     medium_content = "\n".join(f"line {i}: some output text here" for i in range(30))
     assert 200 <= len(medium_content) < 8000
@@ -586,54 +514,10 @@ async def test_medium_tier_registers_view_via_bot_add_view():
     test pins that call so a regression can't drop it."""
     import sys
     sys.path.insert(0, "src")
-    from unittest.mock import MagicMock
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
     from clauded.discord_renderer import DiscordRenderer, ToolResultsView
-
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-
-    class FakeMessage:
-        def __init__(self, msg_id=12345):
-            self.id = msg_id
-            self.content = ""
-            self.embeds = []
-            self.attached_view = None
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                self.attached_view = kwargs["view"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-            self._next_id = 99000
-        async def send(self, *args, **kwargs):
-            self._next_id += 1
-            msg = FakeMessage(msg_id=self._next_id)
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                msg.attached_view = kwargs["view"]
-            self._sent.append(msg)
-            return msg
 
     class FakeBot:
         """Captures add_view calls."""
@@ -688,54 +572,10 @@ async def test_medium_tier_downgrades_log_when_add_view_raises():
     button."""
     import sys
     sys.path.insert(0, "src")
-    from unittest.mock import MagicMock
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
     from clauded.discord_renderer import DiscordRenderer
-
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-
-    class FakeMessage:
-        def __init__(self, msg_id=999):
-            self.id = msg_id
-            self.content = ""
-            self.embeds = []
-            self.attached_view = None
-        async def edit(self, **kwargs):
-            if "content" in kwargs:
-                self.content = kwargs["content"]
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                self.attached_view = kwargs["view"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-            self._next_id = 90000
-        async def send(self, *args, **kwargs):
-            self._next_id += 1
-            msg = FakeMessage(msg_id=self._next_id)
-            if "content" in kwargs:
-                msg.content = kwargs["content"]
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                msg.attached_view = kwargs["view"]
-            self._sent.append(msg)
-            return msg
 
     class FailingAddViewBot:
         def add_view(self, view, *, message_id=None):
@@ -787,50 +627,10 @@ async def test_medium_tier_log_line_index_matches_button_index():
     guess which #N corresponds to which line."""
     import sys
     sys.path.insert(0, "src")
-    from unittest.mock import MagicMock
     from claude_agent_sdk.types import (
         AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
     )
     from clauded.discord_renderer import DiscordRenderer, ToolResultsView
-
-    class FakeBridge:
-        def __init__(self, events):
-            self._events = events
-            self.is_active = True
-            self._client = MagicMock()
-        async def send_message(self, _text):
-            for ev in self._events:
-                yield ev
-
-    class FakeMessage:
-        def __init__(self, msg_id=999):
-            self.id = msg_id
-            self.content = ""
-            self.embeds = []
-            self.attached_view = None
-        async def edit(self, **kwargs):
-            if "embed" in kwargs:
-                self.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                self.attached_view = kwargs["view"]
-            return self
-        async def delete(self):
-            return None
-
-    class FakeTarget:
-        def __init__(self):
-            self.id = 1
-            self._sent = []
-            self._next_id = 90000
-        async def send(self, *args, **kwargs):
-            self._next_id += 1
-            msg = FakeMessage(msg_id=self._next_id)
-            if "embed" in kwargs:
-                msg.embeds = [kwargs["embed"]]
-            if "view" in kwargs:
-                msg.attached_view = kwargs["view"]
-            self._sent.append(msg)
-            return msg
 
     # 3 medium-tier tool calls: Bash, Read, Bash
     medium_content_a = "\n".join(f"a{i}: data data data" for i in range(30))

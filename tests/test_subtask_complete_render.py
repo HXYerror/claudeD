@@ -6,7 +6,30 @@ Fixes:
 - C: _is_async_agent_dispatch + new "🚀 Sub-agent dispatched" embed title
 """
 import pytest
-from unittest.mock import MagicMock
+
+# v1.18 stage-28: subclass the shared fakes (cheap base inheritance keeps
+# the dedup win while still letting us mutate _FakeMessage.create_thread
+# at the class level without touching tests/conftest.py for other files).
+# _FakeThread stays as a separate inline class — one-off shape (random id
+# + tracked _sent) used only by this file's create_thread monkey-patching.
+from tests.conftest import FakeBridge, FakeMessage, FakeTarget
+
+
+class _FakeMessage(FakeMessage):
+    """Test-local subclass so monkey-patching create_thread on _FakeMessage
+    (the prod-failure regression path) doesn't bleed into other tests
+    that import the shared FakeMessage. Default create_thread returns a
+    real _FakeThread (the original behavior before stage-28 trim)."""
+    async def create_thread(self, name, auto_archive_duration=None, **kwargs):
+        return _FakeThread(name=name)
+
+
+class _FakeTarget(FakeTarget):
+    """Override message factory to mint _FakeMessage (the create-thread-
+    aware subclass). Uses the conftest._make_message hook — no need to
+    duplicate the entire send() body."""
+    def _make_message(self, msg_id):
+        return _FakeMessage(msg_id=msg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -153,26 +176,14 @@ def test_dispatch_detection_rejects_unrelated_text():
 # ---------------------------------------------------------------------------
 
 
-class _FakeMessage:
-    def __init__(self, msg_id=1):
-        self.id = msg_id
-        self.content = ""
-        self.embeds = []
-    async def edit(self, **kwargs):
-        if "content" in kwargs:
-            self.content = kwargs["content"]
-        if "embed" in kwargs:
-            self.embeds = [kwargs["embed"]]
-        return self
-    async def delete(self):
-        return None
-    async def create_thread(self, name, auto_archive_duration=None, **kwargs):
-        # Return a fake thread that has the necessary fields
-        return _FakeThread(name=name)
-
-
 class _FakeThread:
-    """Minimal thread stub for the Task tool path."""
+    """Minimal thread stub for the Task tool path.
+
+    Kept inline (not in conftest) because it's only consumed here as the
+    return value of monkey-patched ``_FakeMessage.create_thread``. The
+    random-id + per-thread ``_sent`` shape is not used by any other test
+    file.
+    """
     def __init__(self, name):
         import random
         self.id = random.randint(10_000, 99_999)
@@ -188,36 +199,6 @@ class _FakeThread:
             msg.embeds = [kwargs["embed"]]
         self._sent.append(msg)
         return msg
-
-
-class _FakeTarget:
-    """Top-level channel/thread stub for Sub-agent dispatch path."""
-    def __init__(self):
-        self.id = 1
-        self.name = "main-thread"
-        self.mention = "<#1>"
-        self.parent = None
-        self._sent = []
-    async def send(self, *args, **kwargs):
-        msg = _FakeMessage(msg_id=len(self._sent) + 1)
-        if "content" in kwargs:
-            msg.content = kwargs["content"]
-        if "embed" in kwargs:
-            msg.embeds = [kwargs["embed"]]
-        self._sent.append(msg)
-        return msg
-
-
-class _FakeBridge:
-    is_active = True
-    _client = MagicMock()
-    def __init__(self, events):
-        self._events = events
-    async def send_message(self, _text):
-        for ev in self._events:
-            yield ev
-    async def get_context_usage(self):
-        return None
 
 
 @pytest.mark.asyncio
@@ -259,20 +240,10 @@ async def test_subtask_complete_renders_clean_text_from_list_of_dicts():
         ),
     ]
 
-    target = _FakeTarget()
-    renderer = DiscordRenderer(target)
-    await renderer.render_response(_FakeBridge(events), "run task")
-
-    # Embeds may have been sent to either the main target OR the sub-thread.
-    # Collect from both.
-    all_embeds = list(target._sent)
-    # Find the sub-thread (was created on _FakeMessage.create_thread)
-    # by walking through anchor messages
-    # Actually FakeMessage.create_thread returns FakeThread instances; collect their sent too.
-    # Simpler: also scan FakeThread instances via the renderer/subagent_renderers
-    # (those are not exposed). For this test, embeds we care about end up on the
-    # sub-thread via subagent_renderers[tool_id]._safe_send.
-    # Hack: monkey-patch FakeMessage.create_thread to record threads globally
+    # The first render builds embeds we never inspect; we re-run below
+    # with a monkey-patched create_thread so we can capture the spawned
+    # sub-threads (renderer doesn't expose subagent_renderers). Skip the
+    # first pass entirely (R1 simplicity flagged it as dead async work).
     threads_created: list[_FakeThread] = []
     orig_create = _FakeMessage.create_thread
     async def _record_create(self, name, **kw):
@@ -280,12 +251,11 @@ async def test_subtask_complete_renders_clean_text_from_list_of_dicts():
         threads_created.append(t)
         return t
 
-    # Re-run with patched create_thread
     _FakeMessage.create_thread = _record_create  # type: ignore[method-assign]
     try:
         target2 = _FakeTarget()
         renderer2 = DiscordRenderer(target2)
-        await renderer2.render_response(_FakeBridge(events), "run task")
+        await renderer2.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig_create  # type: ignore[method-assign]
 
@@ -365,7 +335,7 @@ async def test_subtask_complete_normal_path_still_works():
     try:
         target = _FakeTarget()
         renderer = DiscordRenderer(target)
-        await renderer.render_response(_FakeBridge(events), "run task")
+        await renderer.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig  # type: ignore[method-assign]
 
@@ -438,7 +408,7 @@ async def test_subtask_failed_with_list_of_dicts_renders_clean_error():
     try:
         target = _FakeTarget()
         renderer = DiscordRenderer(target)
-        await renderer.render_response(_FakeBridge(events), "run task")
+        await renderer.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig  # type: ignore[method-assign]
 

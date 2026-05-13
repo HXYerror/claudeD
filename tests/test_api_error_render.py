@@ -5,49 +5,12 @@ import pytest
 import sys
 sys.path.insert(0, "src")
 
-from unittest.mock import MagicMock
 from claude_agent_sdk.types import (
     AssistantMessage, TextBlock, ResultMessage,
 )
 from clauded.discord_renderer import DiscordRenderer
 
-
-class FakeBridge:
-    def __init__(self, events):
-        self._events = events
-        self.is_active = True
-        self._client = MagicMock()
-    async def send_message(self, _text):
-        for ev in self._events:
-            yield ev
-
-
-class FakeMessage:
-    def __init__(self):
-        self.content = ""
-        self.embeds = []
-    async def edit(self, **kwargs):
-        if "content" in kwargs:
-            self.content = kwargs["content"]
-        if "embed" in kwargs:
-            self.embeds = [kwargs["embed"]]
-        return self
-    async def delete(self):
-        return None
-
-
-class FakeTarget:
-    def __init__(self):
-        self.id = 1
-        self._sent = []
-    async def send(self, *args, **kwargs):
-        msg = FakeMessage()
-        if "content" in kwargs:
-            msg.content = kwargs["content"]
-        if "embed" in kwargs:
-            msg.embeds = [kwargs["embed"]]
-        self._sent.append(msg)
-        return msg
+from tests.conftest import FakeBridge, FakeTarget  # noqa: E402  (shared fakes)
 
 
 # The exact 400 error from the user's production session
