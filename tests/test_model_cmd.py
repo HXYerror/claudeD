@@ -90,9 +90,14 @@ async def test_model_current_with_session_renders_metadata():
     from clauded.bot import ClaudedBot
     bot_spec = MagicMock(spec=ClaudedBot)
     bot_spec.session_manager = MagicMock()
-    bot_spec.session_manager.get_session = MagicMock(
-        return_value=MagicMock(model="haiku")
-    )
+    # #198: model_current now inspects tier fields directly; simulate
+    # a user-explicit /model switch by setting _model_override.
+    bridge = MagicMock(model="haiku")
+    bridge._model_override = "haiku"
+    bridge._sdk_model = None
+    bridge._config = MagicMock()
+    bridge._config.claude_model = None
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
     interaction = MagicMock()
     interaction.client = bot_spec
     interaction.channel.id = 1
@@ -129,9 +134,13 @@ async def test_model_current_unknown_model_shows_id_only():
     from clauded.bot import ClaudedBot
     bot_spec = MagicMock(spec=ClaudedBot)
     bot_spec.session_manager = MagicMock()
-    bot_spec.session_manager.get_session = MagicMock(
-        return_value=MagicMock(model="claude-future-7-9-xl")
-    )
+    # #198: simulate /model switch to an unknown id (override tier).
+    bridge = MagicMock(model="claude-future-7-9-xl")
+    bridge._model_override = "claude-future-7-9-xl"
+    bridge._sdk_model = None
+    bridge._config = MagicMock()
+    bridge._config.claude_model = None
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
     interaction = MagicMock()
     interaction.client = bot_spec
     interaction.channel.id = 1

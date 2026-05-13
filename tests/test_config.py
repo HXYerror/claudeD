@@ -46,11 +46,24 @@ def test_blank_token_raises(isolated_env: pytest.MonkeyPatch) -> None:
         load_config()
 
 
-def test_default_model_is_sonnet(isolated_env: pytest.MonkeyPatch) -> None:
+def test_default_model_is_none(isolated_env: pytest.MonkeyPatch) -> None:
+    """#198: CLAUDE_MODEL unset → claude_model is None (was 'sonnet').
+
+    None signals "no admin override, let SDK pick from
+    ~/.claude/settings.json" — matches terminal `claude` behavior.
+    """
     isolated_env.setenv("DISCORD_BOT_TOKEN", "tok-abc")
     cfg = load_config()
     assert isinstance(cfg, Config)
-    assert cfg.claude_model == "sonnet"
+    assert cfg.claude_model is None
+
+
+def test_blank_model_env_is_none(isolated_env: pytest.MonkeyPatch) -> None:
+    """#198: whitespace-only CLAUDE_MODEL is treated as unset → None."""
+    isolated_env.setenv("DISCORD_BOT_TOKEN", "tok-abc")
+    isolated_env.setenv("CLAUDE_MODEL", "   ")
+    cfg = load_config()
+    assert cfg.claude_model is None
 
 
 def test_default_permission_mode(isolated_env: pytest.MonkeyPatch) -> None:

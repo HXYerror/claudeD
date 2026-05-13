@@ -41,13 +41,44 @@ def _fmt_context(n: int) -> str:
 def _current_model_for_thread(bot, thread_id: int | None) -> str | None:
     """Return the active model name for ``thread_id`` if a session exists,
     else None. Resolves through ``bridge.model`` which already follows
-    the override > sdk-reported > config-default chain."""
+    the override > sdk-reported > config-default chain.
+
+    #198: ``bridge.model`` may legitimately return ``None`` now (no
+    override, no env, no first turn yet). Callers should treat ``None``
+    as a valid signal rather than 'no session'.
+    """
     if thread_id is None:
         return None
     bridge = bot.session_manager.get_session(thread_id)
     if bridge is None:
         return None
     return getattr(bridge, "model", None)
+
+
+def _model_source_for_bridge(bridge) -> tuple[str, str | None]:
+    """Return (source, value) describing where the bridge's model came from.
+
+    #198: ``/model current`` needs to distinguish the 4 tier cases so it
+    can render an accurate description. We inspect tier fields directly
+    rather than the collapsed ``bridge.model`` property.
+
+    Returns one of:
+    - ``("override", "<name>")``  — user ran ``/model switch``
+    - ``("env", "<value>")``      — ``CLAUDE_MODEL`` env var was set
+    - ``("sdk", "<value>")``      — SDK reported it on a ``ResultMessage``
+    - ``("unset", None)``         — pre-first-turn, no override, no env
+    """
+    override = getattr(bridge, "_model_override", None)
+    if override:
+        return ("override", override)
+    config = getattr(bridge, "_config", None)
+    env_model = getattr(config, "claude_model", None) if config else None
+    if env_model:
+        return ("env", env_model)
+    sdk_model = getattr(bridge, "_sdk_model", None)
+    if sdk_model:
+        return ("sdk", sdk_model)
+    return ("unset", None)
 
 
 model_group = app_commands.Group(
@@ -114,31 +145,65 @@ async def model_current(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
     thread_id = getattr(interaction.channel, "id", None)
-    current = _current_model_for_thread(bot, thread_id)
-    if current is None:
+    # #198: don't collapse via ``bridge.model`` — we need to know which
+    # tier the value came from so we can label it correctly. Resolve the
+    # bridge directly and dispatch on the 4 tier cases.
+    bridge = (
+        bot.session_manager.get_session(thread_id) if thread_id is not None else None
+    )
+    if bridge is None:
         await interaction.response.send_message(
             "ℹ️ No active session in this channel. Send a message to start one.",
             ephemeral=True,
         )
         return
-    # Try to find the matching KNOWN_MODELS entry for metadata
+
+    source, value = _model_source_for_bridge(bridge)
+
+    # Case 4: nothing pinned anywhere AND no SDK turn yet — let the user
+    # know the SDK/CLI will resolve the default on the first turn.
+    if source == "unset":
+        embed = discord.Embed(
+            title="🤖 Current Model",
+            description=(
+                "_(unset — will use CLI default; ask Claude something to "
+                "discover the actual model)_"
+            ),
+            color=COLOR_TOOL_SUCCESS,
+        )
+        await interaction.response.send_message(embed=embed)
+        return
+
+    # Cases 1-3: we have a concrete model name. Build the KNOWN_MODELS
+    # metadata block when the name matches an alias or full id.
+    assert value is not None  # narrowed by the source != "unset" branch
     matched = None
     for alias, info in KNOWN_MODELS.items():
-        if current == alias or current == info["id"]:
+        if value == alias or value == info["id"]:
             matched = (alias, info)
             break
-    if matched:
-        alias, info = matched
-        ctx = _fmt_context(info["context"])
-        desc = (
-            f"• **alias**: `{alias}`\n"
-            f"• **id**: `{info['id']}`\n"
-            f"• **tier**: {info['tier']}\n"
-            f"• **context**: {ctx}"
-        )
+
+    if source == "override":
+        # User ran /model switch — full metadata, no suffix on the title
+        # (matches existing UX from before this PR).
+        if matched:
+            alias, info = matched
+            ctx = _fmt_context(info["context"])
+            desc = (
+                f"• **alias**: `{alias}`\n"
+                f"• **id**: `{info['id']}`\n"
+                f"• **tier**: {info['tier']}\n"
+                f"• **context**: {ctx}"
+            )
+        else:
+            desc = f"• **id**: `{value}`\n• _(not in known-models table)_"
+    elif source == "env":
+        # Admin-pinned via CLAUDE_MODEL env var.
+        desc = f"`{value}` (CLAUDE_MODEL env)"
     else:
-        # Unknown model (full id / experimental)
-        desc = f"• **id**: `{current}`\n• _(not in known-models table)_"
+        # source == "sdk" — observed from a ResultMessage post-first-turn.
+        desc = f"`{value}` (CLI default)"
+
     embed = discord.Embed(
         title="🤖 Current Model",
         description=desc,
