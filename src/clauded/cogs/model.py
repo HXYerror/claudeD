@@ -165,15 +165,6 @@ async def model_switch_autocomplete(interaction: discord.Interaction, current: s
 model_switch.autocomplete("name")(model_switch_autocomplete)
 
 
-# ----- backward-compat top-level alias (#186 migration safety) -----
-# Keep ``switch_model`` symbol exported so bot.py's existing add_command
-# call continues to work BUT route to a thin shim that just calls the
-# group's switch. We do NOT re-register it under the top-level ``model``
-# name (that would conflict with the group). Instead we shadow the
-# import-time variable name only — bot.py's import is updated below.
-switch_model = model_switch  # alias for any external lookup
-
-
 @app_commands.command(name="effort", description="Set Claude's thinking effort level")
 @app_commands.describe(level="Effort: low, medium, high, xhigh, max")
 @app_commands.choices(level=[
