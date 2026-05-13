@@ -115,19 +115,3 @@ def test_setup_hook_source_has_no_global_tree_sync():
             f"twice in autocomplete). Per-guild sync from on_ready instead."
         )
 
-
-import inspect
-
-def test_setup_hook_does_not_call_global_tree_sync():
-    """#185 regression pin: ``setup_hook`` must NOT contain
-    ``self.tree.sync(`` (without a guild kwarg). Per-guild sync is
-    deferred to ``on_ready``; a global sync here would re-introduce
-    the duplicate-commands bug across all 26 commands.
-    """
-    from clauded.bot import ClaudedBot
-    src = inspect.getsource(ClaudedBot.setup_hook)
-    assert "self.tree.sync(" not in src, (
-        "setup_hook must not call self.tree.sync(...) — that would "
-        "global-sync commands and reintroduce #185 (duplicate "
-        "autocomplete entries). Per-guild sync lives in on_ready."
-    )
