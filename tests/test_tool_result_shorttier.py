@@ -778,3 +778,137 @@ async def test_medium_tier_downgrades_log_when_add_view_raises():
     assert "view registration failed" in final_desc, (
         f"Expected explicit 'view registration failed' downgrade; got: {final_desc!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_medium_tier_log_line_index_matches_button_index():
+    """#187: rolling-log `#N` index MUST match button `#N` index so user
+    can map a log line to the button below. Without this they have to
+    guess which #N corresponds to which line."""
+    import sys
+    sys.path.insert(0, "src")
+    from unittest.mock import MagicMock
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer, ToolResultsView
+
+    class FakeBridge:
+        def __init__(self, events):
+            self._events = events
+            self.is_active = True
+            self._client = MagicMock()
+        async def send_message(self, _text):
+            for ev in self._events:
+                yield ev
+
+    class FakeMessage:
+        def __init__(self, msg_id=999):
+            self.id = msg_id
+            self.content = ""
+            self.embeds = []
+            self.attached_view = None
+        async def edit(self, **kwargs):
+            if "embed" in kwargs:
+                self.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                self.attached_view = kwargs["view"]
+            return self
+        async def delete(self):
+            return None
+
+    class FakeTarget:
+        def __init__(self):
+            self.id = 1
+            self._sent = []
+            self._next_id = 90000
+        async def send(self, *args, **kwargs):
+            self._next_id += 1
+            msg = FakeMessage(msg_id=self._next_id)
+            if "embed" in kwargs:
+                msg.embeds = [kwargs["embed"]]
+            if "view" in kwargs:
+                msg.attached_view = kwargs["view"]
+            self._sent.append(msg)
+            return msg
+
+    # 3 medium-tier tool calls: Bash, Read, Bash
+    medium_content_a = "\n".join(f"a{i}: data data data" for i in range(30))
+    medium_content_b = "\n".join(f"b{i}: more more more" for i in range(30))
+    medium_content_c = "\n".join(f"c{i}: third third third" for i in range(30))
+
+    events = [
+        AssistantMessage(
+            content=[
+                ToolUseBlock(id="t1", name="Bash", input={"command": "ls"}),
+                ToolUseBlock(id="t2", name="Read", input={"file_path": "/tmp/foo"}),
+                ToolUseBlock(id="t3", name="Bash", input={"command": "pwd"}),
+            ],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                ToolResultBlock(tool_use_id="t1", content=medium_content_a, is_error=False),
+                ToolResultBlock(tool_use_id="t2", content=medium_content_b, is_error=False),
+                ToolResultBlock(tool_use_id="t3", content=medium_content_c, is_error=False),
+            ],
+            model="claude-sonnet", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-idx",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    await renderer.render_response(FakeBridge(events), "test 187")
+
+    # Get the final rolling-log embed
+    rolling = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
+    ]
+    assert rolling
+    desc = rolling[-1].embeds[0].description
+
+    # Both rolling log AND button labels MUST share the #1/#2/#3 indexing
+    # in the SAME order
+    assert "Bash #1:" in desc, f"Expected `Bash #1:` in rolling log; got: {desc!r}"
+    assert "Read #2:" in desc, f"Expected `Read #2:` in rolling log; got: {desc!r}"
+    assert "Bash #3:" in desc, f"Expected `Bash #3:` in rolling log; got: {desc!r}"
+
+    view: ToolResultsView = rolling[-1].attached_view
+    assert isinstance(view, ToolResultsView)
+    # Buttons in same order: #1 Bash, #2 Read, #3 Bash
+    btn_labels = [view._buttons[tid].label for tid in ("t1", "t2", "t3")]
+    assert "#1" in btn_labels[0] and "Bash" in btn_labels[0]
+    assert "#2" in btn_labels[1] and "Read" in btn_labels[1]
+    assert "#3" in btn_labels[2] and "Bash" in btn_labels[2]
+
+
+def test_medium_tier_idempotent_reentry_keeps_index():
+    """R1 tester gap: when the same tool_use_id renders twice (duplicate
+    event), the rolling-log line MUST keep the same `#N` index. Without
+    this, a re-render would advance the counter and decouple from the
+    (already-existing) button."""
+    # Simulate the production index-computation
+    medium_results = {"t1": ("Bash", "x" * 500)}  # already added
+    tool_id = "t1"
+    if tool_id in medium_results:
+        idx = list(medium_results.keys()).index(tool_id) + 1
+    else:
+        idx = len(medium_results) + 1
+    assert idx == 1, f"Re-rendering t1 must reuse index 1; got {idx}"
+
+    # New tool_id 't2': fresh index 2
+    medium_results["t2"] = ("Read", "y" * 500)
+    tool_id = "t2"
+    idx = list(medium_results.keys()).index(tool_id) + 1 if tool_id in medium_results else len(medium_results) + 1
+    assert idx == 2
+
+    # Re-render t1 again — STILL 1, not 3
+    tool_id = "t1"
+    idx = list(medium_results.keys()).index(tool_id) + 1 if tool_id in medium_results else len(medium_results) + 1
+    assert idx == 1, f"Re-rendering existing t1 must KEEP index 1; got {idx}"

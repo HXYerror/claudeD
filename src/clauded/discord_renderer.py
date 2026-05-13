@@ -1200,13 +1200,25 @@ class DiscordRenderer:
                                         )
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
                                     elif is_medium:
-                                        # Rolling log shows summary;
-                                        # button on this same message lets
-                                        # the user open the full content
-                                        # ephemerally. No separate message.
+                                        # Rolling log shows summary + the
+                                        # same ``#N`` index that the button
+                                        # below uses, so user can map
+                                        # ``✅ Bash #3`` log line to
+                                        # ``[📄 #3 Bash]`` button without guessing.
+                                        # #187: index = len(medium_results)+1
+                                        # (medium_results not yet appended;
+                                        # see below). Use tool_id ordering
+                                        # so re-entries (duplicate event) keep
+                                        # the same number.
                                         line_count = content_str.count("\n") + 1
+                                        if tool_id in medium_results:
+                                            # idempotent re-render
+                                            medium_index = list(medium_results.keys()).index(tool_id) + 1
+                                        else:
+                                            medium_index = len(medium_results) + 1
                                         tool_log_lines[i] = (
-                                            f"{status} {name}: {line_count} lines / "
+                                            f"{status} {name} #{medium_index}: "
+                                            f"{line_count} lines / "
                                             f"{len(content_str)} chars (⬇ click to view)"
                                         )
                                     else:
@@ -1291,7 +1303,10 @@ class DiscordRenderer:
                                     if add_view_failed and is_medium and tool_id:
                                         for j in range(len(tool_log_lines) - 1, -1, -1):
                                             line = tool_log_lines[j]
-                                            if line.startswith(f"{status} {name}:") and "click to view" in line:
+                                            # #187: log line may have `#N`
+                                            # suffix on name; match by
+                                            # `click to view` marker instead.
+                                            if line.startswith(f"{status} {name}") and "click to view" in line:
                                                 tool_log_lines[j] = (
                                                     f"{status} {name}: "
                                                     f"{len(content_str)} chars "
@@ -1313,7 +1328,8 @@ class DiscordRenderer:
                                     # see a click-to-view promise that
                                     # can't be honored.
                                     for j in range(len(tool_log_lines) - 1, -1, -1):
-                                        if tool_log_lines[j].startswith(f"{status} {name}:") and "click to view" in tool_log_lines[j]:
+                                        # #187: name may have ``#N`` suffix; match on click-to-view marker
+                                        if tool_log_lines[j].startswith(f"{status} {name}") and "click to view" in tool_log_lines[j]:
                                             tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; view button unavailable)"
                                             break
                             elif tool_id and tool_id in tool_msgs:
