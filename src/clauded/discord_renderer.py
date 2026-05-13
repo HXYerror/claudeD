@@ -211,6 +211,48 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+def _format_context_segment(stats: dict[str, Any] | None) -> str | None:
+    """Return ``│ 🧠 N%`` (or thresholded ⚠️ / 🔥) for the cost footer, or
+    ``None`` when no usable percentage is available.
+
+    #182: stats may have ``context_percentage`` populated from
+    ``bridge.get_context_usage()`` (#163 sub-task 3 reuse). The renderer
+    silently omits the segment on missing / invalid data so we never
+    break the existing footer for legacy bridges or transient errors.
+
+    Thresholds (boundary inclusive on the lower bound):
+      - < 75%   → 🧠 (calm)
+      - 75-89%  → ⚠️ (warning)
+      - >= 90%  → 🔥 (critical)
+
+    Floor: percentages > 0 but < 1% render as ``<1%`` (otherwise
+    ``int(0.4) == 0`` would mislead the user into thinking they've
+    used nothing).
+    """
+    if not stats:
+        return None
+    pct = stats.get("context_percentage")
+    if pct is None:
+        return None
+    try:
+        pct_f = float(pct)
+    except (TypeError, ValueError):
+        return None
+    if pct_f < 0 or pct_f > 100:
+        return None  # invalid range, omit silently
+    # Threshold-colored emoji
+    if pct_f >= 90:
+        emoji = "🔥"
+    elif pct_f >= 75:
+        emoji = "⚠️"
+    else:
+        emoji = "🧠"
+    # Floor sub-1% to ``<1%`` so a 0.4% turn doesn't render as ``0%``.
+    if 0 < pct_f < 1:
+        return f" │ {emoji} <1%"
+    return f" │ {emoji} {int(pct_f)}%"
+
+
 def _extract_subagent_stats(input_value: Any) -> dict[str, Any] | None:
     """Extract stats from a sub-agent ``UserMessage.tool_use_result`` payload.
 
@@ -566,6 +608,23 @@ class DiscordRenderer:
                         'model': getattr(event, 'model', '') or '',
                         'stop_reason': _last_stop_reason,
                     }
+                    # #182: pull context-window usage and fold percentage
+                    # into stats so the footer can render `🧠 N%` segment.
+                    # ResultMessage.usage carries per-turn API tokens only;
+                    # the cumulative-vs-max ratio lives on a separate SDK
+                    # control-plane call (already wired for /context cmd,
+                    # #163 sub-task 3). Mirrors #160's graceful-fallback
+                    # discipline — any exception logs at DEBUG and the
+                    # footer simply omits the segment.
+                    try:
+                        cu = await bridge.get_context_usage()
+                        if cu and "percentage" in cu:
+                            stats["context_percentage"] = cu["percentage"]
+                    except Exception:
+                        log.debug(
+                            "get_context_usage failed; footer omits 🧠",
+                            exc_info=True,
+                        )
                     break
 
 
@@ -1408,6 +1467,11 @@ class DiscordRenderer:
                     f" │ 📤 {_fmt_tokens(stats.get('output_tokens', 0))}"
                     f" │ ⏱️ {duration_s:.1f}s"
                 )
+                # #182: append `│ 🧠 N%` context-window segment when
+                # available. Graceful-omit when not (helper returns None).
+                ctx_seg = _format_context_segment(stats)
+                if ctx_seg:
+                    footer_text += ctx_seg
                 if _last_stop_reason and _last_stop_reason != "end_turn":
                     footer_text += f" │ ⚠️ {_last_stop_reason}"
 
