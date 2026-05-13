@@ -230,7 +230,7 @@ class ClaudedBot(commands.Bot):
         # ----- Import command objects from cog modules -----
         from .cogs.project import project_group, env_group
         from .cogs.session import session_group
-        from .cogs.model import switch_model, set_effort, max_turns_cmd, fallback_model_cmd, toggle_bare
+        from .cogs.model import model_group, set_effort, max_turns_cmd, fallback_model_cmd, toggle_bare
         from .cogs.tools import tools_group, budget_group
         from .cogs.agent import agent_group
         from .cogs.mcp import mcp_group
@@ -246,7 +246,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
-        self.tree.add_command(switch_model)
+        self.tree.add_command(model_group)
         self.tree.add_command(set_effort)
         self.tree.add_command(tools_group)
         self.tree.add_command(budget_group)
