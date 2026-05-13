@@ -340,10 +340,16 @@ def _is_async_agent_dispatch(text: str) -> bool:
     The actual sub-agent work continues in the background. Marking this
     as "✅ Subtask Complete" was misleading; the renderer instead shows
     "🚀 Sub-agent dispatched" so users know the work is still running.
+
+    Uses word-boundary anchoring on "async agent" (case-insensitive)
+    so a stray substring elsewhere doesn't false-trigger.
     """
     if not text:
         return False
-    return "async agent launched" in text.lower()
+    return bool(_ASYNC_DISPATCH_PATTERN.search(text))
+
+
+_ASYNC_DISPATCH_PATTERN = re.compile(r"\basync agent launched\b", re.IGNORECASE)
 
 
 def _extract_subagent_stats(input_value: Any) -> dict[str, Any] | None:

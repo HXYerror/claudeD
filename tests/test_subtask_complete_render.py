@@ -390,3 +390,88 @@ async def test_subtask_complete_normal_path_still_works():
     embed = complete_marks[0]
     # Plain text preserved
     assert "42 items processed" in (embed.description or "")
+
+
+@pytest.mark.asyncio
+async def test_subtask_failed_with_list_of_dicts_renders_clean_error():
+    """R1 tester gap: error-path (is_error=True) + list-of-dict content
+    must also extract clean text, not leak Python repr. The embed title
+    flips to '❌ Subtask Failed' (not Sub-agent dispatched, since we
+    only dispatch-detect on the non-error path)."""
+    import sys
+    sys.path.insert(0, "src")
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    err_text = "Task crashed: ValueError(\"missing required arg 'name'\")"
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="task-err", name="Task", input={"prompt": "bad", "description": "buggy"})],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="task-err",
+                    content=[{"type": "text", "text": err_text}],
+                    is_error=True,
+                )
+            ],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=100, duration_api_ms=80,
+            is_error=True, num_turns=1, session_id="sess-err",
+            total_cost_usd=0.001,
+        ),
+    ]
+
+    threads_created: list[_FakeThread] = []
+    orig = _FakeMessage.create_thread
+    async def _record(self, name, **kw):
+        t = _FakeThread(name=name)
+        threads_created.append(t)
+        return t
+    _FakeMessage.create_thread = _record  # type: ignore[method-assign]
+    try:
+        target = _FakeTarget()
+        renderer = DiscordRenderer(target)
+        await renderer.render_response(_FakeBridge(events), "run task")
+    finally:
+        _FakeMessage.create_thread = orig  # type: ignore[method-assign]
+
+    all_msgs = list(target._sent)
+    for t in threads_created:
+        all_msgs.extend(t._sent)
+    embeds = [e for m in all_msgs for e in m.embeds]
+    failed_embeds = [
+        e for e in embeds
+        if (e.title or "").startswith("❌ Subtask Failed")
+        and not (e.description or "").startswith("📎 ")
+    ]
+    assert failed_embeds, (
+        f"Expected '❌ Subtask Failed' embed; got titles: "
+        f"{[(e.title or '') for e in embeds]}"
+    )
+    embed = failed_embeds[0]
+    desc = embed.description or ""
+    # No Python repr leak
+    assert "[{'type':" not in desc
+    assert "'text':" not in desc
+    # The actual error text comes through
+    assert "ValueError" in desc or "missing required arg" in desc
+
+
+def test_dispatch_detection_word_boundary():
+    """R1 engineer: word-boundary anchor prevents false positives where
+    'async agent' appears as a substring in unrelated context."""
+    from clauded.discord_renderer import _is_async_agent_dispatch
+    # Positive: canonical phrase
+    assert _is_async_agent_dispatch("Async agent launched successfully.")
+    assert _is_async_agent_dispatch("ASYNC AGENT LAUNCHED")
+    # Negative: substring without word boundary
+    assert not _is_async_agent_dispatch("synchronizedasync agentlauncher started")
+    # Negative: missing 'launched' verb
+    assert not _is_async_agent_dispatch("async agent is running")
