@@ -196,6 +196,10 @@ class ClaudedBot(commands.Bot):
         # #185: per-guild slash-sync idempotency guard. on_ready can fire
         # multiple times per process (reconnects); we sync each guild once.
         self._slash_synced: set[int] = set()
+        # #195: per-thread "ignored-once" guard so we don't spam logs every
+        # message in a 3rd-party thread. Set of thread_ids we've already
+        # logged the ownership-skip for; cleared on bot restart.
+        self._logged_third_party_thread: set[int] = set()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -652,6 +656,42 @@ class ClaudedBot(commands.Bot):
         ``Config.allow_unbound_fallback``, the message is silently ignored
         (v1.0 behavior).
         """
+        # #195 (P0): thread-ownership check. v1.1 PRD F1 "thread doesn't need
+        # @mention" implicitly assumed the thread was created BY the bot
+        # (via _handle_channel_message:create_thread). For 3rd-party
+        # threads (any user opens "Create Thread" on the bound channel),
+        # bot would silently engage on every message — leaking cwd to
+        # random users, burning tokens, risking Discord mod action.
+        # Fix: require explicit @mention or matching role-mention to engage
+        # when ``thread.owner_id != bot.id``. Bot-created threads still
+        # behave per PRD F1 (no @ required).
+        thread = message.channel
+        if isinstance(thread, discord.Thread):
+            bot_id = getattr(self.user, "id", None)
+            thread_owner_id = getattr(thread, "owner_id", None)
+            if bot_id is not None and thread_owner_id is not None and thread_owner_id != bot_id:
+                # 3rd-party thread. Require explicit invite via mention.
+                bot_mentioned = any(
+                    getattr(m, "id", None) == bot_id for m in message.mentions
+                )
+                # Role-mention as a softer invite: bot has a role whose
+                # name matches the bot's display name. Matches the v1.0
+                # mention-required convention.
+                bot_name_lower = (getattr(self.user, "name", "") or "").lower()
+                role_mentioned = bool(bot_name_lower) and any(
+                    (getattr(r, "name", "") or "").lower() == bot_name_lower
+                    for r in message.role_mentions
+                )
+                if not (bot_mentioned or role_mentioned):
+                    if thread.id not in self._logged_third_party_thread:
+                        self._logged_third_party_thread.add(thread.id)
+                        log.info(
+                            "ignored message in third-party thread tid=%s "
+                            "(owner=%s, bot=%s)",
+                            thread.id, thread_owner_id, bot_id,
+                        )
+                    return
+
         # SECURITY (sec-1): mirror channel handler's gate.
         # v1.18: also mirror the first-time-refusal hint so unbound *parent*
         # channels of thread messages don't silent-fail either.
