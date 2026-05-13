@@ -422,7 +422,20 @@ async def test_non_subagent_messages_stay_in_main():
     parent_channel = FakeChannel()
     main_thread = FakeMainThread(parent_channel=parent_channel, name="main")
 
+    # Per commit 2608502: text arrives via StreamEvent (real SDK behavior
+    # with include_partial_messages=True). AssistantMessage TextBlock is
+    # skipped as a streaming duplicate. Test must feed a matching
+    # text_delta StreamEvent so the renderer's buffer actually receives
+    # the text.
     events = [
+        StreamEvent(
+            uuid="sev-1",
+            session_id="sess-7",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Hello from main agent"},
+            },
+        ),
         AssistantMessage(
             content=[TextBlock(text="Hello from main agent")],
             model="claude-sonnet",
@@ -498,7 +511,21 @@ async def test_unknown_parent_tool_use_id_not_routed():
     parent_channel = FakeChannel()
     main_thread = FakeMainThread(parent_channel=parent_channel, name="main")
 
+    # Per commit 2608502: same as test_non_subagent_messages_stay_in_main —
+    # text comes via StreamEvent. The unknown parent_tool_use_id on the
+    # AssistantMessage doesn't change that path (parent_tool_use_id is a
+    # sub-thread routing key on AssistantMessage only, not on StreamEvent;
+    # StreamEvent text always lands on the main thread when no sub-thread
+    # mapping exists for the active block).
     events = [
+        StreamEvent(
+            uuid="sev-2",
+            session_id="sess-10",
+            event={
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Unknown parent message"},
+            },
+        ),
         AssistantMessage(
             content=[TextBlock(text="Unknown parent message")],
             model="claude-sonnet",
