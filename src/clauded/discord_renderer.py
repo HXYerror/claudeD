@@ -638,6 +638,48 @@ class DiscordRenderer:
                 #   - UserMessage: ToolResultBlock (with stats on
                 #     event.tool_use_result that we already captured above)
                 if isinstance(content, list) and isinstance(event, (AssistantMessage, UserMessage)):
+                    # #183: synthetic API-error messages from the SDK or
+                    # upstream provider (LiteLLM, GitHub Copilot, etc.)
+                    # arrive as ``AssistantMessage(error=<kind>, model=
+                    # "<synthetic>", content=[TextBlock("API Error: ...")]
+                    # )``. The TextBlock branch below skips these as
+                    # "streaming duplicates" — but synthetic errors don't
+                    # stream, so dropping them leaves the user with the
+                    # final "(Claude returned no text response)"
+                    # placeholder and no idea what went wrong. Render as
+                    # a red error embed and mark ``saw_text`` so the
+                    # placeholder catch-all doesn't fire on top of it.
+                    api_error = getattr(event, "error", None) if isinstance(event, AssistantMessage) else None
+                    if api_error is not None:
+                        # Pull the human-readable text from the first
+                        # TextBlock (synthetic errors always pack one).
+                        err_text = ""
+                        for blk in content:
+                            if isinstance(blk, TextBlock):
+                                err_text = blk.text
+                                break
+                        if not err_text:
+                            err_text = f"(no error body; AssistantMessage.error={api_error})"
+                        # Discord embed description cap is 4096; trim with
+                        # a tail marker for the rare giant traceback.
+                        if len(err_text) > 3800:
+                            err_text = err_text[:3800] + "\n… (truncated)"
+                        embed = discord.Embed(
+                            title=f"❌ Provider error: {api_error}",
+                            description=(
+                                f"```\n{err_text}\n```\n\n"
+                                f"-# Try `/session clear` if the conversation has "
+                                f"grown past the provider's context window, or "
+                                f"switch providers (`/model` / env)."
+                            ),
+                            color=COLOR_TOOL_FAILURE,
+                        )
+                        await self._safe_send(embed=embed)
+                        # Mark saw_text so the end-of-render catch-all
+                        # "(no text response)" placeholder doesn't fire on
+                        # top of the error embed.
+                        saw_text = True
+                        continue
                     for block in content:
                         if isinstance(block, ThinkingBlock):
                             thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
