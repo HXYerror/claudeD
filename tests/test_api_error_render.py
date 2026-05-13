@@ -236,3 +236,85 @@ async def test_api_error_text_truncated_when_huge():
         f"Embed description exceeds Discord cap: {len(embed.description)}"
     )
     assert "truncated" in embed.description
+
+
+@pytest.mark.parametrize("error_kind", [
+    "authentication_failed",
+    "billing_error",
+    "rate_limit",
+    "invalid_request",
+    "server_error",
+    "unknown",
+])
+@pytest.mark.asyncio
+async def test_api_error_renders_for_all_six_literal_values(error_kind):
+    """R1 tester: ``AssistantMessageError`` Literal has 6 values. Pin all
+    of them so future SDK additions don't silently fall through (the
+    detection is structural — any non-None ``error`` field hits the
+    renderer — but parametrize anyway as defense against the Literal
+    becoming open-ended)."""
+    events = [
+        AssistantMessage(
+            content=[TextBlock(text=f"API Error: 400 ({error_kind})")],
+            model="<synthetic>",
+            parent_tool_use_id=None,
+            error=error_kind,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=10, duration_api_ms=5,
+            is_error=False, num_turns=1, session_id="sess-err",
+            total_cost_usd=0.0,
+        ),
+    ]
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    await renderer.render_response(FakeBridge(events), "继续")
+    error_embeds = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "").startswith("❌ Provider error")
+    ]
+    assert error_embeds, f"No error embed rendered for kind={error_kind!r}"
+    assert error_kind in error_embeds[0].embeds[0].title
+
+
+@pytest.mark.asyncio
+async def test_api_error_with_triple_backticks_in_body_does_not_break_fence():
+    """R1 security: upstream errors can contain literal ``` (an inner
+    exception repr, a JSON-encoded code sample, etc.). Without escaping,
+    they would close our outer ```...``` fence early and leave Discord
+    rendering markdown after the close. Verify the replacement strategy
+    keeps the actual error readable and prevents the fence break."""
+    payload = 'Error parsing: ```python\nprint("hi")\n```'
+    events = [
+        AssistantMessage(
+            content=[TextBlock(text=payload)],
+            model="<synthetic>",
+            parent_tool_use_id=None,
+            error="invalid_request",
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=10, duration_api_ms=5,
+            is_error=False, num_turns=1, session_id="sess-err",
+            total_cost_usd=0.0,
+        ),
+    ]
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    await renderer.render_response(FakeBridge(events), "继续")
+    error_embeds = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "").startswith("❌ Provider error")
+    ]
+    desc = error_embeds[0].embeds[0].description
+    # The outer ```...``` fence wraps the body. Inside the body, the
+    # literal ``` from the payload MUST have been broken up so it
+    # doesn't terminate the outer fence early.
+    inner = desc.split("```\n", 1)[1].rsplit("\n```", 1)[0]
+    assert "```" not in inner, (
+        f"Inner code fence body still contains raw triple-backtick — "
+        f"outer fence would break. Inner: {inner[:120]!r}"
+    )
+    # Original text content still present (zero-width joiners don't
+    # affect visual reading)
+    assert "python" in inner
+    assert "print" in inner

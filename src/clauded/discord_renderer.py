@@ -660,6 +660,13 @@ class DiscordRenderer:
                                 break
                         if not err_text:
                             err_text = f"(no error body; AssistantMessage.error={api_error})"
+                        # R1 security: upstream API error bodies can
+                        # contain literal ``` (e.g. an inner exception
+                        # repr) which would close our outer 3-backtick
+                        # fence early and visually mangle the embed.
+                        # Replace with a zero-width-joiner separator so
+                        # the text still reads correctly.
+                        err_text = err_text.replace("```", "`\u200d`\u200d`")
                         # Discord embed description cap is 4096; trim with
                         # a tail marker for the rare giant traceback.
                         if len(err_text) > 3800:
