@@ -86,3 +86,31 @@ async def test_on_ready_with_no_guilds_does_nothing():
     await ClaudedBot.on_ready(stub)
     assert stub._tree.sync.await_count == 0
     assert stub._slash_synced == set()
+
+
+def test_setup_hook_source_has_no_global_tree_sync():
+    """R1 tester regression pin: source-level assertion that setup_hook
+    never calls ``tree.sync()`` (i.e., without a guild kwarg). This was
+    THE bug — global sync registered all 26 commands in both scopes,
+    causing the autocomplete to show each twice.
+
+    Source-level test instead of behavioral mock because:
+    1. ``self.tree`` is a property with no setter on commands.Bot,
+       making a behavioral mock awkward (we'd have to patch the
+       property descriptor)
+    2. The bug class is "someone re-adds tree.sync() somewhere in
+       setup_hook" — a textual guard catches that even if the call
+       site moves
+    """
+    import inspect
+    from clauded.bot import ClaudedBot
+    src = inspect.getsource(ClaudedBot.setup_hook)
+    # Allow tree.sync(guild=...) but forbid bare tree.sync() / tree.sync(
+    # without a guild= keyword. Approximate via substring match (this is
+    # a regression test, not a parser):
+    for forbidden in ("await self.tree.sync()", "self.tree.sync()"):
+        assert forbidden not in src, (
+            f"setup_hook MUST NOT call {forbidden} — it registers commands "
+            f"GLOBALLY, which is what caused #185 (every command appeared "
+            f"twice in autocomplete). Per-guild sync from on_ready instead."
+        )
