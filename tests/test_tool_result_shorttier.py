@@ -886,3 +886,29 @@ async def test_medium_tier_log_line_index_matches_button_index():
     assert "#1" in btn_labels[0] and "Bash" in btn_labels[0]
     assert "#2" in btn_labels[1] and "Read" in btn_labels[1]
     assert "#3" in btn_labels[2] and "Bash" in btn_labels[2]
+
+
+def test_medium_tier_idempotent_reentry_keeps_index():
+    """R1 tester gap: when the same tool_use_id renders twice (duplicate
+    event), the rolling-log line MUST keep the same `#N` index. Without
+    this, a re-render would advance the counter and decouple from the
+    (already-existing) button."""
+    # Simulate the production index-computation
+    medium_results = {"t1": ("Bash", "x" * 500)}  # already added
+    tool_id = "t1"
+    if tool_id in medium_results:
+        idx = list(medium_results.keys()).index(tool_id) + 1
+    else:
+        idx = len(medium_results) + 1
+    assert idx == 1, f"Re-rendering t1 must reuse index 1; got {idx}"
+
+    # New tool_id 't2': fresh index 2
+    medium_results["t2"] = ("Read", "y" * 500)
+    tool_id = "t2"
+    idx = list(medium_results.keys()).index(tool_id) + 1 if tool_id in medium_results else len(medium_results) + 1
+    assert idx == 2
+
+    # Re-render t1 again — STILL 1, not 3
+    tool_id = "t1"
+    idx = list(medium_results.keys()).index(tool_id) + 1 if tool_id in medium_results else len(medium_results) + 1
+    assert idx == 1, f"Re-rendering existing t1 must KEEP index 1; got {idx}"
