@@ -49,7 +49,7 @@ from .claude_bridge import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from claude_agent_sdk.types import StreamEvent, UserMessage
+from claude_agent_sdk.types import AssistantMessageError, StreamEvent, UserMessage  # noqa: F401 — AssistantMessageError documents the contract pinned by tests/test_api_error_render.py::test_assistant_message_error_field_exists_on_sdk; runtime detection uses getattr() for duck-typing flexibility.
 from .stream_logger import log_event as _log_stream
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
@@ -1414,6 +1414,7 @@ class DiscordRenderer:
                                             medium_index = list(medium_results.keys()).index(tool_id) + 1
                                         else:
                                             medium_index = len(medium_results) + 1
+                                        # #187 invariant: must match ToolResultsView.add_result numbering at ~line 2902. If you change one, audit the other.
                                         tool_log_lines[i] = (
                                             f"{status} {name} #{medium_index}: "
                                             f"{line_count} lines / "
@@ -2897,6 +2898,7 @@ class ToolResultsView(discord.ui.View):
         index = len(self._results)
         # Custom_id must be unique per button across the bot's active
         # views; embed the tool_use_id so callbacks can dispatch.
+        # #187 invariant: must match medium-tier rolling-log numbering at ~line 1417. If you change one, audit the other.
         button = discord.ui.Button(  # type: ignore[var-annotated]
             label=f"📄 #{index} {tool_name[:18]}",
             style=discord.ButtonStyle.secondary,

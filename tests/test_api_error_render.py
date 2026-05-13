@@ -318,3 +318,14 @@ async def test_api_error_with_triple_backticks_in_body_does_not_break_fence():
     # affect visual reading)
     assert "python" in inner
     assert "print" in inner
+
+
+def test_assistant_message_error_field_exists_on_sdk():
+    """Pin: SDK's AssistantMessage MUST expose `.error` attribute."""
+    from dataclasses import fields
+    from claude_agent_sdk.types import AssistantMessage
+    field_names = {f.name for f in fields(AssistantMessage)}
+    assert "error" in field_names, (
+        "claude_agent_sdk.types.AssistantMessage no longer has an "
+        "`error` field; update discord_renderer.py's API-error detection."
+    )
