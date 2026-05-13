@@ -193,6 +193,9 @@ class ClaudedBot(commands.Bot):
         self.allow_unbound_fallback: bool = config.allow_unbound_fallback
         self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
+        # #185: per-guild slash-sync idempotency guard. on_ready can fire
+        # multiple times per process (reconnects); we sync each guild once.
+        self._slash_synced: set[int] = set()
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
@@ -266,8 +269,16 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(btw_cmd)
         self.tree.add_command(context_cmd)
         self.tree.add_command(diff_cmd)
-        synced = await self.tree.sync()
-        log.info("Synced %d application command(s)", len(synced))
+        # #185: do NOT sync globally here — historically claudeD synced
+        # via both ``tree.sync()`` (global) AND PR-specific per-guild
+        # PUT calls, so commands ended up registered in BOTH scopes and
+        # showed twice in Discord's autocomplete. Per-guild sync is
+        # instant (vs. global's ~1h propagation) which is what a self-
+        # hosted bot wants. We sync per-guild from ``on_ready`` instead,
+        # where ``self.guilds`` is populated. Use guarded idempotency
+        # (``self._slash_synced`` initialized in __init__) so reconnect-
+        # driven re-fires don't repeatedly re-sync.
+        log.info("Slash commands registered in tree; per-guild sync deferred to on_ready")
 
     @tasks.loop(minutes=5)
     async def _cleanup_task(self) -> None:
@@ -316,6 +327,27 @@ class ClaudedBot(commands.Bot):
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
         log.info("Bot online as %s (id=%s)", user, getattr(user, "id", "?"))
+        # #185: sync slash commands per-guild on first on_ready. Guarded
+        # idempotency (``self._slash_synced``) so reconnect-driven
+        # re-fires don't waste Discord rate-limit budget. Global sync
+        # is intentionally NOT performed — see setup_hook for the
+        # historical duplicate-registration root cause.
+        guilds_synced: list[str] = []
+        for guild in self.guilds:
+            if guild.id in self._slash_synced:
+                continue
+            try:
+                # Copy globally-defined tree commands into the guild's
+                # scope so the existing ``self.tree.add_command(...)``
+                # API in setup_hook continues to work unchanged.
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                self._slash_synced.add(guild.id)
+                guilds_synced.append(f"{guild.name}({guild.id}):{len(synced)}")
+            except Exception:
+                log.exception("Per-guild slash sync failed for %s", guild.id)
+        if guilds_synced:
+            log.info("Per-guild slash sync done: %s", ", ".join(guilds_synced))
 
     async def on_message(self, message: discord.Message) -> None:  # type: ignore[override]
         # Always ignore self.
