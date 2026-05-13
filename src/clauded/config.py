@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import logging
 
@@ -18,7 +19,7 @@ class Config:
     """Runtime configuration for the Discord-Claude bridge."""
 
     discord_bot_token: str
-    claude_model: str
+    claude_model: Optional[str]
     claude_permission_mode: str
     projects_root: str
     # SECURITY: when False (default), an unbound channel's @bot message is
@@ -55,9 +56,16 @@ def load_config() -> Config:
         if os.environ.get(typo):
             log.warning("Found '%s' in env — did you mean '%s'?", typo, correct)
 
+    # #198: claude_model is Optional[str]. UNSET env var → None → SDK call
+    # omits the `model` kwarg → CLI default from ~/.claude/settings.json is
+    # used (same as terminal `claude`). Setting CLAUDE_MODEL is now an
+    # explicit admin/ops "force-pin" knob rather than the default path.
+    _claude_model_env = os.environ.get("CLAUDE_MODEL", "").strip()
+    claude_model: Optional[str] = _claude_model_env or None
+
     return Config(
         discord_bot_token=token,
-        claude_model=os.environ.get("CLAUDE_MODEL", "sonnet").strip() or "sonnet",
+        claude_model=claude_model,
         claude_permission_mode=(
             os.environ.get("CLAUDE_PERMISSION_MODE", "default").strip()
             or "default"

@@ -139,9 +139,44 @@ class ClaudeBridge:
         self._config = value
 
     @property
-    def model(self) -> str:
-        """Return the active model: explicit override, SDK-reported, or config default."""
-        return self._model_override or self._sdk_model or self._config.claude_model
+    def model(self) -> str | None:
+        """Return the active model for this session, or ``None`` if none is bound.
+
+        Tier precedence (#198):
+        1. ``_model_override`` — user-explicit ``/model switch <name>``
+        2. ``_sdk_model`` — model reported by the SDK on the first
+           ``ResultMessage`` (display-only; NOT used as SDK input — see
+           ``start()`` for why). Once observed, this is the most
+           specific/accurate value (a full model id like
+           ``claude-sonnet-4-5`` rather than the ``sonnet`` alias).
+        3. ``_config.claude_model`` — admin/ops ``CLAUDE_MODEL`` env var
+        4. ``None`` — pre-first-turn with no override and no env var. The
+           SDK call omits ``model=`` so the CLI's ``~/.claude/settings.json``
+           default is used, matching terminal ``claude`` behavior.
+
+        Note: callers that need to distinguish the four cases (e.g.
+        ``/model current``) should inspect the tier fields directly rather
+        than this collapsed property.
+        """
+        return (
+            self._model_override
+            or self._sdk_model
+            or self._config.claude_model
+        )
+
+    @property
+    def explicit_model_override(self) -> str | None:
+        """The user-explicit ``/model switch <name>`` value, or ``None``.
+
+        Public read-only accessor for ``_model_override`` so consumers that
+        need to persist *only* the user's explicit choice (e.g.,
+        :class:`SessionManager.save_session_state`) can avoid the
+        collapsed :attr:`model` property, which would write back the
+        SDK-observed ``_sdk_model`` and form a cross-restart input loop
+        (#198 PRD §Design line 92). Returns ``None`` when the user has
+        not switched and the SDK's CLI-default should govern.
+        """
+        return self._model_override
 
     @property
     def is_active(self) -> bool:
@@ -309,11 +344,21 @@ class ClaudeBridge:
         # back to its own bundled CLI.
         cli_path = resolve_claude_cli()
 
+        # #198: only pass ``model=`` to the SDK when the user has explicitly
+        # chosen one (``/model switch``) or the operator has pinned via
+        # ``CLAUDE_MODEL``. Otherwise omit it so the SDK/CLI reads its own
+        # default from ``~/.claude/settings.json`` — same as terminal
+        # ``claude``. We deliberately do NOT use ``_sdk_model`` here: it's
+        # display-only (the model the SDK reported back on the first
+        # ``ResultMessage``); using it as input would lock the session into
+        # whatever was resolved on turn 1 even if settings.json changes.
+        chosen_model = self._model_override or self._config.claude_model
+
         options = ClaudeAgentOptions(
             cwd=self.project_path,
             env=self._env or {},
             permission_mode=self._config.claude_permission_mode,
-            model=self.model,
+            model=chosen_model,
             resume=self._resume_session_id,
             # R3 (#116): system_prompt preset dict replaces append_system_prompt
             system_prompt={

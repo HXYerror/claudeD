@@ -119,7 +119,10 @@ async def session_info(interaction: discord.Interaction) -> None:
         bot.session_manager.get_session(thread_id) if thread_id is not None else None
     )
     if bridge is not None and bridge.is_active:
-        model = bridge.model or bot.config.claude_model
+        # #198: bridge.model and bot.config.claude_model can both be None now
+        # (unset env + no override + pre-first-turn). Fall back to a
+        # human-readable placeholder for display.
+        model = bridge.model or bot.config.claude_model or "(SDK default)"
         cost_str = f"${bridge.total_cost:.4f}" if bridge.total_cost else "$0.0000"
         lines = [
             f"📡 **Session active** — cwd `{bridge.project_path}`",

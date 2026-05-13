@@ -93,12 +93,23 @@ class SessionManager:
         return True
 
     def save_session_state(self, thread_id: int) -> None:
-        """Persist the current session state for ``thread_id`` to the store."""
+        """Persist the current session state for ``thread_id`` to the store.
+
+        #198 PRD §Design line 92: persist ONLY the user-explicit override
+        (``bridge.explicit_model_override``), not the collapsed
+        ``bridge.model`` property. The collapsed property includes
+        ``_sdk_model`` (what the SDK reported back), and persisting it
+        would lock future resumes onto the SDK-observed value even after
+        the user edits ``~/.claude/settings.json``. Persist ``None`` when
+        the user has not switched — resume will then let the SDK pick
+        the CLI default again.
+        """
         bridge = self._sessions.get(thread_id)
         if bridge and bridge.session_id:
             self._session_store.save_session(
                 thread_id, bridge.session_id, bridge.project_path,
-                model=bridge.model, system_prompt=bridge.system_prompt,
+                model=bridge.explicit_model_override,
+                system_prompt=bridge.system_prompt,
             )
 
     def get_stored_session(self, thread_id: int) -> dict | None:
