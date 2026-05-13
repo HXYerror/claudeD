@@ -24,25 +24,12 @@ class _FakeMessage(FakeMessage):
         return _FakeThread(name=name)
 
 
-class _FakeBridge(FakeBridge):
-    pass
-
-
 class _FakeTarget(FakeTarget):
-    """Override send() to use _FakeMessage (the create-thread-aware subclass)."""
-    async def send(self, *args, **kwargs):
-        self._next_id += 1
-        msg = _FakeMessage(msg_id=self._next_id)
-        if "content" in kwargs:
-            msg.content = kwargs["content"]
-        if "embed" in kwargs:
-            msg.embeds = [kwargs["embed"]]
-        if "view" in kwargs:
-            msg.attached_view = kwargs["view"]
-        if "file" in kwargs:
-            msg.attachments = [kwargs["file"]]
-        self._sent.append(msg)
-        return msg
+    """Override message factory to mint _FakeMessage (the create-thread-
+    aware subclass). Uses the conftest._make_message hook — no need to
+    duplicate the entire send() body."""
+    def _make_message(self, msg_id):
+        return _FakeMessage(msg_id=msg_id)
 
 
 # ---------------------------------------------------------------------------
@@ -253,20 +240,10 @@ async def test_subtask_complete_renders_clean_text_from_list_of_dicts():
         ),
     ]
 
-    target = _FakeTarget()
-    renderer = DiscordRenderer(target)
-    await renderer.render_response(_FakeBridge(events), "run task")
-
-    # Embeds may have been sent to either the main target OR the sub-thread.
-    # Collect from both.
-    all_embeds = list(target._sent)
-    # Find the sub-thread (was created on _FakeMessage.create_thread)
-    # by walking through anchor messages
-    # Actually FakeMessage.create_thread returns FakeThread instances; collect their sent too.
-    # Simpler: also scan FakeThread instances via the renderer/subagent_renderers
-    # (those are not exposed). For this test, embeds we care about end up on the
-    # sub-thread via subagent_renderers[tool_id]._safe_send.
-    # Hack: monkey-patch FakeMessage.create_thread to record threads globally
+    # The first render builds embeds we never inspect; we re-run below
+    # with a monkey-patched create_thread so we can capture the spawned
+    # sub-threads (renderer doesn't expose subagent_renderers). Skip the
+    # first pass entirely (R1 simplicity flagged it as dead async work).
     threads_created: list[_FakeThread] = []
     orig_create = _FakeMessage.create_thread
     async def _record_create(self, name, **kw):
@@ -274,12 +251,11 @@ async def test_subtask_complete_renders_clean_text_from_list_of_dicts():
         threads_created.append(t)
         return t
 
-    # Re-run with patched create_thread
     _FakeMessage.create_thread = _record_create  # type: ignore[method-assign]
     try:
         target2 = _FakeTarget()
         renderer2 = DiscordRenderer(target2)
-        await renderer2.render_response(_FakeBridge(events), "run task")
+        await renderer2.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig_create  # type: ignore[method-assign]
 
@@ -359,7 +335,7 @@ async def test_subtask_complete_normal_path_still_works():
     try:
         target = _FakeTarget()
         renderer = DiscordRenderer(target)
-        await renderer.render_response(_FakeBridge(events), "run task")
+        await renderer.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig  # type: ignore[method-assign]
 
@@ -432,7 +408,7 @@ async def test_subtask_failed_with_list_of_dicts_renders_clean_error():
     try:
         target = _FakeTarget()
         renderer = DiscordRenderer(target)
-        await renderer.render_response(_FakeBridge(events), "run task")
+        await renderer.render_response(FakeBridge(events), "run task")
     finally:
         _FakeMessage.create_thread = orig  # type: ignore[method-assign]
 

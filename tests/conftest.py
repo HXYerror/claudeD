@@ -98,9 +98,20 @@ class FakeTarget:
         self._sent: list[FakeMessage] = []
         self._next_id = target_id * 1000
 
+    def _make_message(self, msg_id: int) -> FakeMessage:
+        """Hook subclasses can override to mint a custom message subclass.
+
+        Default returns the shared ``FakeMessage``. Tests that need
+        per-message-class behavior (e.g.,
+        ``test_subtask_complete_render._FakeMessage`` overriding
+        ``create_thread``) override this method instead of duplicating
+        the entire ``send()`` body.
+        """
+        return FakeMessage(msg_id=msg_id)
+
     async def send(self, *args, **kwargs):
         self._next_id += 1
-        msg = FakeMessage(msg_id=self._next_id)
+        msg = self._make_message(self._next_id)
         if "content" in kwargs:
             msg.content = kwargs["content"]
         if "embed" in kwargs:

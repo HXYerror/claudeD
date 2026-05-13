@@ -186,7 +186,9 @@ def test_touch_heartbeat_no_longer_creates_parent(
     If the cache dir doesn't exist, _touch_heartbeat silently no-ops via OSError."""
     from clauded import bot as bot_mod
     cache_dir = tmp_path / "caches"  # deliberately NOT created
-    monkeypatch.setattr(bot_mod, "_CACHE_DIR", cache_dir)
+    # NOTE: only `_HEARTBEAT_PATH` is read by `_touch_heartbeat`. After
+    # the stage-28 trim moved `_CACHE_DIR` to `_logging_setup`, patching
+    # `bot._CACHE_DIR` had no effect here — dropped per R1 engineer.
     monkeypatch.setattr(bot_mod, "_HEARTBEAT_PATH", cache_dir / "heartbeat")
     monkeypatch.setattr(bot_mod.sys, "platform", "darwin")
     bot_mod._touch_heartbeat()
