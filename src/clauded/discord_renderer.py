@@ -1429,9 +1429,14 @@ class DiscordRenderer:
                                             medium_index = list(medium_results.keys()).index(tool_id) + 1
                                         else:
                                             medium_index = len(medium_results) + 1
-                                        # #187 invariant: must match ToolResultsView.add_result numbering at ~line 2902. If you change one, audit the other.
+                                        # #187 invariant: must match ToolResultsView.add_result numbering at ~line 2918.
+                                        # #207: bold `**#N name**` prefix so the
+                                        # index pops out for visual scan-match
+                                        # with the button label. Also flip
+                                        # ordering to `#N name` to match the
+                                        # button label exactly (was `name #N`).
                                         tool_log_lines[i] = (
-                                            f"{status} {name} #{medium_index}: "
+                                            f"{status} **#{medium_index} {name}**: "
                                             f"{line_count} lines / "
                                             f"{len(content_str)} chars (⬇ click to view)"
                                         )
@@ -1517,12 +1522,11 @@ class DiscordRenderer:
                                     if add_view_failed and is_medium and tool_id:
                                         for j in range(len(tool_log_lines) - 1, -1, -1):
                                             line = tool_log_lines[j]
-                                            # #187: log line may have `#N`
-                                            # suffix on name; match by
-                                            # `click to view` marker instead.
-                                            if line.startswith(f"{status} {name}") and "click to view" in line:
+                                            # #187/#207: format now `{status} **#N {name}**:`; match on the
+                                            # click-to-view marker instead of name-startswith.
+                                            if f"#{medium_index} {name}" in line and "click to view" in line:
                                                 tool_log_lines[j] = (
-                                                    f"{status} {name}: "
+                                                    f"{status} **#{medium_index} {name}**: "
                                                     f"{len(content_str)} chars "
                                                     f"(view registration failed)"
                                                 )
@@ -1542,9 +1546,9 @@ class DiscordRenderer:
                                     # see a click-to-view promise that
                                     # can't be honored.
                                     for j in range(len(tool_log_lines) - 1, -1, -1):
-                                        # #187: name may have ``#N`` suffix; match on click-to-view marker
-                                        if tool_log_lines[j].startswith(f"{status} {name}") and "click to view" in tool_log_lines[j]:
-                                            tool_log_lines[j] = f"{status} {name} ({len(content_str)} chars; view button unavailable)"
+                                        # #187/#207: match new `**#N {name}**:` format on the marker
+                                        if f"#{medium_index} {name}" in tool_log_lines[j] and "click to view" in tool_log_lines[j]:
+                                            tool_log_lines[j] = f"{status} **#{medium_index} {name}** ({len(content_str)} chars; view button unavailable)"
                                             break
                             elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]

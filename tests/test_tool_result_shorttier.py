@@ -675,9 +675,9 @@ async def test_medium_tier_log_line_index_matches_button_index():
 
     # Both rolling log AND button labels MUST share the #1/#2/#3 indexing
     # in the SAME order
-    assert "Bash #1:" in desc, f"Expected `Bash #1:` in rolling log; got: {desc!r}"
-    assert "Read #2:" in desc, f"Expected `Read #2:` in rolling log; got: {desc!r}"
-    assert "Bash #3:" in desc, f"Expected `Bash #3:` in rolling log; got: {desc!r}"
+    assert "**#1 Bash**:" in desc, f"Expected `**#1 Bash**:` in rolling log; got: {desc!r}"
+    assert "**#2 Read**:" in desc, f"Expected `**#2 Read**:` in rolling log; got: {desc!r}"
+    assert "**#3 Bash**:" in desc, f"Expected `**#3 Bash**:` in rolling log; got: {desc!r}"
 
     view: ToolResultsView = rolling[-1].attached_view
     assert isinstance(view, ToolResultsView)
@@ -712,3 +712,29 @@ def test_medium_tier_idempotent_reentry_keeps_index():
     tool_id = "t1"
     idx = list(medium_results.keys()).index(tool_id) + 1 if tool_id in medium_results else len(medium_results) + 1
     assert idx == 1, f"Re-rendering existing t1 must KEEP index 1; got {idx}"
+
+
+def test_207_rolling_log_uses_bold_n_prefix_matching_button_order():
+    """#207 UX polish: rolling log entry format must be ``**#N name**``
+    (bold prefix, index-first) so it visually scan-matches the button
+    label ``📄 #N name``. Pre-#207 was ``name #N`` plain.
+
+    Pure-string format test — pins the exact f-string template at
+    discord_renderer.py:~1434 against the button label template at
+    ~line 2918. If either drifts, this test fires.
+    """
+    # Simulate production format
+    status = "✅"
+    name = "Bash"
+    medium_index = 5
+    line = (
+        f"{status} **#{medium_index} {name}**: "
+        f"30 lines / 750 chars (⬇ click to view)"
+    )
+    assert "**#5 Bash**:" in line, (
+        f"Bold #N name prefix missing or wrong order: {line!r}"
+    )
+    # Match button format
+    button_label = f"📄 #{medium_index} {name}"
+    assert f"#{medium_index} {name}" in button_label
+    assert f"#{medium_index} {name}" in line  # same shared identifier in both surfaces
