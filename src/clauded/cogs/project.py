@@ -10,7 +10,7 @@ from discord import app_commands
 
 from ..discord_renderer import COLOR_INFO
 from ..project_manager import ProjectManager
-from ._unbound import reject_if_unbound
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
 
 log = logging.getLogger("clauded.bot")
 
@@ -32,15 +32,15 @@ async def project_bind(interaction: discord.Interaction, path: str) -> None:
     log.info("/project bind path=%s channel=%s", path, interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
         await interaction.response.send_message(
-            "Cannot bind: no channel context.", ephemeral=True
+            NO_CHANNEL_MESSAGE, ephemeral=True
         )
         return
 
     try:
-        stored = bot.project_manager.bind(channel_id, path, guild_id=interaction.guild_id)
+        stored = bot.project_manager.bind(binding_id, path, guild_id=interaction.guild_id)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
@@ -55,12 +55,12 @@ async def project_info(interaction: discord.Interaction) -> None:
     log.info("/project info channel=%s", interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
 
-    bound_path = bot.project_manager.get_project(channel_id)
+    bound_path = bot.project_manager.get_project(binding_id)
     if bound_path is None:
         await interaction.response.send_message(
             "This channel is not bound to a project. Use `/project bind` to set one.",
@@ -69,13 +69,13 @@ async def project_info(interaction: discord.Interaction) -> None:
         return
 
     lines = [f"📁 This channel is bound to `{bound_path}`"]
-    sp = bot.project_manager.get_system_prompt(channel_id)
+    sp = bot.project_manager.get_system_prompt(binding_id)
     if sp:
         lines.append(f"📝 System prompt: {sp}")
-    mode = bot.project_manager.get_channel_mode(channel_id)
+    mode = bot.project_manager.get_channel_mode(binding_id)
     if mode != "thread":
         lines.append(f"🔀 Channel mode: `{mode}`")
-    mention_required = bot.project_manager.get_mention_required(channel_id)
+    mention_required = bot.project_manager.get_mention_required(binding_id)
     if mention_required:
         lines.append("💬 Mention: required (default — use `/project set-mention-required false` to opt out)")
     else:
@@ -91,16 +91,16 @@ async def project_unbind(interaction: discord.Interaction) -> None:
     log.info("/project unbind channel=%s", interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
 
-    if bot.project_manager.unbind(channel_id):
+    if bot.project_manager.unbind(binding_id):
         # v1.18 product carry: surface that mention preference survives unbind
         # so users aren't surprised when a rebind silently restores the
         # "responds to all messages" mode (#153 R1 product §4).
-        mention_required = bot.project_manager.get_mention_required(channel_id)
+        mention_required = bot.project_manager.get_mention_required(binding_id)
         message_parts = ["✅ Removed this channel's project binding."]
         if not mention_required:
             message_parts.append(
@@ -127,11 +127,11 @@ class SystemPromptModal(discord.ui.Modal, title="Set System Prompt"):
         required=False,
     )
 
-    def __init__(self, channel_id: int, project_manager: ProjectManager) -> None:
+    def __init__(self, binding_id: int, project_manager: ProjectManager) -> None:
         super().__init__()
-        self._channel_id = channel_id
+        self._channel_id = binding_id
         self._pm = project_manager
-        existing = project_manager.get_system_prompt(channel_id)
+        existing = project_manager.get_system_prompt(binding_id)
         if existing:
             self.prompt_input.default = existing
 
@@ -157,18 +157,18 @@ async def project_system_prompt(interaction: discord.Interaction) -> None:
     log.info("/project system-prompt channel=%s", interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
 
     if await reject_if_unbound(interaction, bot):
         return
 
-    # Threads inherit the parent channel's binding; resolve to parent so the
-    # prompt attaches to the bound row, not the (unbound) thread id.
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    modal = SystemPromptModal(parent_id, bot.project_manager)
+    # Threads inherit the parent channel's binding; resolve_binding_id walks
+    # thread → parent so the prompt attaches to the bound row, not the
+    # (unbound) thread id. See #209 for the helper rationale.
+    modal = SystemPromptModal(binding_id, bot.project_manager)
     await interaction.response.send_modal(modal)
 
 
@@ -178,17 +178,17 @@ async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
     log.info("/project add-dir path=%s channel=%s", path, interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
     if await reject_if_unbound(interaction, bot):
         return
-    # Threads inherit the parent channel's binding; resolve to parent so
-    # the extra dir attaches to the bound row, not the (unbound) thread id.
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    # Threads inherit the parent channel's binding; resolve_binding_id walks
+    # thread → parent so the extra dir attaches to the bound row, not the
+    # (unbound) thread id. See #209.
     try:
-        resolved = bot.project_manager.add_extra_dir(parent_id, path)
+        resolved = bot.project_manager.add_extra_dir(binding_id, path)
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return
@@ -205,11 +205,11 @@ async def project_dirs(interaction: discord.Interaction) -> None:
     log.info("/project dirs channel=%s", interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    dirs = bot.project_manager.get_extra_dirs(channel_id)
+    dirs = bot.project_manager.get_extra_dirs(binding_id)
     if not dirs:
         await interaction.response.send_message("No extra directories configured.", ephemeral=True)
         return
@@ -228,11 +228,11 @@ async def project_remove_dir(interaction: discord.Interaction, path: str) -> Non
     log.info("/project remove-dir path=%s channel=%s", path, interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    removed = bot.project_manager.remove_extra_dir(channel_id, path)
+    removed = bot.project_manager.remove_extra_dir(binding_id, path)
     if removed:
         embed = discord.Embed(
             title="📂 Extra Directory Removed",
@@ -254,11 +254,11 @@ async def project_set_mode(interaction: discord.Interaction, mode: app_commands.
     log.info("/project set-mode mode=%s channel=%s", mode.value, interaction.channel_id)
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
-    channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    bot.project_manager.set_channel_mode(channel_id, mode.value)
+    bot.project_manager.set_channel_mode(binding_id, mode.value)
     await interaction.response.send_message(
         f"✅ Channel mode set to `{mode.value}`", ephemeral=True
     )
@@ -285,17 +285,14 @@ async def project_set_mention_required(
     from ..bot import ClaudedBot
     bot: ClaudedBot = interaction.client  # type: ignore[assignment]
     # Thread invocation → settings live on the parent channel (matches
-    # /project bind, system_prompt, env, etc. sibling patterns).
-    channel = interaction.channel
-    if isinstance(channel, discord.Thread):
-        channel_id = channel.parent_id or interaction.channel_id
-    else:
-        channel_id = interaction.channel_id
-    if channel_id is None:
-        await interaction.response.send_message("No channel context.", ephemeral=True)
+    # /project bind, system_prompt, env, etc. sibling patterns). Use the
+    # shared resolve_binding_id helper for consistency (#209).
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
     try:
-        bot.project_manager.set_mention_required(channel_id, required)
+        bot.project_manager.set_mention_required(binding_id, required)
     except ValueError as exc:
         # _assert_bound rejects unbound channels with ValueError.
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
@@ -377,9 +374,11 @@ async def env_set(interaction: discord.Interaction, key: str, value: str) -> Non
         return
     if await reject_if_unbound(interaction, bot):
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    bot.project_manager.set_env(parent_id, key, value)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    bot.project_manager.set_env(binding_id, key, value)
     embed = discord.Embed(
         title="✅ Environment Variable Set",
         description=f"`{key}` = `{value[:100]}{'…' if len(value) > 100 else ''}`",
@@ -395,9 +394,11 @@ async def env_list(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    env = bot.project_manager.get_env(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    env = bot.project_manager.get_env(binding_id)
     if not env:
         await interaction.response.send_message("No environment variables configured.", ephemeral=True)
         return
@@ -422,9 +423,11 @@ async def env_remove(interaction: discord.Interaction, key: str) -> None:
         return
     if await reject_if_unbound(interaction, bot):
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    if bot.project_manager.remove_env(parent_id, key):
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    if bot.project_manager.remove_env(binding_id, key):
         embed = discord.Embed(
             title="✅ Environment Variable Removed",
             description=f"Removed `{key}`",

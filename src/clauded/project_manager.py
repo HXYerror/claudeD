@@ -64,6 +64,20 @@ class ProjectManager:
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Failed to load %s: %s — starting with empty state", self.path, exc)
             self._projects = {}
+        # #209 operator visibility: report binding entry count so operators
+        # who upgrade from pre-#209 builds know the file may contain
+        # thread.id-keyed rows (silently written by the old buggy cogs).
+        # We don't try to distinguish thread.id from channel.id keys —
+        # Discord ids aren't separable without external state — and we
+        # deliberately do NOT mutate; new writes route through
+        # ``resolve_binding_id`` and land on parent_id, leaving any legacy
+        # thread.id rows as dead data. Users on a polluted row simply re-run
+        # ``/project bind`` in the parent channel.
+        log.info(
+            "#209: loaded %d binding entries; thread.id pollution may exist in "
+            "pre-#209 builds (no mutation; new writes use resolve_binding_id).",
+            len(self._projects),
+        )
 
     def _save(self) -> None:
         os.makedirs(self.data_dir, exist_ok=True)

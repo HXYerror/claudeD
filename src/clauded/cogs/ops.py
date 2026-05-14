@@ -10,7 +10,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ._unbound import reject_if_unbound
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -36,9 +36,11 @@ async def cost_show(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    total, calls = bot.cost_tracker.get_channel_cost(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    total, calls = bot.cost_tracker.get_channel_cost(binding_id)
     embed = discord.Embed(
         title="💰 Channel Cost",
         description=f"**${total:.4f}** across {calls} API call(s)",
@@ -70,9 +72,11 @@ async def cost_reset(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    bot.cost_tracker.reset_channel(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    bot.cost_tracker.reset_channel(binding_id)
     await interaction.response.send_message("\u2705 Channel cost reset.", ephemeral=True)
 
 
@@ -264,9 +268,13 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
     if not isinstance(bot, ClaudedBot):
         await interaction.followup.send("❌ Bot not ready.", ephemeral=True)
         return
-    channel = message.channel
-    channel_id = getattr(channel, "parent_id", channel.id) or channel.id
-    project_path = bot.project_manager.get_path(channel_id)
+    # interaction.channel == message.channel for context menus, so resolve
+    # off the interaction for symmetry with all other cog sites (#209).
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.followup.send(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(binding_id)
     if not project_path:
         await interaction.followup.send("❌ Channel not bound.", ephemeral=True)
         return
@@ -276,10 +284,10 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
     except discord.HTTPException:
         await interaction.followup.send("❌ Failed to create thread.", ephemeral=True)
         return
-    system_prompt = bot.project_manager.get_system_prompt(channel_id)
-    extra_dirs = bot.project_manager.get_extra_dirs(channel_id)
-    mcp_servers = bot.project_manager.get_mcp_servers(channel_id)
-    env_vars = bot.project_manager.get_env(channel_id)
+    system_prompt = bot.project_manager.get_system_prompt(binding_id)
+    extra_dirs = bot.project_manager.get_extra_dirs(binding_id)
+    mcp_servers = bot.project_manager.get_mcp_servers(binding_id)
+    env_vars = bot.project_manager.get_env(binding_id)
     handler = InteractionHandler(thread)
     sc = SessionConfig(
         system_prompt=system_prompt,

@@ -7,7 +7,7 @@ import logging
 import discord
 from discord import app_commands
 
-from ._unbound import reject_if_unbound
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
 from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
@@ -32,12 +32,14 @@ async def mcp_add(
         return
     if await reject_if_unbound(interaction, bot):
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
     config: dict = {"type": "stdio", "command": command}
     if args:
         config["args"] = args.split()
-    bot.project_manager.add_mcp_server(parent_id, name, config)
+    bot.project_manager.add_mcp_server(binding_id, name, config)
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
         description=f"Type: stdio\nCommand: `{command}`" + (f"\nArgs: `{args}`" if args else ""),
@@ -56,10 +58,12 @@ async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> 
         return
     if await reject_if_unbound(interaction, bot):
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
     config: dict = {"type": "http", "url": url}
-    bot.project_manager.add_mcp_server(parent_id, name, config)
+    bot.project_manager.add_mcp_server(binding_id, name, config)
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
         description=f"Type: http\nURL: `{url}`",
@@ -75,9 +79,11 @@ async def mcp_list(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    servers = bot.project_manager.get_mcp_servers(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    servers = bot.project_manager.get_mcp_servers(binding_id)
     if not servers:
         await interaction.response.send_message("No MCP servers configured.", ephemeral=True)
         return
@@ -104,9 +110,11 @@ async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
         return
     if await reject_if_unbound(interaction, bot):
         return
-    channel_id = interaction.channel_id
-    parent_id = getattr(interaction.channel, "parent_id", None) or channel_id
-    if bot.project_manager.remove_mcp_server(parent_id, name):
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    if bot.project_manager.remove_mcp_server(binding_id, name):
         embed = discord.Embed(
             title=f"\u2705 MCP server `{name}` removed",
             color=COLOR_INFO,
