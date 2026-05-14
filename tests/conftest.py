@@ -120,5 +120,12 @@ class FakeTarget:
             msg.attached_view = kwargs["view"]
         if "file" in kwargs:
             msg.attachments = [kwargs["file"]]
+        if "files" in kwargs:
+            # discord.py's Channel.send supports both `file=` (one) and
+            # `files=[...]` (list). Test fixture captures both shapes so
+            # tests asserting attachment count don't false-negative when
+            # production switches between APIs (e.g., #205 table PNGs use
+            # files=[png, md] sidecar pattern).
+            msg.attachments = list(kwargs["files"])
         self._sent.append(msg)
         return msg
