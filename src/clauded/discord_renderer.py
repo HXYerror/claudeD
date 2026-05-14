@@ -620,7 +620,17 @@ class DiscordRenderer:
                                     )
                                     sub_renderer._sub_last_edit = now
                             elif isinstance(block, ThinkingBlock):
-                                thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
+                                # #208: skip empty/whitespace-only payloads.
+                                # SDK can emit placeholder ThinkingBlock with
+                                # `thinking=""` (streaming intermediate, proxy
+                                # strip, models that don't surface reasoning),
+                                # which would render as literal `||||` in
+                                # Discord (the spoiler parser requires non-
+                                # empty content between the markers).
+                                raw = block.thinking or ""
+                                if not raw.strip():
+                                    continue
+                                thinking_text = raw[:3900].replace("||", "\\|\\|")
                                 embed = discord.Embed(
                                     title="💭 Thinking...",
                                     description=f"||{thinking_text}||",
@@ -847,7 +857,12 @@ class DiscordRenderer:
                         continue
                     for block in content:
                         if isinstance(block, ThinkingBlock):
-                            thinking_text = block.thinking[:3900].replace("||", "\\|\\|")
+                            # #208: skip empty/whitespace-only payloads — see
+                            # sub-agent path above for full rationale.
+                            raw = block.thinking or ""
+                            if not raw.strip():
+                                continue
+                            thinking_text = raw[:3900].replace("||", "\\|\\|")
                             embed = discord.Embed(
                                 title="💭 Thinking...",
                                 description=f"||{thinking_text}||",
