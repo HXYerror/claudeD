@@ -393,7 +393,7 @@ async def test_session_info_case_override() -> None:
     body = await _invoke_session_info(bridge)
     assert "haiku" in body
     assert "CLAUDE_MODEL env" not in body
-    assert "SDK default" not in body
+    assert "CLI default" not in body
     assert "unknown" not in body.lower()
 
 
@@ -408,13 +408,18 @@ async def test_session_info_case_env() -> None:
 
 @pytest.mark.asyncio
 async def test_session_info_case_sdk_observed() -> None:
-    """No override, no env, _sdk_model set → ``<value> (SDK default)``."""
+    """No override, no env, _sdk_model set → ``<value> (CLI default)``.
+
+    Label parity with ``/model current`` per #213 R1 syntax review:
+    both surfaces render the same SDK-observed value as ``CLI default``
+    (since the value flows from ~/.claude/settings.json via the SDK).
+    """
     bridge = _bridge_for_case(
         override=None, env_model=None, sdk_model="claude-sonnet-4-5"
     )
     body = await _invoke_session_info(bridge)
     assert "claude-sonnet-4-5" in body
-    assert "SDK default" in body
+    assert "CLI default" in body
 
 
 @pytest.mark.asyncio
@@ -600,3 +605,67 @@ def test_regression_199_r1_no_sdk_loop_still_holds() -> None:
     assert captured["model"] != bridge._sdk_model
     # The #210 strengthening: model is None
     assert captured["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_info_strips_backticks_in_sdk_model_attacker_string() -> None:
+    """R1 security hardening: ``_sdk_model`` flows from
+    ``ResultMessage.model`` which is attacker-influenceable. A malicious
+    proxy returning a model name containing backticks could break the
+    inline code fence in the embed and let downstream markdown leak.
+    Defense-in-depth: strip backticks + cap length before embedding.
+    """
+    # Synthetic attacker model name: contains backticks + is long
+    malicious = "evil`escape`-" + ("x" * 500)
+    bridge = _bridge_for_case(
+        override=None, env_model=None, sdk_model=malicious
+    )
+    body = await _invoke_session_info(bridge)
+    # 1) Backticks inside the value MUST be stripped (replaced by ')
+    # The body still contains the OUTER pair from the f"`{safe_value}`"
+    # template, but the inner attacker-controlled backticks are gone.
+    # Extract just the value between the first ` and the matching `:
+    import re
+    match = re.search(r"Model:\s*`([^`]*)`", body)
+    assert match is not None, f"Expected `Model: \\`...\\`` format; got: {body!r}"
+    rendered_value = match.group(1)
+    assert "`" not in rendered_value, (
+        f"Backticks leaked through inline code fence; got: {rendered_value!r}"
+    )
+    # 2) Length capped (we use [:120])
+    assert len(rendered_value) <= 120
+    # 3) The (CLI default) suffix still renders after the cleaned value
+    assert "(CLI default)" in body
+
+
+@pytest.mark.asyncio
+async def test_model_current_strips_backticks_in_sdk_model_attacker_string() -> None:
+    """Same security hardening on ``/model current``'s sdk-observed branch.
+    Both surfaces share the parity contract from R1 syntax + same
+    attacker-influenceable input."""
+    from clauded.cogs.model import model_current
+    from clauded.bot import ClaudedBot
+
+    malicious = "evil`escape`-" + ("x" * 500)
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bot_spec.session_manager = MagicMock()
+    bridge = MagicMock()
+    bridge._model_override = None
+    bridge._sdk_model = malicious
+    bridge._config = MagicMock(claude_model=None)
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 1
+    interaction.response.send_message = AsyncMock()
+    await model_current.callback(interaction)
+    embed = interaction.response.send_message.await_args.kwargs["embed"]
+    desc = embed.description
+    # Extract value between the inline-code-fence backticks
+    import re
+    match = re.search(r"`([^`]*)`", desc)
+    assert match is not None
+    rendered_value = match.group(1)
+    assert "`" not in rendered_value
+    assert len(rendered_value) <= 120
+    assert "(CLI default)" in desc

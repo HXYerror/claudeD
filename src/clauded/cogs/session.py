@@ -134,7 +134,22 @@ async def session_info(interaction: discord.Interaction) -> None:
         elif source == "env":
             model_display = f"`{value}` (CLAUDE_MODEL env)"
         elif source == "sdk":
-            model_display = f"`{value}` (SDK default)"
+            # #210 R1 syntax: label matches ``/model current`` ("CLI default")
+            # so the same logical value renders identically across both
+            # surfaces. Internals call this tier `sdk_model` because the
+            # value flows from ``ResultMessage.model``, but user-facing
+            # copy says "CLI default" (the value originally came from
+            # ~/.claude/settings.json via the SDK).
+            #
+            # #210 R1 security: ``value`` originates in
+            # ``ResultMessage.model``, which is attacker-influenceable
+            # (a malicious proxy could return backticks or pathological
+            # strings). Strip backticks + cap length before embedding
+            # in the inline code fence to prevent the fence from being
+            # broken open. Risk class is Discord rendering only (no
+            # XSS surface), so this is defense-in-depth.
+            safe_value = str(value).replace("`", "'")[:120]
+            model_display = f"`{safe_value}` (CLI default)"
         else:
             # source == "unset": bridge active but no _sdk_model yet
             model_display = _placeholder
