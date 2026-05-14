@@ -202,7 +202,11 @@ async def model_current(interaction: discord.Interaction) -> None:
         desc = f"`{value}` (CLAUDE_MODEL env)"
     else:
         # source == "sdk" — observed from a ResultMessage post-first-turn.
-        desc = f"`{value}` (CLI default)"
+        # #210 R1 security: ``value`` originates in attacker-influenceable
+        # ``ResultMessage.model``; strip backticks + cap length before
+        # embedding in inline code fence (defense-in-depth).
+        safe_value = str(value).replace("`", "'")[:120]
+        desc = f"`{safe_value}` (CLI default)"
 
     embed = discord.Embed(
         title="🤖 Current Model",

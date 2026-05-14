@@ -119,14 +119,44 @@ async def session_info(interaction: discord.Interaction) -> None:
         bot.session_manager.get_session(thread_id) if thread_id is not None else None
     )
     if bridge is not None and bridge.is_active:
-        # #198: bridge.model and bot.config.claude_model can both be None now
-        # (unset env + no override + pre-first-turn). Fall back to a
-        # human-readable placeholder for display.
-        model = bridge.model or bot.config.claude_model or "(SDK default)"
+        # #210: 4-case dispatch mirroring ``/model current`` (cogs/model.py).
+        # Reuse ``_model_source_for_bridge`` so the rendered model display
+        # accurately reflects which tier the value came from. Sibling-cog
+        # import is safe (no circular: cogs/model.py only imports from
+        # ..discord_renderer).
+        from .model import _model_source_for_bridge
+
+        source, value = _model_source_for_bridge(bridge)
+        _placeholder = "(unknown — send a message to discover)"
+        if source == "override":
+            # User ran /model switch X — show X with no suffix
+            model_display = f"`{value}`"
+        elif source == "env":
+            model_display = f"`{value}` (CLAUDE_MODEL env)"
+        elif source == "sdk":
+            # #210 R1 syntax: label matches ``/model current`` ("CLI default")
+            # so the same logical value renders identically across both
+            # surfaces. Internals call this tier `sdk_model` because the
+            # value flows from ``ResultMessage.model``, but user-facing
+            # copy says "CLI default" (the value originally came from
+            # ~/.claude/settings.json via the SDK).
+            #
+            # #210 R1 security: ``value`` originates in
+            # ``ResultMessage.model``, which is attacker-influenceable
+            # (a malicious proxy could return backticks or pathological
+            # strings). Strip backticks + cap length before embedding
+            # in the inline code fence to prevent the fence from being
+            # broken open. Risk class is Discord rendering only (no
+            # XSS surface), so this is defense-in-depth.
+            safe_value = str(value).replace("`", "'")[:120]
+            model_display = f"`{safe_value}` (CLI default)"
+        else:
+            # source == "unset": bridge active but no _sdk_model yet
+            model_display = _placeholder
         cost_str = f"${bridge.total_cost:.4f}" if bridge.total_cost else "$0.0000"
         lines = [
             f"📡 **Session active** — cwd `{bridge.project_path}`",
-            f"• Model: `{model}`",
+            f"• Model: {model_display}",
             f"• Turns: `{bridge.num_turns}`",
             f"• Total cost: `{cost_str}`",
         ]
@@ -181,9 +211,15 @@ async def session_resume(interaction: discord.Interaction) -> None:
     async with lock:
         await bot.session_manager.stop_session(thread_id)
         handler = InteractionHandler(interaction.channel)
+        # #210: deliberately do NOT read stored.get("model"). Legacy entries
+        # may carry "sonnet" pollution from pre-#199 builds; reinjecting it
+        # would re-force the sonnet override that #198 set out to fix.
+        # Cross-restart ``model_override`` is intentionally ephemeral per
+        # user intent ("没设置就是 claude code 默认的"). The SDK falls back
+        # to ~/.claude/settings.json (CLI default) when model_override is None.
         sc = SessionConfig(
             system_prompt=stored.get("system_prompt"),
-            model_override=stored.get("model"),
+            model_override=None,  # #210: ephemeral; see note above
             on_ask_user=handler.handle_ask_user_question,
             resume_session_id=stored["session_id"],
         )

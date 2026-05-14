@@ -100,15 +100,23 @@ class SessionManager:
         ``bridge.model`` property. The collapsed property includes
         ``_sdk_model`` (what the SDK reported back), and persisting it
         would lock future resumes onto the SDK-observed value even after
-        the user edits ``~/.claude/settings.json``. Persist ``None`` when
-        the user has not switched — resume will then let the SDK pick
-        the CLI default again.
+        the user edits ``~/.claude/settings.json``.
+
+        #210: After the read-side stopped reading ``stored.get("model")``
+        (see ``bot.py`` thread-resume and ``cogs/session.py`` /session
+        resume), the persisted ``model`` field is purely vestigial — it
+        is never consumed. To keep new rows clearly distinguishable from
+        legacy "sonnet"-polluted rows during forensic inspection, we now
+        always write ``model=None`` regardless of the explicit override.
+        ``/model switch`` is intentionally ephemeral per user intent;
+        cross-restart, the user re-runs ``/model switch`` if they want
+        it again.
         """
         bridge = self._sessions.get(thread_id)
         if bridge and bridge.session_id:
             self._session_store.save_session(
                 thread_id, bridge.session_id, bridge.project_path,
-                model=bridge.explicit_model_override,
+                model=None,  # #210: ephemeral; read-side ignores this field
                 system_prompt=bridge.system_prompt,
             )
 
