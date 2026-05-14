@@ -8,6 +8,7 @@ import discord
 from discord import app_commands
 
 from ..discord_renderer import COLOR_INFO
+from ._unbound import NO_CHANNEL_MESSAGE, resolve_binding_id
 
 log = logging.getLogger("clauded.bot")
 
@@ -100,9 +101,9 @@ async def budget_set(interaction: discord.Interaction, amount: float) -> None:
     if amount <= 0:
         await interaction.response.send_message("Budget must be positive.", ephemeral=True)
         return
-    parent_id = getattr(interaction.channel, "parent_id", None)
-    if parent_id is not None:
-        bot.project_manager.set_budget(parent_id, amount)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is not None:
+        bot.project_manager.set_budget(binding_id, amount)
     bridge = await bot._recreate_session(interaction, max_budget_usd=amount)
     if bridge:
         embed = discord.Embed(
@@ -120,8 +121,11 @@ async def budget_show(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
-    budget = bot.project_manager.get_budget(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    budget = bot.project_manager.get_budget(binding_id)
     if budget is not None:
         embed = discord.Embed(
             title="💵 Current Budget",
@@ -144,8 +148,11 @@ async def budget_clear(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    parent_id = getattr(interaction.channel, "parent_id", None) or interaction.channel_id
-    bot.project_manager.clear_budget(parent_id)
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    bot.project_manager.clear_budget(binding_id)
     embed = discord.Embed(
         title="💵 Budget Cleared",
         description="Budget limit removed. Sessions are now unlimited.",

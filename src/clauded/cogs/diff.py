@@ -43,7 +43,7 @@ import discord
 from discord import app_commands
 
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
-from ._unbound import reject_if_unbound
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
 
 log = logging.getLogger("clauded.bot")
 
@@ -107,13 +107,18 @@ async def diff_cmd(interaction: discord.Interaction) -> None:
         return
 
     # Resolve bound path. We already know the channel is bound (reject
-    # above returned False), so get_path won't return None here.
-    channel_id = interaction.channel_id
-    if channel_id is None:
+    # above returned False), so get_path won't return None here. Use
+    # resolve_binding_id so threads correctly inherit the parent's path —
+    # raw interaction.channel_id would be the thread id in threads, which
+    # is never written by /project bind and would self-contradict the
+    # reject_if_unbound check above (#209).
+    binding_id = resolve_binding_id(interaction)
+    if binding_id is None:
         # Defensive — reject_if_unbound already handles None, but the
         # type-checker can't see that.
+        await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    project_path = bot.project_manager.get_path(channel_id)
+    project_path = bot.project_manager.get_path(binding_id)
     if not project_path:
         await interaction.response.send_message(
             "❌ Channel not bound.", ephemeral=True
