@@ -502,8 +502,21 @@ def test_save_session_state_persists_only_explicit_override_no_sdk_loop():
 
 
 def test_save_session_state_persists_user_override_when_set():
-    """Positive case: when user has switched to 'opus', persistence
-    correctly carries that across restart."""
+    """#210 update: ``/model switch`` is intentionally ephemeral.
+
+    Pre-#210 contract: persistence carried the user-explicit override
+    across restart so resume would re-inject it.
+
+    Post-#210 contract: the read side stopped reading ``stored.model``
+    (see ``bot.py`` thread auto-resume and ``cogs/session.py`` /session
+    resume). Persisting the override would therefore be dead weight,
+    and would also blur the line between new rows (clean) and legacy
+    "sonnet"-polluted rows during forensic inspection. New rows now
+    always carry ``model=None`` regardless of whether the user has
+    switched. Users intentionally re-run ``/model switch`` after
+    restart if they want a non-default model — per user decision in
+    DDD ("没设置就是 claude code 默认的").
+    """
     from unittest.mock import MagicMock
     from clauded.session_manager import SessionManager
 
@@ -524,4 +537,6 @@ def test_save_session_state_persists_user_override_when_set():
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(99)
 
-    assert captured["model"] == "opus"
+    # #210: always None — model_override is ephemeral, no cross-restart
+    # persistence even when the user has explicitly switched.
+    assert captured["model"] is None

@@ -716,7 +716,14 @@ class ClaudedBot(commands.Bot):
                     # Check for stored session to resume
                     stored = self.session_manager.get_stored_session(thread_id)
                     resume_id = stored.get("session_id") if stored else None
-                    stored_model = stored.get("model") if stored else None
+                    # #210: deliberately do NOT read stored.get("model").
+                    # Legacy entries may carry "sonnet" pollution from
+                    # pre-#199 builds; reinjecting it would re-force the
+                    # sonnet override that #198 set out to fix. Cross-restart
+                    # ``model_override`` is intentionally ephemeral per user
+                    # intent ("没设置就是 claude code 默认的"). The SDK falls
+                    # back to ~/.claude/settings.json (CLI default) when
+                    # model_override is None.
                     stored_prompt = stored.get("system_prompt") if stored else None
                     extra_dirs = self.project_manager.get_extra_dirs(parent_id)
                     mcp_servers = self.project_manager.get_mcp_servers(parent_id)
@@ -739,7 +746,7 @@ class ClaudedBot(commands.Bot):
                     _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
                     sc = SessionConfig(
                         system_prompt=stored_prompt or system_prompt,
-                        model_override=stored_model,
+                        model_override=None,  # #210: ephemeral; see note above
                         resume_session_id=resume_id,
                         on_ask_user=handler.handle_ask_user_question,
                         on_pre_tool_use=_pre_tool_notify_thread if _notify else None,

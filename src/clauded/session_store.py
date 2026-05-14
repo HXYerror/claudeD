@@ -28,6 +28,22 @@ class SessionStore:
         except (json.JSONDecodeError, OSError):
             log.warning("Failed to load sessions.json, starting fresh")
             self._sessions = {}
+        # #210: count legacy rows with a non-null ``model`` field for
+        # operator visibility. The field is deprecated as of v1.18 — read
+        # paths ignore it and write paths emit None. We do NOT mutate the
+        # file here (forensic preservation); the count naturally shrinks
+        # as old entries are overwritten or expire via the 1h idle GC.
+        legacy_count = sum(
+            1
+            for v in self._sessions.values()
+            if isinstance(v, dict) and v.get("model") is not None
+        )
+        if legacy_count:
+            log.info(
+                "#210: %d legacy stored.model entries ignored "
+                "(deprecated field; not mutating data)",
+                legacy_count,
+            )
 
     def _save(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
