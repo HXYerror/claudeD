@@ -33,12 +33,20 @@ NO_CHANNEL_MESSAGE = "❌ This command must be run in a channel."
 
 
 def resolve_channel_id(interaction: discord.Interaction) -> int | None:
-    """Resolve the channel id used for project/session lookups.
+    """Resolve the channel id used for **session-level state** lookups.
 
     Returns ``None`` for DM channels (explicit or by cache-miss
     fallback) so callers can surface a friendly "must be run in a
     channel" error. Threads resolve to their parent channel so a
     thread inherits its parent's bound state.
+
+    .. seealso::
+
+       :func:`resolve_binding_id` for **project-level state** lookups.
+       The two helpers are intentionally asymmetric: binding state is
+       keyed by parent (threads share their parent's binding), session
+       state is keyed by the thread itself (each thread has its own
+       live SDK client). See #197 / #209 for the bug lineage.
     """
     ch = interaction.channel
     if ch is None or isinstance(ch, discord.DMChannel):
@@ -80,8 +88,11 @@ def resolve_binding_id(interaction: discord.Interaction) -> int | None:
     scoped to the actual thread for per-conversation isolation.
     """
     channel = interaction.channel
-    if channel is None:
-        return interaction.channel_id  # may also be None
+    if channel is None or isinstance(channel, discord.DMChannel):
+        # DM, cache miss, or permission gap — mirror :func:`resolve_channel_id`
+        # so DM callers fail-closed consistently (R1 tester #210 finding:
+        # docstring said "Returns None... DMs" but pre-fix returned channel.id).
+        return None
     parent_id = getattr(channel, "parent_id", None)
     if parent_id is not None:
         return parent_id

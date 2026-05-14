@@ -128,9 +128,10 @@ def test_resolve_binding_id_bare_channel_returns_channel_id() -> None:
     assert resolve_binding_id(interaction) == 444
 
 
-def test_resolve_binding_id_none_channel_returns_channel_id_fallback() -> None:
-    """When ``interaction.channel`` is None (DM / cache miss), falls
-    back to ``interaction.channel_id`` (which itself may be None)."""
+def test_resolve_binding_id_none_channel_both_none_returns_none() -> None:
+    """Boundary: channel=None AND channel_id=None — returns None (fail
+    closed). Note: post-R1, even channel=None with channel_id populated
+    returns None; see test_resolve_binding_id_none_channel_returns_none."""
     interaction = MagicMock(spec=discord.Interaction)
     interaction.channel = None
     interaction.channel_id = None
@@ -138,14 +139,17 @@ def test_resolve_binding_id_none_channel_returns_channel_id_fallback() -> None:
     assert resolve_binding_id(interaction) is None
 
 
-def test_resolve_binding_id_none_channel_with_channel_id_returns_id() -> None:
-    """If channel is None but channel_id is populated (rare cache case),
-    return that id rather than crashing."""
+def test_resolve_binding_id_none_channel_returns_none() -> None:
+    """R1 tester: contract aligned with resolve_channel_id — channel=None
+    (cache miss / DM) returns None to fail-closed for project commands.
+    Was previously returning interaction.channel_id; the new uniform
+    behavior matches the docstring and sibling helper.
+    """
     interaction = MagicMock(spec=discord.Interaction)
     interaction.channel = None
-    interaction.channel_id = 777
+    interaction.channel_id = 777  # populated but should be ignored now
 
-    assert resolve_binding_id(interaction) == 777
+    assert resolve_binding_id(interaction) is None
 
 
 # ---------------------------------------------------------------------------
@@ -281,18 +285,60 @@ def test_no_cog_passes_raw_channel_id_to_project_manager() -> None:
       3. Revert the revert; this test passes again.
     """
     cogs_dir = Path(__file__).resolve().parent.parent / "src" / "clauded" / "cogs"
-    forbidden_pattern = re.compile(
-        r"project_manager\.\w+\(\s*channel_id\b",
-        re.MULTILINE,
+    # R1 architect: strengthened to also catch direct
+    # ``interaction.channel_id`` passes (cheap upgrade short of AST).
+    # Two patterns:
+    #   1. ``project_manager.<m>(channel_id`` — raw local var named channel_id
+    #   2. ``project_manager.<m>(interaction.channel_id`` — inline access
+    # bypass still possible by renaming the local var to anything else;
+    # PRD §Risks documents this as a known fragility, accepted.
+    forbidden_patterns = (
+        re.compile(r"project_manager\.\w+\(\s*channel_id\b", re.MULTILINE),
+        re.compile(r"project_manager\.\w+\(\s*interaction\.channel_id\b", re.MULTILINE),
     )
     violations = []
     for cog_file in cogs_dir.glob("*.py"):
         text = cog_file.read_text()
         for line_no, line in enumerate(text.splitlines(), start=1):
-            if forbidden_pattern.search(line):
-                violations.append(f"{cog_file.name}:{line_no}: {line.strip()}")
+            for pat in forbidden_patterns:
+                if pat.search(line):
+                    violations.append(f"{cog_file.name}:{line_no}: {line.strip()}")
+                    break  # don't double-report
     assert not violations, (
         "Cogs must use resolve_binding_id(interaction) (variable named "
-        "`binding_id`), not raw `channel_id`, when calling "
-        "project_manager.*. Violations:\n" + "\n".join(violations)
+        "`binding_id`), not raw `channel_id` or `interaction.channel_id`, "
+        "when calling project_manager.*. Violations:\n" + "\n".join(violations)
     )
+
+
+def test_resolve_binding_id_returns_none_in_dm():
+    """R1 tester finding: resolve_binding_id must mirror resolve_channel_id's
+    DM contract and return None (not channel.id). Pre-R1 implementation
+    returned channel.id, contradicting its own docstring + risking
+    accidental cross-DM project binding.
+    """
+    import discord
+    from clauded.cogs._unbound import resolve_binding_id
+
+    interaction = MagicMock(spec=discord.Interaction)
+    interaction.channel = MagicMock(spec=discord.DMChannel)
+    interaction.channel_id = 12345
+    assert resolve_binding_id(interaction) is None, (
+        "DMChannel must return None to fail-closed for project commands; "
+        "matches resolve_channel_id contract."
+    )
+
+
+def test_audit_grep_catches_inline_interaction_channel_id_pattern():
+    """R1 architect finding: audit grep strengthened to also reject
+    `project_manager.<m>(interaction.channel_id, ...)` not just raw
+    `channel_id` local var. This test ensures the regex compiles and
+    matches the intended pattern (smoke test for the lint itself)."""
+    import re
+    pat = re.compile(r"project_manager\.\w+\(\s*interaction\.channel_id\b")
+    # Positive match
+    bad = "bot.project_manager.bind(interaction.channel_id, path)"
+    assert pat.search(bad) is not None
+    # Negative: resolved var name OK
+    good = "bot.project_manager.bind(binding_id, path)"
+    assert pat.search(good) is None
