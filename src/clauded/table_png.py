@@ -263,13 +263,17 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
     draw.rectangle((PAD, y, PAD + total_w, y + HEAD_H), fill=HEAD_BG)
     x = PAD
     for ci, h in enumerate(fmt_headers):
-        draw.text((x + CELL_X, y + CELL_Y - 2), h, fill=HEAD_TEXT, font=font_head)
+        # R1 simplicity: previously hardcoded `-2` offset and `width=1`
+        # line stroke didn't scale at 2x → hairline-thin on Retina.
+        # Derive both from SCALE so all visual elements share the same
+        # 2x density.
+        draw.text((x + CELL_X, y + CELL_Y - 2 * SCALE), h, fill=HEAD_TEXT, font=font_head)
         x += col_w[ci]
         if ci < ncols - 1:
-            draw.line((x, y, x, y + HEAD_H), fill=LINE, width=1)
+            draw.line((x, y, x, y + HEAD_H), fill=LINE, width=1 * SCALE)
     y += HEAD_H
     # Accent under the header.
-    draw.line((PAD, y, PAD + total_w, y), fill=ACCENT, width=2)
+    draw.line((PAD, y, PAD + total_w, y), fill=ACCENT, width=2 * SCALE)
 
     # --- Data rows -----------------------------------------------------
     for ri, r in enumerate(fmt_rows):
@@ -281,7 +285,7 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
             if cell:
                 # multiline_text handles single-line strings too.
                 draw.multiline_text(
-                    (x + CELL_X, y + CELL_Y - 2),
+                    (x + CELL_X, y + CELL_Y - 2 * SCALE),
                     cell,
                     fill=TEXT,
                     font=font_body,
@@ -289,7 +293,7 @@ def render_table_png(headers: list[str], rows: list[list[str]]) -> bytes:
                 )
             x += col_w[ci]
             if ci < ncols - 1:
-                draw.line((x, y, x, y + rh), fill=LINE, width=1)
+                draw.line((x, y, x, y + rh), fill=LINE, width=1 * SCALE)
         y += rh
 
     buf = io.BytesIO()
