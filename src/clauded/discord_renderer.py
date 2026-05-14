@@ -2022,7 +2022,19 @@ class DiscordRenderer:
                         "\n" + render.markdown_source + "\n",
                         1,
                     )
-                summary = upload_buffer[:200] + "..." if len(upload_buffer) > 200 else upload_buffer
+                # #205 fix: summary used to be ``upload_buffer[:200]``,
+                # which would include the raw markdown table if the
+                # table happened to be near the start — producing the
+                # "table renders twice (markdown + PNG)" prod bug.
+                # Replace with a plain caption so the inline message
+                # carries no table content; PNG follow-up provides the
+                # visual, .md attachment provides the full text.
+                line_count = upload_buffer.count("\n") + 1
+                char_count = len(upload_buffer)
+                summary = (
+                    f"📎 **Long response** — {line_count} lines / "
+                    f"{char_count} chars uploaded (see attached .md)."
+                )
                 f = discord.File(_io.BytesIO(upload_buffer.encode()), filename="claude-response.md")
                 await self._safe_send(content=summary, file=f)
                 # Still send the PNG follow-ups so chat carries the visuals.
