@@ -21,7 +21,12 @@ import logging
 import discord
 from discord import app_commands
 
-from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE, COLOR_TOOL_SUCCESS
+from ..discord_renderer import (
+    COLOR_INFO,
+    COLOR_TOOL_FAILURE,
+    COLOR_TOOL_SUCCESS,
+    MODE_EMOJI,
+)
 
 log = logging.getLogger("clauded.bot")
 
@@ -37,15 +42,10 @@ _CYCLE_ORDER: list[str] = [
 
 
 # Emoji mapping for the footer + display surfaces. ``default`` is
-# deliberately absent — when the effective mode is ``default`` the
-# footer second line is omitted entirely (PRD §Design "Footer"). Keep
-# this dict centralized so the renderer + /health + /session info all
-# share the same source of truth.
-MODE_EMOJI: dict[str, str] = {
-    "acceptEdits": "✏️",
-    "plan": "🔒",
-    "bypassPermissions": "⚡",
-}
+# MODE_EMOJI is imported from `..discord_renderer` (#211 R1 architect:
+# relocated there to break a cyclic import — the renderer's cost-footer
+# code is the primary consumer; this cog imports it back for
+# /mode current + /health + /session info displays).
 
 
 def _next_mode(current: str) -> str:
@@ -88,26 +88,61 @@ def _mode_source_for_bridge(bridge) -> tuple[str, str]:
 
 
 def _format_mode_display(mode: str, source: str) -> str:
-    """Render ``{emoji} {mode} (source: ...)`` for embed bodies.
+    """Render ``{emoji} {mode} (source: ...) — persisted/...`` for embed bodies.
 
     Used by ``/mode current``, ``/health``, and ``/session info`` so
     every surface labels the active mode identically. ``default`` shows
     no emoji prefix; the other three modes get their ``MODE_EMOJI``
     glyph.
+
+    Source → lifetime label (#211 R1 architect):
+      - ``override`` → “persisted” (survives bot restart, PRD §Decision #4)
+      - ``env``      → “env-pinned” (CLAUDED_PERMISSION_MODE env)
+      - ``default``  → “CLI default”
+    Surfacing the lifetime is the user-visible fix for the
+    /mode-persistent vs /model-ephemeral dichotomy.
     """
     emoji = MODE_EMOJI.get(mode, "")
     label = f"{emoji} `{mode}`".strip() if emoji else f"`{mode}`"
-    return f"{label} (source: {source})"
+    lifetime = {
+        "override": "persisted",
+        "env": "env-pinned",
+        "default": "CLI default",
+    }.get(source, source)
+    return f"{label} (source: {source} — {lifetime})"
 
 
 mode_group = app_commands.Group(
     name="mode",
     description="View / switch Claude permission mode for this thread",
+    # #211 R1 security HIGH (PR #221): /mode set bypassPermissions auto-
+    # approves all SDK tool calls + persists across restart. Gate write
+    # subcommands to admin-default; `/mode current` is read-only and
+    # stays open. Defense-in-depth re-check at each callback (Discord
+    # default_permissions is admin-reassignable in the server UI; the
+    # callback check defends against role overrides). Pattern matches
+    # `ops.unbound_fallback_toggle` (the closest precedent).
 )
+
+
+def _require_admin(interaction: discord.Interaction) -> bool:
+    """Defense-in-depth admin check for write-side /mode subcommands.
+
+    Returns True if caller is administrator; otherwise emits an
+    ephemeral refusal and returns False (caller should return early).
+    Mirror of the per-callback re-check in ``ops.unbound_fallback_toggle``
+    (#211 R1 security #1).
+    """
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is not None and perms.administrator:
+        return True
+    return False
 
 
 @mode_group.command(name="set", description="Set Claude permission mode for this thread")
 @app_commands.describe(mode="Mode: default / acceptEdits / plan / bypassPermissions")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
 @app_commands.choices(mode=[
     app_commands.Choice(name="default", value="default"),
     app_commands.Choice(name="acceptEdits ✏️", value="acceptEdits"),
@@ -123,6 +158,16 @@ async def mode_set(
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    # #211 R1 security HIGH: defense-in-depth admin re-check (Discord
+    # default_permissions can be UI-overridden per role; the callback
+    # check guarantees a privilege-elevating action requires admin
+    # regardless of UI policy).
+    if not _require_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Administrator permission required to change permission mode.",
+            ephemeral=True,
+        )
+        return
     thread_id = getattr(interaction.channel, "id", None)
     bridge = (
         bot.session_manager.get_session(thread_id) if thread_id is not None else None
@@ -135,6 +180,13 @@ async def mode_set(
         )
         return
 
+    # #211 R1 security HIGH: privilege-elevation audit trail.
+    # Every permission_mode write is forensic-worthy; log WARNING with
+    # WHO/WHERE/WHAT-CHANGED so operators can reconstruct who relaxed
+    # tool permissions when. Matches `ops.unbound_fallback_toggle`
+    # precedent.
+    member = interaction.user
+    previous_mode = getattr(bridge, "effective_permission_mode", "default")
     try:
         await bridge.set_permission_mode(mode.value)
     except Exception as exc:
@@ -148,6 +200,12 @@ async def mode_set(
             ephemeral=True,
         )
         return
+    log.warning(
+        "SECURITY: /mode set permission_mode %s -> %s by user=%s(id=%s) guild=%s channel=%s thread=%s",
+        previous_mode, mode.value,
+        getattr(member, "name", "?"), getattr(member, "id", "?"),
+        interaction.guild_id, interaction.channel_id, thread_id,
+    )
 
     # Persist immediately so a bot restart between this turn and the
     # next one preserves the user's choice (PRD user decision #4).
@@ -160,7 +218,11 @@ async def mode_set(
     title = f"{emoji} Permission mode: `{mode.value}`".strip()
     embed = discord.Embed(
         title=title,
-        description=f"Mode set to **{mode.value}**. The next tool call will respect it.",
+        description=(
+            f"Mode set to **{mode.value}**. The next tool call will respect it.\n\n"
+            "-# 💾 **Persisted** — survives bot restart. (Contrast with "
+            "`/model switch` which is per-session.) Use `/mode set default` to clear."
+        ),
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -170,12 +232,21 @@ async def mode_set(
     name="cycle",
     description="Advance to the next permission mode in the fixed cycle order",
 )
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
 async def mode_cycle(interaction: discord.Interaction) -> None:
     from ..bot import ClaudedBot
 
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    # #211 R1 security HIGH: defense-in-depth admin re-check.
+    if not _require_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Administrator permission required to cycle permission mode.",
+            ephemeral=True,
+        )
         return
     thread_id = getattr(interaction.channel, "id", None)
     bridge = (
@@ -194,6 +265,7 @@ async def mode_cycle(interaction: discord.Interaction) -> None:
     # back to ``acceptEdits`` (the would-be successor of ``default``).
     current = getattr(bridge, "effective_permission_mode", "default") or "default"
     new_mode = _next_mode(current)
+    member = interaction.user
     try:
         await bridge.set_permission_mode(new_mode)
     except Exception as exc:
@@ -207,6 +279,12 @@ async def mode_cycle(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+    log.warning(
+        "SECURITY: /mode cycle permission_mode %s -> %s by user=%s(id=%s) guild=%s channel=%s thread=%s",
+        current, new_mode,
+        getattr(member, "name", "?"), getattr(member, "id", "?"),
+        interaction.guild_id, interaction.channel_id, thread_id,
+    )
 
     try:
         bot.session_manager.save_session_state(thread_id)
@@ -217,7 +295,10 @@ async def mode_cycle(interaction: discord.Interaction) -> None:
     title = f"{emoji} Permission mode: `{new_mode}`".strip()
     embed = discord.Embed(
         title=title,
-        description=f"Cycled `{current}` → **{new_mode}**.",
+        description=(
+            f"Cycled `{current}` → **{new_mode}**.\n\n"
+            "-# 💾 **Persisted** — survives bot restart."
+        ),
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

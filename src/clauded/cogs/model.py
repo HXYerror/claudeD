@@ -100,7 +100,11 @@ async def model_switch(interaction: discord.Interaction, name: str) -> None:
         await interaction.followup.send(
             embed=discord.Embed(
                 title=f"🔄 Switched to `{name}`",
-                description="⚠️ Previous conversation context was reset.",
+                description=(
+                    "⚠️ Previous conversation context was reset.\n\n"
+                    "-# ⏱️ **Per-session** — bot restart returns to your CLI "
+                    "default. (Contrast with `/mode set` which persists.)"
+                ),
                 color=COLOR_INFO,
             )
         )

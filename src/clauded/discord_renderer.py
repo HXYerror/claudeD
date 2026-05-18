@@ -179,6 +179,17 @@ COLOR_THINKING = 0x6B7280      # Gray — thinking
 # we can append a cursor or close-and-reopen a code fence safely.
 DISCORD_MAX_LEN = 1900
 
+# #211 R1 architect: relocated from cogs/mode.py to break a real cyclic
+# import (cogs/mode.py imports COLOR_INFO from this module; the renderer
+# previously did a lazy ``from .cogs.mode import MODE_EMOJI`` to paper
+# over the cycle). MODE_EMOJI is a rendering concern — it lives here.
+# cogs/mode.py imports it back for /mode current + /health + /session info.
+MODE_EMOJI: dict[str, str] = {
+    "acceptEdits": "✏️",
+    "plan": "🔒",
+    "bypassPermissions": "⚡",
+}
+
 # Single-character cursor appended to the in-flight typewriter message.
 CURSOR = "▌"
 
@@ -1639,11 +1650,10 @@ class DiscordRenderer:
                 # implicit ``"default"`` (PRD §Design "Footer"). Pulling
                 # ``bridge.effective_permission_mode`` here collapses
                 # override / env / default into one string we just compare.
-                # Imported lazily to keep the module-level dependency graph
-                # symmetric (renderer ↔ cogs.mode would otherwise import
-                # each other transitively through bot.py).
+                # MODE_EMOJI lives at module scope of this file (#211 R1
+                # architect relocation — breaks the previous lazy import
+                # cycle with cogs/mode.py).
                 try:
-                    from .cogs.mode import MODE_EMOJI
                     effective_mode = getattr(
                         bridge, "effective_permission_mode", "default"
                     )

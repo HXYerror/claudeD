@@ -888,3 +888,206 @@ async def test_session_info_displays_permission_mode() -> None:
     assert "Mode:" in body
     assert "acceptEdits" in body
     assert "env" in body
+
+
+# ---------------------------------------------------------------------------
+# R1 architect — persistence-dichotomy user-visible labels (PR #221 R1)
+# ---------------------------------------------------------------------------
+
+
+def test_format_mode_display_includes_persisted_lifetime_for_override():
+    """R1 architect important #1: `/mode current` source label must
+    surface the persistence semantic so users don't experience the
+    /mode-persistent vs /model-ephemeral asymmetry as a bug."""
+    from clauded.cogs.mode import _format_mode_display
+    out = _format_mode_display("plan", "override")
+    assert "persisted" in out, (
+        f"override source should be labeled 'persisted'; got: {out!r}"
+    )
+    # Mode + emoji + source all present
+    assert "plan" in out
+    assert "🔒" in out
+
+
+def test_format_mode_display_includes_env_pinned_for_env():
+    from clauded.cogs.mode import _format_mode_display
+    out = _format_mode_display("acceptEdits", "env")
+    assert "env-pinned" in out, (
+        f"env source should be labeled 'env-pinned'; got: {out!r}"
+    )
+
+
+def test_format_mode_display_includes_cli_default_for_default():
+    from clauded.cogs.mode import _format_mode_display
+    out = _format_mode_display("default", "default")
+    assert "CLI default" in out, (
+        f"default source should be labeled 'CLI default'; got: {out!r}"
+    )
+
+
+def test_mode_emoji_imports_cleanly_from_discord_renderer():
+    """R1 architect important #2: cyclic import resolved. MODE_EMOJI
+    lives in `discord_renderer.py` (rendering concern); `cogs/mode.py`
+    imports it back without a lazy fallback. Pin the import shape
+    against accidental re-introduction of the cycle."""
+    # Both sides reference the SAME dict object (no aliasing surprise).
+    from clauded.discord_renderer import MODE_EMOJI as renderer_emoji
+    from clauded.cogs.mode import MODE_EMOJI as cog_emoji
+    assert renderer_emoji is cog_emoji
+    # Exactly 3 entries, default deliberately excluded
+    assert set(renderer_emoji.keys()) == {"acceptEdits", "plan", "bypassPermissions"}
+
+
+# ---------------------------------------------------------------------------
+# R1 security HIGH — admin gate + audit log (PR #221 R1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mode_set_refuses_non_admin_caller():
+    """R1 security HIGH: /mode set must refuse callers without
+    administrator permission. Before the fix, any guild member could
+    `/mode set bypassPermissions` and persist the elevation across
+    bot restart.
+    """
+    from clauded.cogs.mode import mode_set
+    from clauded.bot import ClaudedBot
+    from unittest.mock import MagicMock, AsyncMock
+    import discord
+
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock()  # never reached
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 1
+    # Non-admin caller: guild_permissions.administrator = False
+    interaction.user.guild_permissions = MagicMock(administrator=False)
+    interaction.response.send_message = AsyncMock()
+
+    choice = discord.app_commands.Choice(name="bypassPermissions", value="bypassPermissions")
+    await mode_set.callback(interaction, choice)
+
+    # Refusal must be the FIRST send_message call
+    interaction.response.send_message.assert_awaited()
+    call = interaction.response.send_message.await_args
+    msg = call.args[0] if call.args else call.kwargs.get("content", "")
+    assert "Administrator" in msg or "admin" in msg.lower(), (
+        f"Expected admin-required refusal; got: {msg!r}"
+    )
+    # Crucially: the bridge lookup was NOT reached (no privilege escalation
+    # before the gate)
+    bot_spec.session_manager.get_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mode_cycle_refuses_non_admin_caller():
+    """R1 security HIGH: /mode cycle has same admin gate."""
+    from clauded.cogs.mode import mode_cycle
+    from clauded.bot import ClaudedBot
+    from unittest.mock import MagicMock, AsyncMock
+
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock()
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 1
+    interaction.user.guild_permissions = MagicMock(administrator=False)
+    interaction.response.send_message = AsyncMock()
+
+    await mode_cycle.callback(interaction)
+
+    interaction.response.send_message.assert_awaited()
+    call = interaction.response.send_message.await_args
+    msg = call.args[0] if call.args else call.kwargs.get("content", "")
+    assert "Administrator" in msg or "admin" in msg.lower()
+    bot_spec.session_manager.get_session.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mode_current_allows_non_admin_read():
+    """/mode current is read-only — non-admin should still be able to
+    see the current mode. Mirror of /health visibility."""
+    from clauded.cogs.mode import mode_current
+    from clauded.bot import ClaudedBot
+    from unittest.mock import MagicMock, AsyncMock
+
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bot_spec.session_manager = MagicMock()
+    bridge = MagicMock()
+    bridge._permission_mode_override = "plan"
+    bridge._config = MagicMock(claude_permission_mode="default")
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 1
+    interaction.user.guild_permissions = MagicMock(administrator=False)
+    interaction.response.send_message = AsyncMock()
+
+    await mode_current.callback(interaction)
+
+    interaction.response.send_message.assert_awaited()
+    # Should NOT be the "Administrator required" refusal
+    call = interaction.response.send_message.await_args
+    if call.args:
+        content_str = str(call.args[0])
+    else:
+        content_str = call.kwargs.get("content", "")
+        embed = call.kwargs.get("embed")
+        if embed is not None:
+            content_str += str(getattr(embed, "title", ""))
+            content_str += str(getattr(embed, "description", ""))
+    assert "Administrator" not in content_str, (
+        f"/mode current must NOT gate on admin (it's read-only); got: {content_str!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mode_set_emits_security_audit_log(caplog):
+    """R1 security HIGH: every successful permission_mode write logs
+    WARNING with WHO/WHERE/WHAT-CHANGED for forensic reconstruction.
+    Matches ops.unbound_fallback_toggle precedent.
+    """
+    import logging
+    from clauded.cogs.mode import mode_set
+    from clauded.bot import ClaudedBot
+    from unittest.mock import MagicMock, AsyncMock
+    import discord
+
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bridge = MagicMock()
+    bridge.is_active = True
+    bridge.effective_permission_mode = "default"
+    bridge.set_permission_mode = AsyncMock()
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    bot_spec.session_manager.save_session_state = MagicMock()
+
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 42
+    interaction.guild_id = 99
+    interaction.channel_id = 42
+    interaction.user.guild_permissions = MagicMock(administrator=True)
+    interaction.user.name = "test_admin"
+    interaction.user.id = 1234
+    interaction.response.send_message = AsyncMock()
+
+    choice = discord.app_commands.Choice(name="bypassPermissions", value="bypassPermissions")
+    caplog.set_level(logging.WARNING, logger="clauded.cogs.mode")
+    await mode_set.callback(interaction, choice)
+
+    # Find the SECURITY: audit log
+    audit = [r for r in caplog.records if "SECURITY:" in r.getMessage() and "permission_mode" in r.getMessage()]
+    assert audit, f"No SECURITY: audit log emitted; records: {[r.getMessage() for r in caplog.records]}"
+    log_msg = audit[0].getMessage()
+    # WHO
+    assert "test_admin" in log_msg
+    assert "1234" in log_msg
+    # WHERE
+    assert "99" in log_msg  # guild
+    assert "42" in log_msg  # channel
+    # WHAT-CHANGED
+    assert "default" in log_msg
+    assert "bypassPermissions" in log_msg
