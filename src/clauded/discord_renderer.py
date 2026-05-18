@@ -1413,6 +1413,21 @@ class DiscordRenderer:
                                     "WebFetch": "🌐",
                                 }
                                 alias = tool_marker_aliases.get(name, "")
+                                # #226: pre-loop defaults so the no-match
+                                # path (rolling-log eviction past the
+                                # last-15 window / ToolResultBlock arrives
+                                # before its ToolUseBlock) doesn't crash
+                                # the renderer with UnboundLocalError.
+                                # Downstream guards (`if is_medium and
+                                # not is_err and tool_id:` etc.) all gate
+                                # on `is_medium`; with the False default,
+                                # those branches skip cleanly and the
+                                # event is a safe no-op (correct since
+                                # there's no rolling-log line to update).
+                                is_medium = False
+                                content_str = ""
+                                medium_index: int | None = None
+                                matched = False  # for the diagnostic log below
                                 for i in range(len(tool_log_lines) - 1, -1, -1):
                                     line = tool_log_lines[i]
                                     if not line.startswith("🔄 "):
@@ -1459,6 +1474,7 @@ class DiscordRenderer:
                                     if is_err:
                                         error_text = content_str[:100] if content_str else "Failed"
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
+                                        matched = True
                                     elif is_short:
                                         # Strip backticks to avoid breaking the
                                         # rolling-log embed's markdown. Collapse
@@ -1470,6 +1486,7 @@ class DiscordRenderer:
                                             .replace("\n", " │ ")
                                         )
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
+                                        matched = True
                                     elif is_medium:
                                         # Rolling log shows summary + the
                                         # same ``#N`` index that the button
@@ -1498,9 +1515,24 @@ class DiscordRenderer:
                                             f"{line_count} lines / "
                                             f"{len(content_str)} chars (⬇ click to view)"
                                         )
+                                        matched = True
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
+                                        matched = True
                                     break
+                                if not matched:
+                                    # #226: rolling-log line for this tool
+                                    # was evicted (kept only last 15) or
+                                    # the event arrived out of order.
+                                    # Logged for #223 / #224 diagnostic
+                                    # epic; downstream guards on `is_medium
+                                    # = False` make this a safe no-op.
+                                    log.warning(
+                                        "ToolResultBlock no-matched rolling-log line; "
+                                        "tool_id=%s name=%s alias=%r rolling_log_len=%d "
+                                        "(likely rolling-log eviction or out-of-order event)",
+                                        tool_id, name, alias, len(tool_log_lines),
+                                    )
                                 has_errors = any("❌" in l for l in tool_log_lines)
                                 tool_embed = discord.Embed(
                                     title="🔧 Tool Activity",
