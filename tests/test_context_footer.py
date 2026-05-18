@@ -55,8 +55,14 @@ def test_format_context_sub_1_percent_floor():
     assert _format_context_segment({"context_percentage": 0.99}) == " │ 🧠 <1%"
     # 0% exact stays as 0% (haven't started the session)
     assert _format_context_segment({"context_percentage": 0}) == " │ 🧠 0%"
-    # 1.0% rounds to 1%
-    assert _format_context_segment({"context_percentage": 1.0}) == " │ 🧠 1%"
+    # #v1.18 precision tier: 1–10% range uses 1-decimal precision so
+    # users see movement (was `🧠 1%` flat regardless of 1.0 vs 9.9).
+    assert _format_context_segment({"context_percentage": 1.0}) == " │ 🧠 1.0%"
+    assert _format_context_segment({"context_percentage": 2.8}) == " │ 🧠 2.8%"
+    assert _format_context_segment({"context_percentage": 9.9}) == " │ 🧠 9.9%"
+    # >= 10% reverts to int (precision adds no value at scale).
+    assert _format_context_segment({"context_percentage": 10.0}) == " │ 🧠 10%"
+    assert _format_context_segment({"context_percentage": 73.4}) == " │ 🧠 73%"
 
 
 def test_format_context_shape():
@@ -95,10 +101,14 @@ async def test_footer_includes_context_segment_e2e():
     ]
     target = FakeTarget()
     renderer = DiscordRenderer(target)
-    # Realistic ContextUsageResponse shape from SDK 0.1.80
+    # Realistic ContextUsageResponse shape from SDK 0.1.80.
+    # #v1.18: footer now computes pct from totalTokens/maxTokens for
+    # precision (SDK's ``percentage`` is int-rounded; 0.0-0.5% shows as
+    # 0 even when real ratio is non-zero). Numbers chosen so the
+    # self-computed ratio is exactly 73.0% (146k/200k).
     ctx_response = {
-        "percentage": 73.4,
-        "totalTokens": 145000,
+        "percentage": 73,  # SDK-rounded int (now ignored by helper)
+        "totalTokens": 146000,
         "maxTokens": 200000,
         "rawMaxTokens": 200000,
         "model": "claude-sonnet-4-5",
@@ -108,7 +118,7 @@ async def test_footer_includes_context_segment_e2e():
 
     # Collect all message content
     all_content = " ".join(m.content for m in target._sent if m.content)
-    # The footer should contain 🧠 73%
+    # The footer should contain 🧠 73% (146000/200000 = 73.0%, int-tier)
     assert "🧠 73%" in all_content, (
         f"Expected '🧠 73%' in footer; got: {all_content!r}"
     )

@@ -254,3 +254,80 @@ async def test_integration_footer_renders_sub_one_percent():
     assert "🧠 <1%" in all_content, (
         f"Sub-1% must render `<1%`, got: {all_content!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v1.18 precision: use totalTokens / maxTokens, not SDK's int-rounded percentage
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_v118_precision_self_computes_from_total_and_max():
+    """SDK ``percentage`` is int-rounded (28192/1000000 ≈ 2.82% → 3 or 0).
+    Helper now computes ``totalTokens / maxTokens`` itself for precision.
+    """
+    from clauded.discord_renderer import _fetch_context_pct_settled
+
+    class FakeBridge:
+        async def get_context_usage(self):
+            return {
+                "percentage": 3,   # SDK int-rounded (would lose precision)
+                "totalTokens": 28192,
+                "maxTokens": 1000000,
+            }
+
+    pct = await _fetch_context_pct_settled(FakeBridge(), settle_delay=0.0)
+    # 28192 / 1000000 * 100 = 2.8192 (not the SDK's int 3)
+    assert pct is not None
+    assert 2.8 <= pct <= 2.9, f"expected ~2.82%, got {pct}"
+
+
+@pytest.mark.asyncio
+async def test_v118_precision_falls_back_to_sdk_percentage_when_total_missing():
+    """If totalTokens/maxTokens absent, fall back to SDK's ``percentage`` field."""
+    from clauded.discord_renderer import _fetch_context_pct_settled
+
+    class FakeBridge:
+        async def get_context_usage(self):
+            return {"percentage": 47}  # only the legacy field
+
+    pct = await _fetch_context_pct_settled(FakeBridge(), settle_delay=0.0)
+    assert pct == 47.0
+
+
+@pytest.mark.asyncio
+async def test_v118_precision_handles_zero_max_tokens_gracefully():
+    """Defensive: maxTokens=0 → fall back to legacy percentage field."""
+    from clauded.discord_renderer import _fetch_context_pct_settled
+
+    class FakeBridge:
+        async def get_context_usage(self):
+            return {"percentage": 50, "totalTokens": 100, "maxTokens": 0}
+
+    pct = await _fetch_context_pct_settled(FakeBridge(), settle_delay=0.0)
+    # 0 maxTokens triggers the fallback path
+    assert pct == 50.0
+
+
+@pytest.mark.asyncio
+async def test_v118_user_reported_28k_in_1m_window_no_longer_zero():
+    """User-reported scenario (5/18): conversation at 28k tokens in 1M
+    Opus context window. Pre-fix SDK rounded to 0 → footer showed 🧠 0%
+    forever. Post-fix: 2.8% precision."""
+    from clauded.discord_renderer import _fetch_context_pct_settled, _format_context_segment
+
+    class OpusBridge:
+        async def get_context_usage(self):
+            return {
+                "percentage": 0,  # SDK rounded 28192/1000000 down
+                "totalTokens": 28192,
+                "maxTokens": 1000000,
+            }
+
+    pct = await _fetch_context_pct_settled(OpusBridge(), settle_delay=0.0)
+    assert pct is not None and pct > 0, (
+        f"#v1.18: 28k/1M must NOT round to 0; got {pct}"
+    )
+    # Threshold tier renders with 1-decimal precision in 1-10% range
+    seg = _format_context_segment({"context_percentage": pct})
+    assert seg == " │ 🧠 2.8%", f"expected ' │ 🧠 2.8%', got {seg!r}"
