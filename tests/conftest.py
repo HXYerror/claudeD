@@ -146,10 +146,15 @@ import pytest
 def _zero_context_settle_delay(monkeypatch):
     """Auto-zero the #220 footer settle delay across all tests.
 
-    The helper's defaults (0.5s + 0.5s retry) are correct for production
-    but make the test suite slow. Tests that specifically exercise the
-    timing behavior can re-patch by calling the helper directly with
-    explicit kwargs (see `tests/test_footer_context_race.py`).
+    The helper's default (0.5s) is correct for production but makes the
+    test suite slow. Tests that specifically exercise the timing behavior
+    can re-patch via direct ``monkeypatch`` or by calling the helper
+    directly (see `tests/test_footer_context_race.py`).
+
+    R1 simplicity fix: this fixture HARD-OVERWRITES the delay to 0.0;
+    it does NOT accept a caller-supplied ``settle_delay`` and silently
+    discard it (the previous wrapper shape misled future debuggers).
+    Tests that need a non-zero delay must `monkeypatch.setattr` again.
     """
     try:
         import clauded.discord_renderer as _renderer_mod
@@ -159,9 +164,11 @@ def _zero_context_settle_delay(monkeypatch):
         return
     real_helper = _renderer_mod._fetch_context_pct_settled
 
-    async def _fast_helper(bridge, *, initial_delay=0.5, retry_delay=0.5, log_label="footer"):
+    async def _zero_delay_helper(bridge, *, log_label="footer", **_ignored):
+        # _ignored swallows any settle_delay kwarg callers may pass.
+        # We deliberately force settle_delay=0.0 — see docstring.
         return await real_helper(
-            bridge, initial_delay=0.0, retry_delay=0.0, log_label=log_label
+            bridge, settle_delay=0.0, log_label=log_label
         )
 
-    monkeypatch.setattr(_renderer_mod, "_fetch_context_pct_settled", _fast_helper)
+    monkeypatch.setattr(_renderer_mod, "_fetch_context_pct_settled", _zero_delay_helper)

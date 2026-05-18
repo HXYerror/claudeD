@@ -2,7 +2,7 @@
 by ~hundreds of ms, so `get_context_usage()` called immediately returns
 percentage=0. Fix: settle delay + retry-on-0 via `_fetch_context_pct_settled`.
 
-Tests pass `initial_delay=0.0, retry_delay=0.0` to skip actual sleep.
+Tests pass `settle_delay=0.0` to skip actual sleep.
 """
 import pytest
 from unittest.mock import MagicMock, AsyncMock
@@ -21,7 +21,7 @@ async def test_returns_first_call_value_when_above_zero():
     bridge = MagicMock()
     bridge.get_context_usage = AsyncMock(return_value={"percentage": 42.5})
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct == 42.5
     assert bridge.get_context_usage.await_count == 1
@@ -35,7 +35,7 @@ async def test_retries_once_when_first_call_returns_zero():
         side_effect=[{"percentage": 0.0}, {"percentage": 12.3}]
     )
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct == 12.3
     assert bridge.get_context_usage.await_count == 2
@@ -51,7 +51,7 @@ async def test_returns_zero_when_both_calls_zero_fresh_session():
         side_effect=[{"percentage": 0.0}, {"percentage": 0.0}]
     )
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct == 0.0
     assert bridge.get_context_usage.await_count == 2
@@ -63,7 +63,7 @@ async def test_returns_none_when_first_call_returns_none():
     bridge = MagicMock()
     bridge.get_context_usage = AsyncMock(return_value=None)
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct is None
     assert bridge.get_context_usage.await_count == 1
@@ -76,7 +76,7 @@ async def test_returns_none_when_percentage_field_missing():
     bridge = MagicMock()
     bridge.get_context_usage = AsyncMock(return_value={"totalTokens": 100})
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct is None
     assert bridge.get_context_usage.await_count == 1
@@ -89,7 +89,7 @@ async def test_returns_none_when_first_call_raises():
     bridge = MagicMock()
     bridge.get_context_usage = AsyncMock(side_effect=RuntimeError("boom"))
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct is None
     assert bridge.get_context_usage.await_count == 1
@@ -103,7 +103,7 @@ async def test_returns_none_when_retry_call_returns_none():
         side_effect=[{"percentage": 0.0}, None]
     )
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct is None
     assert bridge.get_context_usage.await_count == 2
@@ -116,7 +116,7 @@ async def test_returns_sub_one_percent_from_first_call():
     bridge = MagicMock()
     bridge.get_context_usage = AsyncMock(return_value={"percentage": 0.5})
     pct = await _fetch_context_pct_settled(
-        bridge, initial_delay=0.0, retry_delay=0.0
+        bridge, settle_delay=0.0
     )
     assert pct == 0.5
     assert bridge.get_context_usage.await_count == 1
@@ -128,7 +128,7 @@ async def test_returns_sub_one_percent_from_first_call():
 
 
 @pytest.mark.asyncio
-async def test_integration_footer_renders_real_pct_after_race_retry(monkeypatch):
+async def test_integration_footer_renders_real_pct_after_race_retry():
     """End-to-end: bridge returns 0 first then 12.3 (the prod race).
     Footer must contain `🧠 12%`, not `🧠 0%`."""
     import sys
@@ -149,14 +149,8 @@ async def test_integration_footer_renders_real_pct_after_race_retry(monkeypatch)
                 return {"percentage": 0.0, "totalTokens": 0, "maxTokens": 200_000}
             return {"percentage": 12.3, "totalTokens": 24_600, "maxTokens": 200_000}
 
-    # Speed up the helper's sleeps in this integration test too
-    import clauded.discord_renderer as renderer_mod
-    real_helper = renderer_mod._fetch_context_pct_settled
-    async def _fast_helper(bridge, *, initial_delay=0.5, retry_delay=0.5, log_label="footer"):
-        return await real_helper(
-            bridge, initial_delay=0.0, retry_delay=0.0, log_label=log_label
-        )
-    monkeypatch.setattr(renderer_mod, "_fetch_context_pct_settled", _fast_helper)
+    # (autouse `_zero_context_settle_delay` in conftest.py zeroes the helper's
+    # settle_delay across the whole suite — no per-test monkeypatch needed.)
 
     events = [
         AssistantMessage(
@@ -185,7 +179,7 @@ async def test_integration_footer_renders_real_pct_after_race_retry(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_integration_footer_renders_zero_for_genuine_fresh_session(monkeypatch):
+async def test_integration_footer_renders_zero_for_genuine_fresh_session():
     """Legit case: bridge.get_context_usage returns 0 on BOTH calls
     (first message in a brand-new session with no context yet) →
     footer renders `🧠 0%`."""
@@ -199,13 +193,7 @@ async def test_integration_footer_renders_zero_for_genuine_fresh_session(monkeyp
         async def get_context_usage(self):
             return {"percentage": 0.0, "totalTokens": 0, "maxTokens": 200_000}
 
-    import clauded.discord_renderer as renderer_mod
-    real_helper = renderer_mod._fetch_context_pct_settled
-    async def _fast_helper(bridge, *, initial_delay=0.5, retry_delay=0.5, log_label="footer"):
-        return await real_helper(
-            bridge, initial_delay=0.0, retry_delay=0.0, log_label=log_label
-        )
-    monkeypatch.setattr(renderer_mod, "_fetch_context_pct_settled", _fast_helper)
+    # (autouse `_zero_context_settle_delay` in conftest.py handles this.)
 
     events = [
         AssistantMessage(
@@ -231,7 +219,7 @@ async def test_integration_footer_renders_zero_for_genuine_fresh_session(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_integration_footer_renders_sub_one_percent(monkeypatch):
+async def test_integration_footer_renders_sub_one_percent():
     """0 < pct < 1 → `<1%` label preserved via existing _format_context_segment."""
     import sys
     sys.path.insert(0, "src")
@@ -243,13 +231,7 @@ async def test_integration_footer_renders_sub_one_percent(monkeypatch):
         async def get_context_usage(self):
             return {"percentage": 0.5, "totalTokens": 1000, "maxTokens": 200_000}
 
-    import clauded.discord_renderer as renderer_mod
-    real_helper = renderer_mod._fetch_context_pct_settled
-    async def _fast_helper(bridge, *, initial_delay=0.5, retry_delay=0.5, log_label="footer"):
-        return await real_helper(
-            bridge, initial_delay=0.0, retry_delay=0.0, log_label=log_label
-        )
-    monkeypatch.setattr(renderer_mod, "_fetch_context_pct_settled", _fast_helper)
+    # (autouse `_zero_context_settle_delay` in conftest.py handles this.)
 
     events = [
         AssistantMessage(

@@ -225,8 +225,7 @@ def _fmt_tokens(n: int) -> str:
 async def _fetch_context_pct_settled(
     bridge: Any,
     *,
-    initial_delay: float = 0.5,
-    retry_delay: float = 0.5,
+    settle_delay: float = 0.5,
     log_label: str = "footer",
 ) -> float | None:
     """Fetch context_usage percentage with settle delay + retry-on-0 (#220).
@@ -238,21 +237,22 @@ async def _fetch_context_pct_settled(
     confirms it's a timing window, not a data-path bug.
 
     Strategy:
-      1. Sleep ``initial_delay`` (default 0.5s) — lets the CLI commit.
+      1. Sleep ``settle_delay`` (default 0.5s) — lets the CLI commit.
       2. Call ``bridge.get_context_usage()``. If ``percentage > 0``, return.
-      3. If ``percentage == 0``, sleep ``retry_delay`` and call once more.
-         Accept whatever the second call returns (including 0 — first
-         message in a fresh session is legitimately 0%).
+      3. If ``percentage == 0``, sleep ``settle_delay`` again and call once
+         more. Accept whatever the second call returns (including 0 —
+         first message in a fresh session is legitimately 0%).
 
-    Sleep durations parametrized so tests pass ``0.0/0.0`` (no actual
-    sleep, keeps suite fast).
+    ``settle_delay`` is a single knob (R1 simplicity #225: pre-PR had
+    separate ``initial_delay``/``retry_delay`` that were always set
+    together). Tests pass ``settle_delay=0.0`` to skip actual sleep.
 
     Returns the percentage float, or ``None`` on any error / missing field.
     Caller's :func:`_format_context_segment` already handles the
     ``None`` / ``0`` / ``0 < pct < 1`` cases.
     """
     try:
-        await asyncio.sleep(initial_delay)
+        await asyncio.sleep(settle_delay)
         cu = await bridge.get_context_usage()
         if cu is None or "percentage" not in cu:
             log.debug("%s: get_context_usage returned no percentage", log_label)
@@ -261,7 +261,7 @@ async def _fetch_context_pct_settled(
         if pct > 0:
             return pct
         # Retry once — CLI likely hasn't fully committed turn state yet.
-        await asyncio.sleep(retry_delay)
+        await asyncio.sleep(settle_delay)
         cu = await bridge.get_context_usage()
         if cu is None or "percentage" not in cu:
             return None
