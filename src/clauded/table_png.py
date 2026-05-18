@@ -113,23 +113,116 @@ def _replace_known_emoji(text: str) -> str:
 # --- Font resolution -----------------------------------------------------
 
 # Module-level so tests can monkeypatch the candidate list.
-# PingFang first: it has good Latin coverage AND CJK glyphs, so it works as
-# the primary font on the happy path while preventing tofu boxes for Chinese
-# text (PRD R4.2 — review I6).
+#
+# #219: priority order = CJK-capable first, then ASCII-only fallbacks.
+# A `_load_font` `getmask('中')` probe rejects fonts that LOAD but lack
+# CJK glyphs (the original Menlo-tofu bug — fontconfig says "yes I'll
+# load Menlo" then renders Chinese as empty boxes).
+#
+# CJK fonts up top so a happy mac still resolves to PingFang in one step.
+# Linux candidates kept for future docker / linux deployment (the project
+# is mac-only today, but future-proofing is free here).
 FONT_CANDIDATES = (
-    "/System/Library/Fonts/PingFang.ttc",                      # CJK first (PRD R4.2)
-    "/System/Library/Fonts/Menlo.ttc",                         # mono fallback
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",    # broad fallback
+    # macOS CJK
+    "/System/Library/Fonts/PingFang.ttc",                            # primary (PRD #112 R4.2)
+    "/System/Library/Fonts/STHeiti Light.ttc",                       # macOS legacy CJK
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",                    # macOS GB CJK
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",          # broad coverage
+    # Linux CJK (docker / future deploys)
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    # ASCII-only fallback (no CJK — only chosen if probe rejects all CJK options)
+    "/System/Library/Fonts/Menlo.ttc",
 )
+
+# #219: a glyph the CJK probe must successfully draw. ``中`` is high-
+# frequency in both simplified + traditional; if a font produces an empty
+# mask for this code point we treat the font as CJK-unsupported and
+# advance to the next candidate.
+_CJK_PROBE_CHAR = "中"
+
+# #219: Pillow's getmask() for a missing glyph returns the font's
+# ".notdef" tofu box — a non-empty rectangle. To distinguish "font has
+# this glyph" from "font is rendering the tofu placeholder" we compare
+# the probe's mask to a Unicode private-use codepoint that NO font has
+# (by spec). Identical masks → both are tofu → font has no CJK.
+_PUA_TOFU_REFERENCE = "\uE000"
+
+
+def _font_has_cjk(font: ImageFont.FreeTypeFont) -> bool:
+    """True iff ``font`` actually rasterizes a real (non-tofu) glyph for ``中``.
+
+    The naive ``getmask().size > 0`` test fails because Menlo (#219 root
+    cause) loads cleanly AND returns a non-empty hollow-rectangle mask
+    for CJK code points — the ".notdef" placeholder. To discriminate, we
+    compare ``中`` 's mask to the mask of ``U+E000`` (Unicode private-
+    use area). No font defines a glyph at U+E000, so its mask IS the
+    tofu placeholder. If the two masks match exactly → 中 is also tofu
+    → reject the font.
+
+    A CJK-capable font produces a distinct, larger, ink-rich mask for
+    中 than for U+E000 (typically the U+E000 mask is also 0-sized).
+    """
+    try:
+        cjk_mask = font.getmask(_CJK_PROBE_CHAR)
+    except Exception:
+        return False
+    if cjk_mask is None or cjk_mask.size == (0, 0):
+        # Glyph missing outright — also tofu (and rarer than ".notdef").
+        return False
+    try:
+        tofu_mask = font.getmask(_PUA_TOFU_REFERENCE)
+    except Exception:
+        # Can't get the reference; conservatively say no.
+        return False
+    # If size or pixel data match, CJK is rendering as tofu.
+    if cjk_mask.size != tofu_mask.size:
+        return True
+    try:
+        return bytes(cjk_mask) != bytes(tofu_mask)
+    except Exception:
+        return cjk_mask.size != tofu_mask.size
 
 
 def _load_font(size: int):
-    """Try each candidate path; fall back to ``load_default`` (never crashes)."""
+    """Try each candidate path; fall back to ``load_default`` (never crashes).
+
+    #219: a font that LOADS without exception is not enough — the original
+    Menlo bug had ``ImageFont.truetype(menlo)`` succeed cleanly but render
+    Chinese as empty boxes (Menlo has no CJK in cmap). We now require the
+    font to ACTUALLY rasterize the CJK probe glyph before accepting it.
+
+    Fallback chain:
+    - For each candidate path, try to load it. Exceptions → next.
+    - If loaded font has CJK coverage → return it.
+    - If loaded font has NO CJK coverage → remember it as "ASCII fallback"
+      and keep looking for a CJK-capable font.
+    - If no CJK font found, fall back to the last successfully-loaded
+      ASCII-only font (so we still render English correctly).
+    - Final fallback: ``ImageFont.load_default()``.
+    """
+    ascii_fallback = None
     for path in FONT_CANDIDATES:
         try:
-            return ImageFont.truetype(path, size)
-        except (OSError, IOError):
+            f = ImageFont.truetype(path, size)
+        except Exception:
+            # #219: broaden except. Some Pillow versions raise non-OSError
+            # types (IndexError on bad ttc face, ValueError on cmap parse,
+            # etc.) and we want to advance rather than crash the renderer.
             continue
+        if _font_has_cjk(f):
+            return f
+        # Remember the FIRST successfully-loaded ASCII-only font as the
+        # last-resort fallback. Later iterations don't overwrite this so
+        # we don't "upgrade" from Menlo to some random ASCII path.
+        if ascii_fallback is None:
+            ascii_fallback = f
+    if ascii_fallback is not None:
+        return ascii_fallback
     return ImageFont.load_default()
 
 
