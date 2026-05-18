@@ -3,132 +3,169 @@
 When the renderer crashes mid-turn, the Retry button must rebuild bridge
 with `SessionConfig(resume_session_id=...)` so the SDK continues the same
 conversation. Without this, every crash dropped all conversation context.
+
+R1 engineer/tester caught: original v1 tests bypassed prod code (built
+SessionConfig inside the test, asserted MagicMock returns) — would pass
+even with the production fix reverted. v2 drives the module-level helper
+`_build_retry_session_config` directly so mental revert fails ≥1 test.
 """
+import logging
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+
+from clauded.bot import _build_retry_session_config
+from clauded.session_config import SessionConfig
 
 
-@pytest.mark.asyncio
-async def test_retry_closure_reads_stored_session_id():
-    """The _on_retry closure builds SessionConfig with resume_session_id
-    pulled from `stored.session_id`. Without this fix, retry was cold-start
-    and lost the entire conversation history (the #227 bug)."""
-    from clauded.bot import ClaudedBot
-    from clauded.session_config import SessionConfig
+# -- core fix: resume_session_id propagates from stored to SessionConfig --
 
-    # Stub a ClaudedBot enough to drive _render_with_retry's retry closure
-    bot = MagicMock(spec=ClaudedBot)
-    bot.config = MagicMock()
-
-    # Mock session_manager: stored.session_id present
-    sm = MagicMock()
-    sm.get_lock = MagicMock()
-    lock_cm = MagicMock()
-    lock_cm.__aenter__ = AsyncMock()
-    lock_cm.__aexit__ = AsyncMock()
-    sm.get_lock.return_value = lock_cm
-    sm.stop_session = AsyncMock(return_value=True)
-    sm.get_stored_session = MagicMock(return_value={
+def test_retry_helper_propagates_stored_session_id():
+    """#227 core: when stored.session_id is set, the retry SessionConfig
+    must carry it as resume_session_id. THIS test is the regression pin —
+    if the production line is reverted, this assertion fails."""
+    stored = {
         "session_id": "sess-resume-target-uuid",
         "model": None,
         "permission_mode_override": None,
-    })
+    }
+    base_sc = SessionConfig(model_override="opus")
 
-    # create_session captures the SessionConfig passed
-    captured_sc: dict = {}
-    async def _capture_create(thread_id, project_path, config, sc):
-        captured_sc["sc"] = sc
-        bridge = MagicMock()
-        bridge.is_active = True
-        return bridge
-    sm.create_session = _capture_create
+    retry_sc = _build_retry_session_config(
+        stored,
+        base_sc,
+        on_ask_user=lambda *_a, **_k: None,
+        thread_id_for_log=42,
+    )
 
-    bot.session_manager = sm
-    bot._render_with_retry = ClaudedBot._render_with_retry.__get__(bot)
-
-    # Drive the retry path: simulate renderer.send_error_with_retry having
-    # received an _on_retry callback. We can't easily call the closure
-    # directly without executing _render_with_retry's outer setup, so
-    # we exercise the contract indirectly via a minimal _render_with_retry
-    # invocation that raises (forcing the retry path).
-    # — alternative: surgically test by calling the bot's internals after
-    # injecting a renderer that raises.
-
-    # Simpler scaffold: directly reach into bot.session_manager and prove
-    # the *get_stored_session*-then-SessionConfig wiring is what we land on.
-    # That's the actual semantic the PRD pins.
-    stored = sm.get_stored_session(42)
-    resume_id = stored.get("session_id") if stored else None
-    sc = SessionConfig(resume_session_id=resume_id)
-    assert sc.resume_session_id == "sess-resume-target-uuid"
+    assert retry_sc.resume_session_id == "sess-resume-target-uuid", (
+        "#227 regression: retry SessionConfig lost the stored session_id; "
+        "renderer crash will cold-start and discard conversation context"
+    )
 
 
-@pytest.mark.asyncio
-async def test_retry_closure_falls_back_to_cold_start_when_no_stored(caplog):
-    """Edge: crashed before first ResultMessage persisted session_id.
-    stored returns None → log.warning fires, SessionConfig built with
-    resume_session_id=None (cold start)."""
-    import logging
-    from clauded.bot import log as bot_log
+def test_retry_helper_preserves_other_session_config_fields():
+    """Non-regression: every non-on_ask_user field flows through unchanged."""
+    base_sc = SessionConfig(
+        system_prompt="be helpful",
+        model_override="opus",
+        permission_mode_override="acceptEdits",
+        effort="high",
+        allowed_tools=["Read", "Write"],
+        max_budget_usd=5.0,
+    )
+    stored = {"session_id": "s1"}
 
-    # Pretend stored is missing
-    stored = None
-    resume_id = stored.get("session_id") if stored else None
+    retry_sc = _build_retry_session_config(
+        stored, base_sc, on_ask_user=lambda *_a, **_k: "answer"
+    )
 
-    # Mirror production warning path (the same `if resume_id is None:` block
-    # in bot.py:_on_retry)
+    assert retry_sc.system_prompt == "be helpful"
+    assert retry_sc.model_override == "opus"
+    assert retry_sc.permission_mode_override == "acceptEdits"
+    assert retry_sc.effort == "high"
+    assert retry_sc.allowed_tools == ["Read", "Write"]
+    assert retry_sc.max_budget_usd == 5.0
+    # on_ask_user must be the fresh callback, not base_sc.on_ask_user
+    assert retry_sc.on_ask_user is not base_sc.on_ask_user
+
+
+# -- fallback: stored missing → cold start + warning --
+
+def test_retry_helper_falls_back_when_stored_missing(caplog):
+    """No stored entry → SessionConfig.resume_session_id is None +
+    log.warning fires so #224 /log dump epic captures it."""
     caplog.set_level(logging.WARNING, logger="clauded.bot")
-    if resume_id is None:
-        bot_log.warning(
-            "#227: retry has no stored session_id "
-            "(crashed before first ResultMessage?); "
-            "falling back to cold start for thread=%s",
-            12345,
-        )
 
-    assert resume_id is None
+    retry_sc = _build_retry_session_config(
+        None,
+        SessionConfig(),
+        on_ask_user=lambda *_a, **_k: None,
+        thread_id_for_log=99,
+    )
+
+    assert retry_sc.resume_session_id is None
     warnings = [
         r for r in caplog.records
         if r.levelno == logging.WARNING
         and "#227" in r.getMessage()
         and "cold start" in r.getMessage()
     ]
-    assert warnings, f"Expected #227 cold-start warning; got: {[r.getMessage() for r in caplog.records]}"
-    assert "12345" in warnings[0].getMessage()
+    assert warnings, (
+        f"missing #227 cold-start warning; got: "
+        f"{[r.getMessage() for r in caplog.records]}"
+    )
+    assert "99" in warnings[0].getMessage()
 
+
+def test_retry_helper_falls_back_when_session_id_field_missing(caplog):
+    """Stored row exists but session_id key absent (legacy or partial).
+    Same fallback: None resume + warning fires."""
+    caplog.set_level(logging.WARNING, logger="clauded.bot")
+
+    retry_sc = _build_retry_session_config(
+        {"model": "opus"},  # no session_id key
+        SessionConfig(),
+        on_ask_user=lambda *_a, **_k: None,
+    )
+
+    assert retry_sc.resume_session_id is None
+    assert any(
+        "#227" in r.getMessage() and "cold start" in r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING
+    )
+
+
+# -- base_sc None edge --
+
+def test_retry_helper_handles_none_base_session_config():
+    """Defensive: if upstream lost the original SessionConfig (legacy code
+    path), still build a minimal one with resume_session_id wired."""
+    stored = {"session_id": "s-edge"}
+
+    retry_sc = _build_retry_session_config(
+        stored, None, on_ask_user=lambda *_a, **_k: None
+    )
+
+    assert retry_sc.resume_session_id == "s-edge"
+    assert retry_sc.system_prompt is None
+
+
+# -- engineer Q3: resume + permission_mode_override pairing --
+
+def test_retry_helper_pairs_resume_with_permission_mode_override():
+    """Engineer R1 Q3: resume_session_id pulled from stored, but
+    permission_mode_override pulled from in-process base_sc snapshot. Pin
+    that both flow through together so SDK resume + persistent mode work
+    in tandem (#211 / #221 interaction)."""
+    base_sc = SessionConfig(
+        permission_mode_override="bypassPermissions",
+        model_override="opus",
+    )
+    stored = {"session_id": "s-mode-pair", "permission_mode_override": "plan"}
+
+    retry_sc = _build_retry_session_config(
+        stored, base_sc, on_ask_user=lambda *_a, **_k: None
+    )
+
+    # resume from stored.session_id (server-side conversation)
+    assert retry_sc.resume_session_id == "s-mode-pair"
+    # permission_mode_override from in-process base_sc (client-side override)
+    # NOT from stored (stored.permission_mode_override is read by a
+    # separate auto-resume path, not here)
+    assert retry_sc.permission_mode_override == "bypassPermissions"
+
+
+# -- public crash embed copy --
 
 def test_crash_embed_copy_says_conversation_will_continue():
-    """#227: crash embed wording changed from 'fresh session' → 'conversation
-    will continue from where it crashed'. Verify against the runtime-built
-    embed (not source) since source has adjacent string literals that
-    don't concatenate textually."""
+    """Pin user-visible copy against accidental revert."""
     from clauded.discord_renderer import DiscordRenderer
     import inspect
 
-    # Source-level: check both substrings exist somewhere (regardless of
-    # adjacent-literal split)
     src = inspect.getsource(DiscordRenderer.send_error_with_retry)
-    # The new wording — fragmented across adjacent literals "...it " "crashed..."
-    assert "continue from where it" in src, (
-        f"crash embed copy missing 'continue from where it' (#227); source:\n{src[:1200]}"
-    )
-    assert "crashed (#227)" in src, (
-        f"crash embed copy missing 'crashed (#227)' marker; source:\n{src[:1200]}"
-    )
-    # The old wording must NOT be present
+    # Adjacent literals split across newlines; check fragments
+    assert "continue from where it" in src
+    assert "crashed (#227)" in src
     assert "fresh session will be started" not in src, (
         "crash embed still uses pre-#227 wording 'fresh session will be started'"
     )
-
-
-@pytest.mark.asyncio
-async def test_session_config_carries_resume_field_through():
-    """Sanity: SessionConfig accepts resume_session_id kwarg and propagates.
-    Catches refactor that drops the field from the dataclass."""
-    from clauded.session_config import SessionConfig
-
-    sc = SessionConfig(resume_session_id="abc-123")
-    assert sc.resume_session_id == "abc-123"
-
-    sc2 = SessionConfig()  # default
-    assert sc2.resume_session_id is None
