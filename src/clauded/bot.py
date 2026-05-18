@@ -689,7 +689,7 @@ class ClaudedBot(commands.Bot):
                 user_text = user_text.replace(message.content, content) if message.content else user_text
             else:
                 user_text = content
-            renderer = DiscordRenderer(thread, bot=self)
+            renderer = DiscordRenderer(thread, bot=self, project_path=Path(project_path) if project_path else None)
             cost_before = bridge.total_cost if bridge else 0.0
             _render_ok = False
             try:
@@ -880,7 +880,7 @@ class ClaudedBot(commands.Bot):
                 log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
 
             user_text, tmp_dir = await self._compose_user_text(message)
-            renderer = DiscordRenderer(message.channel, bot=self)
+            renderer = DiscordRenderer(message.channel, bot=self, project_path=Path(project_path) if project_path else None)
             cost_before = bridge.total_cost if bridge else 0.0
             _render_ok = False
             try:
@@ -1158,7 +1158,7 @@ class ClaudedBot(commands.Bot):
                         # blip; on permanent failure we silently drop.
                         await safe_send_message(thread, embed=err_embed)
                         return
-                    new_renderer = DiscordRenderer(thread, bot=self)
+                    new_renderer = DiscordRenderer(thread, bot=self, project_path=Path(project_path) if project_path else None)
                     await self._render_with_retry(
                         renderer=new_renderer,
                         bridge=new_bridge,
