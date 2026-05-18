@@ -115,6 +115,36 @@ async def test_get_server_info_success_emits_event(captured_events):
 
 
 @pytest.mark.asyncio
+async def test_get_server_info_failure_emits_warning_and_event(
+    caplog, captured_events,
+):
+    """#223 R1 tester: symmetric to get_context_usage — failure path
+    must produce log.warning(exc_info=True) + ControlPlane error event."""
+    from clauded.claude_bridge import ClaudeBridge
+
+    bridge = ClaudeBridge.__new__(ClaudeBridge)
+    bridge._active = True
+    bridge._client = MagicMock()
+    bridge._client.get_server_info = AsyncMock(side_effect=RuntimeError("si-boom"))
+
+    caplog.set_level(logging.WARNING, logger="clauded.claude_bridge")
+    with pytest.raises(RuntimeError, match="si-boom"):
+        await bridge.get_server_info()
+
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("get_server_info failed" in r.getMessage() for r in warns)
+    assert any(r.exc_info for r in warns)
+
+    err_events = [
+        e for e in captured_events
+        if e.get("type") == "ControlPlane"
+        and e.get("method") == "get_server_info"
+        and e.get("error")
+    ]
+    assert len(err_events) == 1
+
+
+@pytest.mark.asyncio
 async def test_get_context_usage_inactive_returns_none_without_event(captured_events):
     """When bridge inactive, fast-path returns None without instrumentation."""
     from clauded.claude_bridge import ClaudeBridge
@@ -189,9 +219,9 @@ def test_crash_event_payload_shape():
     """#223 AC3: pin the payload structure that bot.py emits in the
     `except Exception as exc:` branch of _render_with_retry.
 
-    Direct unit test on the inline event-build expression (extracted via
-    inspect) is enough — testing the full call path needs a fully wired
-    bot + renderer.
+    Source-level pin (mental revert: deleting the log_event call would
+    still pass this test, so we also have ``test_crash_event_real_runtime``
+    below for behavioral coverage — R1 tester finding).
     """
     import inspect
     from clauded import bot
@@ -201,6 +231,78 @@ def test_crash_event_payload_shape():
     assert '"type": "Crash"' in src
     assert '"where": "render_response"' in src
     assert "_tb.format_exc()" in src or "traceback.format_exc()" in src
+    # #223 R1 product: session_id must be in payload for #224 cross-ref
+    assert '"session_id"' in src and "bridge" in src
+
+
+@pytest.mark.asyncio
+async def test_crash_event_real_runtime_emits_with_session_id(
+    captured_events, monkeypatch,
+):
+    """#223 R1 tester finding: replace the source-grep crash test with a
+    real runtime test. Drive ``_render_with_retry`` with a renderer that
+    raises a non-transient exception — the outer except must dump a Crash
+    event containing bridge.session_id + thread_id + traceback.
+    """
+    from clauded.bot import ClaudedBot
+
+    bot = ClaudedBot.__new__(ClaudedBot)
+    bot.config = MagicMock()
+
+    # Stub session_manager: stop_session is awaited inside crash path
+    sm = MagicMock()
+    sm.stop_session = AsyncMock(return_value=True)
+    sm.get_stored_session = MagicMock(return_value=None)
+    sm.get_lock = MagicMock()
+    lock_cm = MagicMock()
+    lock_cm.__aenter__ = AsyncMock()
+    lock_cm.__aexit__ = AsyncMock()
+    sm.get_lock.return_value = lock_cm
+    bot.session_manager = sm
+
+    # Renderer that raises a NON-transient exception (so we hit the
+    # crash branch, not the transient-recovery branch)
+    renderer = MagicMock()
+    renderer.render_response = AsyncMock(side_effect=ValueError("renderer-boom"))
+    renderer.send_error_with_retry = AsyncMock()
+
+    # Bridge with a known session_id
+    bridge = MagicMock()
+    bridge.session_id = "sess-runtime-id-xyz"
+
+    thread = MagicMock()
+    thread.id = 99999
+
+    # Build SessionConfig stub so retry-closure setup doesn't blow up
+    from clauded.session_config import SessionConfig
+
+    # ``_render_with_retry`` is bound; pass through __get__
+    bound = ClaudedBot._render_with_retry.__get__(bot)
+
+    # Drive it. The crash branch runs but the retry button itself only
+    # triggers if user clicks — we just need the crash event to fire.
+    await bound(
+        renderer=renderer,
+        bridge=bridge,
+        user_text="hi",
+        thread=thread,
+        project_path=MagicMock(),
+        session_config=SessionConfig(),
+        author_id=12345,
+    )
+
+    # Assert Crash event was emitted with full payload
+    crash_events = [e for e in captured_events if e.get("type") == "Crash"]
+    assert len(crash_events) == 1, (
+        f"Expected 1 Crash event; got {len(crash_events)}; "
+        f"all events: {captured_events}"
+    )
+    crash = crash_events[0]
+    assert crash["where"] == "render_response"
+    assert crash["thread_id"] == 99999
+    assert crash["session_id"] == "sess-runtime-id-xyz"
+    assert crash["exc_class"] == "ValueError"
+    assert "renderer-boom" in crash["traceback"]
 
 
 # ---------------------------------------------------------------------------

@@ -81,6 +81,12 @@ _MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 _BACKUP_COUNT = 7
 _FH: Any = None
 
+_SCHEMA_VERSION = 1
+"""#223 R1 architect: every event carries ``v=N`` so /log dump (#224)
+can evolve schema without ambiguity. Bump on breaking change (rename,
+removal). Add-only field changes do NOT bump.
+"""
+
 
 def _open_file() -> Any:
     """Open the jsonl file in append mode, creating parent dir if needed."""
@@ -140,10 +146,15 @@ def _build_entry(event: object, buffer_len: int) -> dict:
     SDK message types use the legacy extraction so existing callers
     (none in tree post-#223 audit, but external callers may exist)
     keep working.
+
+    Every entry is stamped with ``v=1`` (schema version) so the
+    /log dump epic (#224) can grow the schema without ambiguity
+    on older lines. Bump ``_SCHEMA_VERSION`` when a breaking change
+    lands (e.g., field renames).
     """
     if isinstance(event, dict):
         # Caller passed a pre-built event payload (control-plane / retry / crash)
-        entry: dict = {"ts": time.time()}
+        entry: dict = {"ts": time.time(), "v": _SCHEMA_VERSION}
         entry.update(event)
         if buffer_len:
             entry["buffer_len"] = buffer_len
@@ -167,12 +178,14 @@ def _build_entry(event: object, buffer_len: int) -> dict:
         # SDK not installed (CI / unit test path) — emit minimal envelope
         return {
             "ts": time.time(),
+            "v": _SCHEMA_VERSION,
             "type": type(event).__name__,
             "buffer_len": buffer_len,
         }
 
     entry = {
         "ts": time.time(),
+        "v": _SCHEMA_VERSION,
         "type": type(event).__name__,
         "buffer_len": buffer_len,
     }

@@ -1067,12 +1067,18 @@ class ClaudedBot(commands.Bot):
             # can ship the full traceback even if the user reports a bug
             # without the rotating clauded.log lines (often gone after 7
             # rotations — jsonl is the audit trail).
+            #
+            # #223 R1 product: include session_id so /log dump can
+            # cross-reference the SDK conversation (thread_id alone is
+            # ambiguous — sessions cycle on resume #160, and
+            # stop_session runs right after this dump).
             if stream_logger.is_enabled():
                 import traceback as _tb
                 stream_logger.log_event({
                     "type": "Crash",
                     "where": "render_response",
                     "thread_id": getattr(thread, "id", None),
+                    "session_id": getattr(bridge, "session_id", None),
                     "exc_class": type(exc).__name__,
                     "traceback": _tb.format_exc(),
                 })

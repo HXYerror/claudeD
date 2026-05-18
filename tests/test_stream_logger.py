@@ -109,6 +109,8 @@ def test_log_event_dict_payload_passes_through(tmp_path, monkeypatch):
     assert entry["result_pct"] == 47
     assert "ts" in entry
     assert isinstance(entry["ts"], (int, float))
+    # #223 R1 architect: every event carries schema version v=1 for #224 epic.
+    assert entry["v"] == 1
 
 
 def test_log_event_dict_with_extra_merge(tmp_path, monkeypatch):
@@ -140,6 +142,8 @@ def test_log_event_unknown_object_does_not_crash(tmp_path, monkeypatch):
     entry = json.loads((tmp_path / "x.jsonl").read_text().splitlines()[0])
     assert entry["type"] == "Bogus"
     assert entry["buffer_len"] == 99
+    # #223 R1 architect: legacy path also stamps v=1
+    assert entry["v"] == 1
 
 
 # ---------------------------------------------------------------------------
