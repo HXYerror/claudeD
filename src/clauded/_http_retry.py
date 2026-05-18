@@ -105,7 +105,9 @@ async def safe_remove_reaction(msg: "discord.Message", emoji: Any, member: Any) 
             lambda: msg.remove_reaction(emoji, member), label="remove_reaction"
         )
     except Exception:  # noqa: BLE001
-        log.debug("safe_remove_reaction swallowed exception", exc_info=True)
+        # #223 PR-B: was log.debug (invisible in prod). Reaction failures
+        # commonly mean gateway perms broken — worth a WARNING.
+        log.warning("safe_remove_reaction swallowed exception", exc_info=True)
 
 
 async def safe_add_reaction(msg: "discord.Message", emoji: Any) -> None:
@@ -113,4 +115,4 @@ async def safe_add_reaction(msg: "discord.Message", emoji: Any) -> None:
     try:
         await safe_http(lambda: msg.add_reaction(emoji), label="add_reaction")
     except Exception:  # noqa: BLE001
-        log.debug("safe_add_reaction swallowed exception", exc_info=True)
+        log.warning("safe_add_reaction swallowed exception", exc_info=True)

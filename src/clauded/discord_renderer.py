@@ -486,9 +486,19 @@ def _extract_subagent_stats(input_value: Any) -> dict[str, Any] | None:
         if "totalToolUseCount" in parsed:
             out["tool_count"] = int(parsed["totalToolUseCount"])
         return out if out else None
-    except Exception:
+    except Exception as exc:
         # Malformed input / unexpected types / recursion / encoding errors:
         # treat as "no stats" and let the caller skip the mini-footer.
+        #
+        # #223 PR-B: previously this swallowed ALL renderer bugs in
+        # _compute_stats silently — if the parser ever broke, no log
+        # line surfaced. Now record at WARNING with exc_info; behavior
+        # (return None) unchanged.
+        log.warning(
+            "_compute_stats failed; mini-footer suppressed: %s",
+            exc,
+            exc_info=True,
+        )
         return None
 
 
@@ -1026,7 +1036,15 @@ class DiscordRenderer:
                                     tmsg = await self._safe_send(embed=summary_embed)
                                     if tmsg and tool_id:
                                         tool_msgs[tool_id] = tmsg
-                                except discord.HTTPException:
+                                except discord.HTTPException as exc:
+                                    # #223 PR-B: HTTPException is expected
+                                    # (e.g. cross-guild) and we already have
+                                    # a fallback, so just record at WARNING
+                                    # — not silent.
+                                    log.warning(
+                                        "sub-thread summary embed failed; falling back to inline: %s",
+                                        exc,
+                                    )
                                     # Fallback: inline
                                     sep = discord.Embed(title=f"🔀 Subtask #{task_depth}", description=desc, color=COLOR_INFO)
                                     tmsg = await self._safe_send(embed=sep)
@@ -1835,6 +1853,16 @@ class DiscordRenderer:
                 thread = await msg.create_thread(name=thread_name)
                 replacement = f"✅ Created thread: {thread.mention}"
             except Exception as e:
+                # #223 PR-B: previously the error string-only went into the
+                # user message — if the user didn't paste a screenshot, the
+                # exception was 100% lost. Now we record exc_info too.
+                log.warning(
+                    "Failed to create thread %r in channel=%s: %s",
+                    thread_name,
+                    getattr(channel, "id", "?"),
+                    e,
+                    exc_info=True,
+                )
                 replacement = f"❌ Failed to create thread: {e}"
             text = text[:match.start()] + replacement + text[match.end():]
 
@@ -1846,6 +1874,13 @@ class DiscordRenderer:
                 new_channel = await guild.create_text_channel(name=channel_name)
                 replacement = f"✅ Created channel: {new_channel.mention}"
             except Exception as e:
+                log.warning(
+                    "Failed to create text channel %r in guild=%s: %s",
+                    channel_name,
+                    getattr(guild, "id", "?"),
+                    e,
+                    exc_info=True,
+                )
                 replacement = f"❌ Failed to create channel: {e}"
             text = text[:match.start()] + replacement + text[match.end():]
 
@@ -2426,16 +2461,27 @@ class DiscordRenderer:
             if f is not None and hasattr(f, "fp") and hasattr(f.fp, "seek"):
                 try:
                     f.fp.seek(0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # #223 PR-B: silent seek failure caused attachments to
+                    # send as empty bytes on retry — truncated files in
+                    # production with no log line.
+                    log.warning(
+                        "file.fp.seek(0) failed before retry; "
+                        "attachment may be empty: %s",
+                        exc,
+                    )
             fs = kwargs.get("files")
             if fs:
                 for entry in fs:
                     if hasattr(entry, "fp") and hasattr(entry.fp, "seek"):
                         try:
                             entry.fp.seek(0)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log.warning(
+                                "files[i].fp.seek(0) failed before retry; "
+                                "attachment may be empty: %s",
+                                exc,
+                            )
 
         async def _op() -> discord.Message | None:
             return await self.target.send(**kwargs)
@@ -3074,8 +3120,12 @@ class ToolResultsView(discord.ui.View):
                     "started this turn.",
                     ephemeral=True,
                 )
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                # #223 PR-B: auth-rejection ephemeral failed to post.
+                # User sees nothing — record so we can correlate later.
+                log.warning(
+                    "ToolResultsView auth-rejection ephemeral failed: %s", exc,
+                )
             return
         entry = self._results.get(tool_use_id)
         if entry is None:
@@ -3083,8 +3133,10 @@ class ToolResultsView(discord.ui.View):
                 await interaction.response.send_message(
                     "⚠️ Result no longer available.", ephemeral=True
                 )
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                log.warning(
+                    "ToolResultsView 'no longer available' ephemeral failed: %s", exc,
+                )
             return
         tool_name, content = entry
         file_bytes = content.encode("utf-8", errors="replace")
@@ -3105,8 +3157,12 @@ class ToolResultsView(discord.ui.View):
                     f"⚠️ Could not send result: {exc.text[:200] if hasattr(exc, 'text') else 'unknown'}",
                     ephemeral=True,
                 )
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc2:
+                # #223 PR-B: failure-notify itself failed. User gets
+                # nothing; log so we can correlate.
+                log.warning(
+                    "ToolResultsView failure-notify also failed: %s", exc2,
+                )
 
 
 class RetryView(discord.ui.View):
@@ -3142,8 +3198,12 @@ class RetryView(discord.ui.View):
         if self._fired:
             try:
                 await interaction.response.defer()
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                # #223 PR-B: double-click defer failed. User sees nothing
+                # extra; log so it's not lost.
+                log.warning(
+                    "RetryView double-click defer failed: %s", exc,
+                )
             return
         self._fired = True
         button.disabled = True

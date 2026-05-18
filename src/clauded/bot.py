@@ -160,8 +160,15 @@ def _touch_heartbeat() -> None:
         return
     try:
         _HEARTBEAT_PATH.touch()
-    except OSError:
-        pass
+    except OSError as exc:
+        # #223 PR-B: silent OSError here means LaunchAgent health checks
+        # silently fail (`heartbeat` file stops being touched — external
+        # watchdog assumes bot is dead, restarts, no log of why). WARNING.
+        log.warning(
+            "_HEARTBEAT_PATH.touch() failed; LaunchAgent health may be"
+            " misled: %s",
+            exc,
+        )
 
 
 def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
@@ -669,8 +676,11 @@ class ClaudedBot(commands.Bot):
             # Feature #66: Add hourglass reaction
             try:
                 await message.add_reaction("⏳")
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                # #223 PR-B: per-message hot path; record at DEBUG so
+                # we can correlate "no ⏳ shown" gateway perm issues
+                # without flooding prod WARNINGs.
+                log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
 
             user_text, tmp_dir = await self._compose_user_text(message)
             # Use mention-stripped content instead of raw message content
@@ -863,8 +873,11 @@ class ClaudedBot(commands.Bot):
             # Feature #66: Add hourglass reaction
             try:
                 await message.add_reaction("⏳")
-            except discord.HTTPException:
-                pass
+            except discord.HTTPException as exc:
+                # #223 PR-B: per-message hot path; record at DEBUG so
+                # we can correlate "no ⏳ shown" gateway perm issues
+                # without flooding prod WARNINGs.
+                log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
 
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel, bot=self)
@@ -984,8 +997,24 @@ class ClaudedBot(commands.Bot):
             async def _pre_tool_notify(tool_name: str, input_data: dict) -> None:
                 try:
                     await _target.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
-                except Exception:
-                    pass
+                except discord.HTTPException as exc:
+                    # #223 PR-B: Discord 5xx during hot-path pre-tool
+                    # notify is acceptable noise — keep at DEBUG so prod
+                    # logs don't drown.
+                    log.debug(
+                        "pre_tool_notify HTTPException for %s: %s",
+                        tool_name,
+                        exc,
+                    )
+                except Exception as exc:
+                    # Non-HTTP failure means a real bug (closed channel,
+                    # permission revoked mid-turn, etc.) — worth WARNING.
+                    log.warning(
+                        "pre_tool_notify failed for %s: %s",
+                        tool_name,
+                        exc,
+                        exc_info=True,
+                    )
             pre_tool_cb = _pre_tool_notify
 
         async def _post_tool_notify(tool_name: str, input_data: dict) -> None:
