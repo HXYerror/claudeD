@@ -11,6 +11,7 @@ class SessionConfig:
 
     system_prompt: str | None = None
     model_override: str | None = None
+    permission_mode_override: str | None = None
     resume_session_id: str | None = None
     effort: str | None = None
     allowed_tools: list[str] = field(default_factory=list)

@@ -1634,6 +1634,28 @@ class DiscordRenderer:
                 if _last_stop_reason and _last_stop_reason != "end_turn":
                     footer_text += f" │ ⚠️ {_last_stop_reason}"
 
+                # #211: append a second footer line showing the current
+                # effective permission mode — but ONLY when it's not the
+                # implicit ``"default"`` (PRD §Design "Footer"). Pulling
+                # ``bridge.effective_permission_mode`` here collapses
+                # override / env / default into one string we just compare.
+                # Imported lazily to keep the module-level dependency graph
+                # symmetric (renderer ↔ cogs.mode would otherwise import
+                # each other transitively through bot.py).
+                try:
+                    from .cogs.mode import MODE_EMOJI
+                    effective_mode = getattr(
+                        bridge, "effective_permission_mode", "default"
+                    )
+                    if effective_mode and effective_mode != "default":
+                        mode_emoji = MODE_EMOJI.get(effective_mode, "")
+                        # Discord ``-#`` small-text marker repeats per
+                        # line: emoji on its own row keeps the mode
+                        # visually separated from the cost stats above.
+                        footer_text += f"\n-# {mode_emoji} {effective_mode}".rstrip()
+                except Exception:  # pragma: no cover - never break the cost footer
+                    log.debug("Mode footer append failed; continuing", exc_info=True)
+
                 if self._last_msg is not None:
                     # Try to append to the last user-visible message.
                     current = self._last_msg_text.rstrip(CURSOR)

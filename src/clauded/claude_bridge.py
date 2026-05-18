@@ -95,6 +95,12 @@ class ClaudeBridge:
         self._last_activity = time.time()
         self._start_time = time.time()
         self._model_override = sc.model_override
+        # #211: per-session override for ``permission_mode``. Initialized
+        # from the SessionConfig (which auto-resume / /session resume read
+        # from ``data/sessions.json`` so the user's choice survives a bot
+        # restart). When None, the SDK call uses ``config.claude_permission_mode``
+        # (CLAUDE_PERMISSION_MODE env or ``"default"``).
+        self._permission_mode_override: str | None = sc.permission_mode_override
         self._resume_session_id = sc.resume_session_id
         self._effort = sc.effort
         self._allowed_tools = list(sc.allowed_tools) if sc.allowed_tools else []
@@ -177,6 +183,61 @@ class ClaudeBridge:
         not switched and the SDK's CLI-default should govern.
         """
         return self._model_override
+
+    @property
+    def permission_mode_override(self) -> str | None:
+        """The user-explicit ``/mode set`` (or ``/mode cycle``) value, or ``None``.
+
+        #211: read-only accessor used by
+        :meth:`SessionManager.save_session_state` so we persist ONLY what
+        the user explicitly set — not the env or default fallback. Mirror
+        of :attr:`explicit_model_override` but for permission mode.
+
+        Returns ``None`` when the user has never run ``/mode set`` / cycle
+        on this thread (or on a previous-restart thread we haven't re-seen
+        since); callers fall back to env (``CLAUDE_PERMISSION_MODE``) or
+        ``"default"`` via :attr:`effective_permission_mode`.
+        """
+        return self._permission_mode_override
+
+    @property
+    def effective_permission_mode(self) -> str:
+        """Return the active permission mode: override > config > ``"default"``.
+
+        #211: collapsed accessor used by the footer renderer and ``/mode
+        current`` display. Always returns a non-empty string (the SDK's
+        ``PermissionMode`` literal contract), so callers can compare
+        ``!= "default"`` without a None check.
+
+        Tier order:
+        1. ``_permission_mode_override`` — user ran ``/mode set`` or ``cycle``
+        2. ``_config.claude_permission_mode`` — ``CLAUDE_PERMISSION_MODE`` env,
+           or its ``"default"`` fallback (set by ``load_config``)
+        """
+        return (
+            self._permission_mode_override
+            or self._config.claude_permission_mode
+            or "default"
+        )
+
+    async def set_permission_mode(self, mode: str) -> None:
+        """Runtime switch via the SDK's control-plane.
+
+        #211: surfaces ``ClaudeSDKClient.set_permission_mode`` so user-
+        facing ``/mode set`` / ``/mode cycle`` can flip the mode mid-
+        session without recreating the bridge (which would lose context).
+        Caller is responsible for passing a valid SDK ``PermissionMode``
+        literal — the SDK will raise if it doesn't recognize the value.
+
+        Persists the new value to ``_permission_mode_override`` so
+        :attr:`effective_permission_mode` and the footer reflect the
+        change. The SDK call happens FIRST so a rejection from the
+        underlying CLI leaves our override unchanged (no lying display).
+        """
+        if self._client is None or not self._active:
+            raise RuntimeError("bridge not active")
+        await self._client.set_permission_mode(mode)
+        self._permission_mode_override = mode
 
     @property
     def is_active(self) -> bool:
@@ -357,7 +418,12 @@ class ClaudeBridge:
         options = ClaudeAgentOptions(
             cwd=self.project_path,
             env=self._env or {},
-            permission_mode=self._config.claude_permission_mode,
+            # #211: per-session override > config (env / default). Use the
+            # same accessor the runtime ``set_permission_mode()`` updates so
+            # an auto-resumed session with a persisted override re-enters the
+            # bridge with the right mode on the very first turn (not just
+            # after the user re-runs ``/mode set``).
+            permission_mode=self.effective_permission_mode,
             model=chosen_model,
             resume=self._resume_session_id,
             # R3 (#116): system_prompt preset dict replaces append_system_prompt

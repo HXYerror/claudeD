@@ -55,12 +55,19 @@ class SessionStore:
         os.replace(tmp, self._path)
 
     def save_session(self, thread_id: int, session_id: str, project_path: str,
-                     model: str | None = None, system_prompt: str | None = None) -> None:
+                     model: str | None = None, system_prompt: str | None = None,
+                     permission_mode_override: str | None = None) -> None:
         self._sessions[str(thread_id)] = {
             "session_id": session_id,
             "project_path": project_path,
             "model": model,
             "system_prompt": system_prompt,
+            # #211: persist the user's explicit ``/mode set`` / cycle choice
+            # so it survives bot restart (per PRD user decision #4). Unlike
+            # ``model`` (which #210 made vestigial because of legacy
+            # pollution), ``permission_mode_override`` is a fresh schema
+            # field with no prior writes — read-side honors it unmodified.
+            "permission_mode_override": permission_mode_override,
             "last_active": datetime.now(timezone.utc).isoformat(),
         }
         self._save()
