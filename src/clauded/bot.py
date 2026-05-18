@@ -52,6 +52,80 @@ log = logging.getLogger("clauded.bot")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
+
+# --------------------------------------------------------------------------
+# #227 helper: build the SessionConfig for the renderer-crash Retry button.
+#
+# Extracted to module scope so unit tests can drive it directly and assert
+# that ``resume_session_id`` flows from the persisted ``stored.session_id``
+# into the new SessionConfig — the entire behavioural value of the #227
+# fix is this one kwarg propagating end-to-end.
+# --------------------------------------------------------------------------
+def _build_retry_session_config(
+    stored,  # SessionStoreEntry or None  — result of get_stored_session
+    base_sc,  # original SessionConfig (a.k.a. _retry_sc in the closure)
+    on_ask_user,  # fresh InteractionHandler bound callback
+    *,
+    thread_id_for_log=None,  # used only for log.warning context
+):
+    """Build a SessionConfig for the Retry-button crash-recovery path.
+
+    The crucial bit (#227): ``resume_session_id`` is read from ``stored`` so
+    the new SDK process resumes the SAME conversation. Without this, retry
+    cold-starts and the user loses every prior turn.
+
+    Falls back to cold start (``resume_session_id=None``) when no stored
+    entry exists — happens if the renderer crashed before the first
+    ResultMessage persisted the session_id, or if the user ran
+    ``/session clear`` mid-turn. A WARNING is logged either way so #224's
+    ``/log dump`` epic can pick up the diagnostic trail.
+    """
+    resume_id = stored.get("session_id") if stored else None
+    if resume_id is None:
+        log.warning(
+            "#227: retry has no stored session_id "
+            "(crashed pre-ResultMessage or /session clear?); "
+            "falling back to cold start for thread=%s",
+            thread_id_for_log,
+        )
+
+    if base_sc is None:
+        return SessionConfig(
+            resume_session_id=resume_id,
+            on_ask_user=on_ask_user,
+        )
+
+    return SessionConfig(
+        system_prompt=base_sc.system_prompt,
+        model_override=base_sc.model_override,
+        permission_mode_override=base_sc.permission_mode_override,
+        resume_session_id=resume_id,
+        effort=base_sc.effort,
+        allowed_tools=list(base_sc.allowed_tools) if base_sc.allowed_tools else [],
+        disallowed_tools=list(base_sc.disallowed_tools) if base_sc.disallowed_tools else [],
+        max_budget_usd=base_sc.max_budget_usd,
+        fork_session=base_sc.fork_session,
+        add_dirs=base_sc.add_dirs,
+        from_pr=base_sc.from_pr,
+        worktree=base_sc.worktree,
+        agent_name=base_sc.agent_name,
+        custom_agents=base_sc.custom_agents,
+        mcp_servers=base_sc.mcp_servers,
+        max_turns=base_sc.max_turns,
+        fallback_model=base_sc.fallback_model,
+        plugin_dirs=list(base_sc.plugin_dirs) if base_sc.plugin_dirs else None,
+        settings=base_sc.settings,
+        env=base_sc.env,
+        user=base_sc.user,
+        bare=base_sc.bare,
+        session_name=base_sc.session_name,
+        on_ask_user=on_ask_user,
+        on_pre_tool_use=base_sc.on_pre_tool_use,
+        on_post_tool_use=base_sc.on_post_tool_use,
+        on_stop=base_sc.on_stop,
+    )
+
+
 # --------------------------------------------------------------------------
 # macOS LaunchAgent paths/labels (v1.15).
 #
@@ -1003,41 +1077,21 @@ class ClaudedBot(commands.Bot):
                     return
                 async with self.session_manager.get_lock(thread_id):
                     try:
+                        # #227 R1 engineer: extract retry-SessionConfig build
+                        # into module-level ``_build_retry_session_config``
+                        # so it has unit-test coverage that fails under
+                        # mental revert. ``stop_session`` above only kills
+                        # the in-memory bridge; persistent store entry
+                        # survives, so ``get_stored_session`` returns the
+                        # session_id we need to resume.
+                        stored = self.session_manager.get_stored_session(thread_id)
                         new_handler = InteractionHandler(thread)
-                        # Reuse the same SessionConfig (minus resume, plus fresh on_ask_user)
-                        if _retry_sc is not None:
-                            retry_sc = SessionConfig(
-                                system_prompt=_retry_sc.system_prompt,
-                                model_override=_retry_sc.model_override,
-                                permission_mode_override=_retry_sc.permission_mode_override,
-                                effort=_retry_sc.effort,
-                                allowed_tools=list(_retry_sc.allowed_tools) if _retry_sc.allowed_tools else [],
-                                disallowed_tools=list(_retry_sc.disallowed_tools) if _retry_sc.disallowed_tools else [],
-                                max_budget_usd=_retry_sc.max_budget_usd,
-                                fork_session=_retry_sc.fork_session,
-                                add_dirs=_retry_sc.add_dirs,
-                                from_pr=_retry_sc.from_pr,
-                                worktree=_retry_sc.worktree,
-                                agent_name=_retry_sc.agent_name,
-                                custom_agents=_retry_sc.custom_agents,
-                                mcp_servers=_retry_sc.mcp_servers,
-                                max_turns=_retry_sc.max_turns,
-                                fallback_model=_retry_sc.fallback_model,
-                                plugin_dirs=list(_retry_sc.plugin_dirs) if _retry_sc.plugin_dirs else None,
-                                settings=_retry_sc.settings,
-                                env=_retry_sc.env,
-                                user=_retry_sc.user,
-                                bare=_retry_sc.bare,
-                                session_name=_retry_sc.session_name,
-                                on_ask_user=new_handler.handle_ask_user_question,
-                                on_pre_tool_use=_retry_sc.on_pre_tool_use,
-                                on_post_tool_use=_retry_sc.on_post_tool_use,
-                                on_stop=_retry_sc.on_stop,
-                            )
-                        else:
-                            retry_sc = SessionConfig(
-                                on_ask_user=new_handler.handle_ask_user_question,
-                            )
+                        retry_sc = _build_retry_session_config(
+                            stored,
+                            _retry_sc,
+                            new_handler.handle_ask_user_question,
+                            thread_id_for_log=thread_id,
+                        )
                         new_bridge = await self.session_manager.create_session(
                             thread_id,
                             project_path,

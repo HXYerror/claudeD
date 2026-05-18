@@ -2961,7 +2961,8 @@ class DiscordRenderer:
             title="❌ Claude session crashed",
             description=(
                 "Something went wrong while talking to Claude. You can retry the "
-                "last message — a fresh session will be started for it.\n\n"
+                "last message — your conversation will continue from where it "
+                "crashed (#227).\n\n"
                 f"Error: `{exc}`"
             )[:_RETRY_EMBED_DESC_MAX],
             color=COLOR_TOOL_FAILURE,
