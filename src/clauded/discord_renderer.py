@@ -1426,7 +1426,7 @@ class DiscordRenderer:
                                 # there's no rolling-log line to update).
                                 is_medium = False
                                 content_str = ""
-                                medium_index: int | None = None
+                                medium_index = None
                                 matched = False  # for the diagnostic log below
                                 for i in range(len(tool_log_lines) - 1, -1, -1):
                                     line = tool_log_lines[i]
@@ -1474,7 +1474,6 @@ class DiscordRenderer:
                                     if is_err:
                                         error_text = content_str[:100] if content_str else "Failed"
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
-                                        matched = True
                                     elif is_short:
                                         # Strip backticks to avoid breaking the
                                         # rolling-log embed's markdown. Collapse
@@ -1486,7 +1485,6 @@ class DiscordRenderer:
                                             .replace("\n", " │ ")
                                         )
                                         tool_log_lines[i] = f"{status} {name} → {safe}"
-                                        matched = True
                                     elif is_medium:
                                         # Rolling log shows summary + the
                                         # same ``#N`` index that the button
@@ -1515,10 +1513,14 @@ class DiscordRenderer:
                                             f"{line_count} lines / "
                                             f"{len(content_str)} chars (⬇ click to view)"
                                         )
-                                        matched = True
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
-                                        matched = True
+                                    # #226 R1 simplicity: hoist `matched =
+                                    # True` out of the 4 branches —
+                                    # duplicating the flag across branches
+                                    # re-creates the bug class being fixed
+                                    # ("branch forgot to set flag").
+                                    matched = True
                                     break
                                 if not matched:
                                     # #226: rolling-log line for this tool
