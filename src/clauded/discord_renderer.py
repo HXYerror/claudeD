@@ -1076,6 +1076,27 @@ class DiscordRenderer:
 
                             # --- Special tool display: Task subtask (#55, #74) ---
                             # Create a sub-thread for each sub-agent
+                            # #212 forensics: log any sub-agent tool name +
+                            # input keys to stream-debug.jsonl so we capture
+                            # real schema for future re-introduction. #223
+                            # PR-A added the stream_logger; we just emit
+                            # one event per sub-agent-ish ToolUseBlock.
+                            if name in (
+                                "TaskOutput", "AgentOutput",
+                                "TaskStop", "AgentStop",
+                                "Task", "Agent",
+                            ):
+                                _log_stream({
+                                    "type": "SubAgentToolUse",
+                                    "name": name,
+                                    "tool_id": tool_id,
+                                    "input_keys": (
+                                        list(block.input.keys())
+                                        if isinstance(block.input, dict)
+                                        else None
+                                    ),
+                                })
+
                             if name in ("Task", "Agent"):
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:200]
@@ -1126,30 +1147,32 @@ class DiscordRenderer:
                                         tool_msgs[tool_id] = tmsg
                                 continue
 
-                            # --- Special tool display: TaskOutput (#74) ---
-                            if name in ("TaskOutput", "AgentOutput"):
-                                output = block.input.get("output", "")[:500]
-                                task_out_embed = discord.Embed(
-                                    title="📤 Subtask Output",
-                                    description=output,
-                                    color=COLOR_INFO,
-                                )
-                                tmsg = await self._safe_send(embed=task_out_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
-                            # --- Special tool display: TaskStop (#74) ---
-                            if name in ("TaskStop", "AgentStop"):
-                                task_depth = max(0, task_depth - 1)
-                                task_stop_embed = discord.Embed(
-                                    title="⏹️ Subtask Stopped",
-                                    color=COLOR_TOOL_FAILURE,
-                                )
-                                tmsg = await self._safe_send(embed=task_stop_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
+                            # --- #74 / #212: dead Subtask Output/Stop paths removed ---
+                            #
+                            # v1.6 PRD F4 speculatively wired ``TaskOutput`` /
+                            # ``AgentOutput`` / ``TaskStop`` / ``AgentStop``
+                            # tool names with guessed ``block.input`` schemas.
+                            # SDK never documented these names; the field name
+                            # (``output``) was never observed in prod stream
+                            # data, so the resulting embeds rendered with empty
+                            # descriptions and no anchor link to the spawning
+                            # ``Task`` — orphans in the main thread.
+                            #
+                            # #212 decision (Approach C): delete the
+                            # speculative paths. If the CLI does emit these
+                            # tool names, they fall through to the generic
+                            # tool-use embed below, which is already correct
+                            # (#192 Fix C also handles async-agent dispatch).
+                            # We can re-add targeted handling once stream-debug
+                            # (#223 PR-A) captures real schema.
+                            #
+                            # ``task_depth`` is still incremented in the
+                            # ``Task`` / ``Agent`` branch above and consumed
+                            # by downstream indentation logic; the missing
+                            # decrement on TaskStop is acceptable because
+                            # ``task_depth`` is a sub-thread display hint
+                            # only — spurious depth is bounded by the
+                            # parent turn ending (depth resets per render).
 
                             # --- Special tool display: TodoWrite (#56) ---
                             if name == "TodoWrite":
@@ -1471,6 +1494,13 @@ class DiscordRenderer:
                                 continue
 
                             if result_name == "TaskStop":
+                                # #212: the speculative TaskStop tool-use
+                                # branch was removed above (Approach C),
+                                # so we'd never have a ``tool_msgs[tool_id]``
+                                # to update here. Keep the early-continue
+                                # to skip generic tool-result rendering for
+                                # any TaskStop tool_result that does slip
+                                # through (it'd carry no useful info).
                                 continue
 
                             is_err = bool(getattr(block, "is_error", False))
