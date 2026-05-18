@@ -21,6 +21,15 @@
          mirrored every Python log line (Python's stderr handler in bot.py +
          launchd's redirect both wrote the same content). RotatingFileHandler
          at ~/Library/Logs/clauded/clauded.log is now the canonical log. -->
+    <key>ProcessType</key><string>Interactive</string>
+    <!-- #232 follow-up (round 2): empty ProcessType still trips
+         launchd's default "light resource limits + throttling" for
+         daemon-spawned services (per launchd.plist(5)). The
+         "because inefficient" SIGKILL kept happening even with the
+         key removed. `Interactive` declares this is a foreground
+         interactive service — launchd skips the resource judgement
+         entirely. See docs/prd/v1.18-fix-launchagent-process-type.md
+         for the original investigation. -->
     <!-- #232 removed: ``ProcessType=Background`` told launchd this is a
          low-priority occasional task, so it SIGKILL'd us every 15-25 min
          with the "because inefficient" reason. clauded is a long-running

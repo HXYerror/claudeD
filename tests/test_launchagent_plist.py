@@ -23,12 +23,18 @@ def _render_template() -> dict:
 
 
 def test_process_type_key_absent():
-    """#232: ProcessType key must NOT be set. Default (Standard) is correct."""
+    """#232 follow-up round 2: ``ProcessType`` IS set, to ``Interactive``.
+
+    Round-1 fix tried removing the key entirely, but launchd's default
+    behavior for missing ``ProcessType`` still applies the "inefficient"
+    resource throttle (per launchd.plist(5)). 2 SIGKILL events fired
+    post-fix at 18:18 + 19:33 CST on 2026-05-18. ``Interactive``
+    explicitly opts out of the resource judgement.
+    """
     data = _render_template()
-    assert "ProcessType" not in data, (
-        f"#232: plist must NOT have ProcessType key (Standard default is "
-        f"correct for long-running interactive services). Found: "
-        f"{data.get('ProcessType')!r}"
+    assert data.get("ProcessType") == "Interactive", (
+        f"#232 round 2: plist must set ProcessType=Interactive to opt out "
+        f"of launchd resource throttling. Got: {data.get('ProcessType')!r}"
     )
 
 
@@ -52,10 +58,16 @@ def test_label_and_paths():
 def test_comment_explains_absence():
     """Pin the #232 explainer comment so it's not stripped by accident."""
     text = TEMPLATE.read_text()
+    # Round-1 comment (removed Background) preserved as historical context
     assert "#232 removed" in text, (
-        "#232: the why-this-key-is-absent comment must stay; without it a "
-        "future plist-cleanup refactor would silently restore ProcessType."
+        "#232: the historical Background-removal comment stays for "
+        "future-archaeology context"
     )
     assert "because inefficient" in text, (
         "Pin the launchd reason string in the comment for future grep-back"
+    )
+    # Round-2 comment explaining the actual fix
+    assert "#232 follow-up" in text, (
+        "#232 round 2: the why-Interactive comment must stay so a future "
+        "plist-cleanup refactor doesn't swap back to the wrong value"
     )
