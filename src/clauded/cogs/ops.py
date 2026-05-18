@@ -109,6 +109,25 @@ async def health_check(interaction: discord.Interaction) -> None:
     embed.add_field(name="Claude CLI", value=claude_version, inline=True)
     embed.add_field(name="Python", value=sys.version.split()[0], inline=True)
 
+    # #211: surface the current channel's permission mode if a session
+    # exists. ``/health`` is callable outside threads too (no session
+    # in scope), in which case we silently skip the field. Centralized
+    # ``_format_mode_display`` keeps the label format in sync with
+    # ``/mode current`` + ``/session info``.
+    thread_id = getattr(interaction.channel, "id", None)
+    bridge = (
+        bot.session_manager.get_session(thread_id) if thread_id is not None else None
+    )
+    if bridge is not None:
+        from .mode import _mode_source_for_bridge, _format_mode_display
+
+        source, value = _mode_source_for_bridge(bridge)
+        embed.add_field(
+            name="Permission mode",
+            value=_format_mode_display(value, source),
+            inline=False,
+        )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

@@ -118,6 +118,13 @@ class SessionManager:
                 thread_id, bridge.session_id, bridge.project_path,
                 model=None,  # #210: ephemeral; read-side ignores this field
                 system_prompt=bridge.system_prompt,
+                # #211: persist the user-explicit override (None when
+                # they've never run /mode set on this thread; the
+                # SessionStore happily round-trips None for legacy rows
+                # / unset cases).
+                permission_mode_override=getattr(
+                    bridge, "permission_mode_override", None
+                ),
             )
 
     def get_stored_session(self, thread_id: int) -> dict | None:

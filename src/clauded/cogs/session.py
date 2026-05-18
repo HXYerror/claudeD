@@ -154,9 +154,17 @@ async def session_info(interaction: discord.Interaction) -> None:
             # source == "unset": bridge active but no _sdk_model yet
             model_display = _placeholder
         cost_str = f"${bridge.total_cost:.4f}" if bridge.total_cost else "$0.0000"
+        # #211: surface the current permission mode + source-tier (parity
+        # with ``/mode current`` and ``/health``). Centralized formatter
+        # lives in cogs.mode so all three surfaces share one label format.
+        from .mode import _mode_source_for_bridge, _format_mode_display
+
+        mode_source, mode_value = _mode_source_for_bridge(bridge)
+        mode_line = _format_mode_display(mode_value, mode_source)
         lines = [
             f"📡 **Session active** — cwd `{bridge.project_path}`",
             f"• Model: {model_display}",
+            f"• Mode: {mode_line}",
             f"• Turns: `{bridge.num_turns}`",
             f"• Total cost: `{cost_str}`",
         ]
@@ -220,6 +228,11 @@ async def session_resume(interaction: discord.Interaction) -> None:
         sc = SessionConfig(
             system_prompt=stored.get("system_prompt"),
             model_override=None,  # #210: ephemeral; see note above
+            # #211: opposite of model_override — permission_mode_override
+            # IS persistent (PRD user decision #4 contrast with #210). Read
+            # the stored value if present; legacy rows without the field
+            # safely return None and fall through to env / "default".
+            permission_mode_override=stored.get("permission_mode_override"),
             on_ask_user=handler.handle_ask_user_question,
             resume_session_id=stored["session_id"],
         )

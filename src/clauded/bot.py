@@ -223,6 +223,7 @@ class ClaudedBot(commands.Bot):
         from .cogs.project import project_group, env_group
         from .cogs.session import session_group
         from .cogs.model import model_group, set_effort, max_turns_cmd, fallback_model_cmd, toggle_bare
+        from .cogs.mode import mode_group
         from .cogs.tools import tools_group, budget_group
         from .cogs.agent import agent_group
         from .cogs.mcp import mcp_group
@@ -239,6 +240,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
         self.tree.add_command(model_group)
+        self.tree.add_command(mode_group)
         self.tree.add_command(set_effort)
         self.tree.add_command(tools_group)
         self.tree.add_command(budget_group)
@@ -725,6 +727,14 @@ class ClaudedBot(commands.Bot):
                     # back to ~/.claude/settings.json (CLI default) when
                     # model_override is None.
                     stored_prompt = stored.get("system_prompt") if stored else None
+                    # #211: read the user-explicit permission-mode override
+                    # from the stored row so a bot restart preserves the
+                    # user's last ``/mode set`` / cycle choice (PRD user
+                    # decision #4). Missing field on legacy rows → None →
+                    # bridge falls back to env / "default".
+                    stored_perm_mode = (
+                        stored.get("permission_mode_override") if stored else None
+                    )
                     extra_dirs = self.project_manager.get_extra_dirs(parent_id)
                     mcp_servers = self.project_manager.get_mcp_servers(parent_id)
                     _thread_target = message.channel
@@ -747,6 +757,7 @@ class ClaudedBot(commands.Bot):
                     sc = SessionConfig(
                         system_prompt=stored_prompt or system_prompt,
                         model_override=None,  # #210: ephemeral; see note above
+                        permission_mode_override=stored_perm_mode,  # #211: persistent
                         resume_session_id=resume_id,
                         on_ask_user=handler.handle_ask_user_question,
                         on_pre_tool_use=_pre_tool_notify_thread if _notify else None,
@@ -998,6 +1009,7 @@ class ClaudedBot(commands.Bot):
                             retry_sc = SessionConfig(
                                 system_prompt=_retry_sc.system_prompt,
                                 model_override=_retry_sc.model_override,
+                                permission_mode_override=_retry_sc.permission_mode_override,
                                 effort=_retry_sc.effort,
                                 allowed_tools=list(_retry_sc.allowed_tools) if _retry_sc.allowed_tools else [],
                                 disallowed_tools=list(_retry_sc.disallowed_tools) if _retry_sc.disallowed_tools else [],

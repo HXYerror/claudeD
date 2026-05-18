@@ -481,7 +481,7 @@ def test_save_session_state_persists_only_explicit_override_no_sdk_loop():
     # Capture what gets passed to the store
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
         captured.update(
             thread_id=thread_id, session_id=session_id, project_path=project_path,
             model=model, system_prompt=system_prompt,
@@ -531,7 +531,7 @@ def test_save_session_state_persists_user_override_when_set():
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
         captured["model"] = model
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]

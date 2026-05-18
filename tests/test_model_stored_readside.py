@@ -313,7 +313,7 @@ def test_save_session_state_always_writes_none() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
         captured.update(
             thread_id=thread_id, session_id=session_id,
             project_path=project_path, model=model,
@@ -350,7 +350,7 @@ def test_save_session_state_writes_none_when_no_user_override() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
         captured["model"] = model
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
@@ -595,7 +595,7 @@ def test_regression_199_r1_no_sdk_loop_still_holds() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None):
+    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
         captured["model"] = model
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
