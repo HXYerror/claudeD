@@ -1003,13 +1003,32 @@ class ClaudedBot(commands.Bot):
                     return
                 async with self.session_manager.get_lock(thread_id):
                     try:
+                        # #227: read stored session_id so retry resumes the
+                        # same SDK conversation, not a cold start. Without
+                        # this, every renderer crash discarded all turn
+                        # history. ``stop_session`` above only kills the
+                        # in-memory bridge; persistent store entry survives.
+                        stored = self.session_manager.get_stored_session(thread_id)
+                        resume_id = stored.get("session_id") if stored else None
+                        if resume_id is None:
+                            # Rare: crash before first ResultMessage — no
+                            # session_id ever persisted. Fall back to cold
+                            # start so the retry button still works.
+                            log.warning(
+                                "#227: retry has no stored session_id "
+                                "(crashed before first ResultMessage?); "
+                                "falling back to cold start for thread=%s",
+                                thread_id,
+                            )
                         new_handler = InteractionHandler(thread)
-                        # Reuse the same SessionConfig (minus resume, plus fresh on_ask_user)
+                        # Reuse the same SessionConfig (plus fresh on_ask_user
+                        # and #227 resume_session_id from stored).
                         if _retry_sc is not None:
                             retry_sc = SessionConfig(
                                 system_prompt=_retry_sc.system_prompt,
                                 model_override=_retry_sc.model_override,
                                 permission_mode_override=_retry_sc.permission_mode_override,
+                                resume_session_id=resume_id,
                                 effort=_retry_sc.effort,
                                 allowed_tools=list(_retry_sc.allowed_tools) if _retry_sc.allowed_tools else [],
                                 disallowed_tools=list(_retry_sc.disallowed_tools) if _retry_sc.disallowed_tools else [],
@@ -1036,6 +1055,7 @@ class ClaudedBot(commands.Bot):
                             )
                         else:
                             retry_sc = SessionConfig(
+                                resume_session_id=resume_id,
                                 on_ask_user=new_handler.handle_ask_user_question,
                             )
                         new_bridge = await self.session_manager.create_session(
