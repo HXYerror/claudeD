@@ -277,3 +277,40 @@ def test_extract_subagent_stats_usage_dict_wins_over_flat():
 
 
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# v1.18 footer 💰 per-turn delta (user feedback 5/18)
+# ---------------------------------------------------------------------------
+
+
+def test_v118_footer_cost_is_per_turn_delta():
+    """v1.18 footer 💰: cost shown is `total_cost_usd - cost_before`,
+    NOT cumulative. User reported `💰 $5.98 │ 📥 6.9k │ 📤 4.4k` was
+    misleading because $5.98 was the whole session, but 6.9k/4.4k were
+    just this turn.
+
+    Source-grep on the renderer assignment.
+    """
+    import inspect
+    from clauded import discord_renderer
+
+    src = inspect.getsource(discord_renderer.DiscordRenderer.render_response)
+    # The snapshot must exist
+    assert 'cost_before' in src
+    assert 'getattr(bridge, "total_cost"' in src
+    # The stats dict must compute the delta (not just take cumulative)
+    assert 'cumulative_cost - cost_before' in src
+    # Both fields land in stats for future debug/display
+    assert "'cost'" in src and "'cost_cumulative'" in src
+
+
+def test_v118_footer_cost_clamped_to_zero():
+    """If cumulative cost regresses (shouldn't happen, but bridge reset
+    could in theory), max(0, ...) prevents negative cost display."""
+    import inspect
+    from clauded import discord_renderer
+
+    src = inspect.getsource(discord_renderer.DiscordRenderer.render_response)
+    # max(0.0, ...) clamp present
+    assert "max(0.0, cumulative_cost - cost_before)" in src
