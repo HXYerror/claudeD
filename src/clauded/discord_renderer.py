@@ -707,6 +707,13 @@ class DiscordRenderer:
         task_depth = 0                            # subtask nesting depth (#74)
         # Stats populated from ResultMessage
         stats: dict | None = None
+        # #v1.18-footer: snapshot the bridge's cumulative ``total_cost``
+        # BEFORE the turn starts so we can compute the per-turn delta when
+        # ``ResultMessage`` arrives. SDK only ships cumulative cost; we
+        # want the footer's 💰 to show the user what THIS turn cost (the
+        # 💰 cumulative used to mislead users into thinking a 6.9k-token
+        # turn cost $5.98 when really only a few cents of it was theirs).
+        cost_before: float = float(getattr(bridge, "total_cost", 0.0) or 0.0)
         _last_stop_reason: str | None = None
         # Rolling tool log (Issue #1: merge consecutive tool embeds)
         tool_log_msg: discord.Message | None = None
@@ -912,9 +919,16 @@ class DiscordRenderer:
                     continue
 
                 if isinstance(event, ResultMessage):
-                    # Capture stats from the result
+                    # Capture stats from the result.
+                    # #v1.18-footer: ``total_cost_usd`` on ResultMessage is
+                    # the CUMULATIVE conversation cost (per SDK contract /
+                    # claude_bridge._update_stats). For the footer's 💰
+                    # we want the per-turn delta = cumulative_after -
+                    # cost_before snapshot taken at render_response start.
+                    cumulative_cost = float(getattr(event, 'total_cost_usd', 0) or 0)
                     stats = {
-                        'cost': float(getattr(event, 'total_cost_usd', 0) or 0),
+                        'cost': max(0.0, cumulative_cost - cost_before),
+                        'cost_cumulative': cumulative_cost,
                         'input_tokens': int((getattr(event, 'usage', None) or {}).get('input_tokens', 0) or 0),
                         'output_tokens': int((getattr(event, 'usage', None) or {}).get('output_tokens', 0) or 0),
                         'duration_ms': (time.time() - stream_start) * 1000,
