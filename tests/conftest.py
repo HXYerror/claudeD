@@ -129,3 +129,39 @@ class FakeTarget:
             msg.attachments = list(kwargs["files"])
         self._sent.append(msg)
         return msg
+
+
+# ---------------------------------------------------------------------------
+# #220 — speed up ALL tests that hit `_fetch_context_pct_settled` (footer).
+# Without this autouse fixture, every render_response integration test pays
+# the helper's 0.5s+0.5s sleep on each turn — adds ~1s per test, ~25s suite-wide.
+# Tests can override by passing explicit kwargs in their own monkey-patching.
+# ---------------------------------------------------------------------------
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _zero_context_settle_delay(monkeypatch):
+    """Auto-zero the #220 footer settle delay across all tests.
+
+    The helper's defaults (0.5s + 0.5s retry) are correct for production
+    but make the test suite slow. Tests that specifically exercise the
+    timing behavior can re-patch by calling the helper directly with
+    explicit kwargs (see `tests/test_footer_context_race.py`).
+    """
+    try:
+        import clauded.discord_renderer as _renderer_mod
+    except ImportError:  # safety: tests that don't load the renderer don't need this
+        return
+    if not hasattr(_renderer_mod, "_fetch_context_pct_settled"):
+        return
+    real_helper = _renderer_mod._fetch_context_pct_settled
+
+    async def _fast_helper(bridge, *, initial_delay=0.5, retry_delay=0.5, log_label="footer"):
+        return await real_helper(
+            bridge, initial_delay=0.0, retry_delay=0.0, log_label=log_label
+        )
+
+    monkeypatch.setattr(_renderer_mod, "_fetch_context_pct_settled", _fast_helper)
