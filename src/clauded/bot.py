@@ -29,6 +29,7 @@ from .session_config import SessionConfig
 from .session_store import SessionStore
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
+from . import stream_logger
 from .cogs._unbound import UNBOUND_HINT_MESSAGE, UNBOUND_REFUSE_MESSAGE
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
@@ -1062,6 +1063,25 @@ class ClaudedBot(commands.Bot):
                 )
                 return
             log.exception("Renderer fatal; offering retry button")
+            # #223: dump crash to stream-debug.jsonl so /log dump (#224)
+            # can ship the full traceback even if the user reports a bug
+            # without the rotating clauded.log lines (often gone after 7
+            # rotations — jsonl is the audit trail).
+            #
+            # #223 R1 product: include session_id so /log dump can
+            # cross-reference the SDK conversation (thread_id alone is
+            # ambiguous — sessions cycle on resume #160, and
+            # stop_session runs right after this dump).
+            if stream_logger.is_enabled():
+                import traceback as _tb
+                stream_logger.log_event({
+                    "type": "Crash",
+                    "where": "render_response",
+                    "thread_id": getattr(thread, "id", None),
+                    "session_id": getattr(bridge, "session_id", None),
+                    "exc_class": type(exc).__name__,
+                    "traceback": _tb.format_exc(),
+                })
             thread_id = getattr(thread, "id", None)
             if thread_id is not None:
                 await self.session_manager.stop_session(thread_id)

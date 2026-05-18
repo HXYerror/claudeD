@@ -46,6 +46,7 @@ from claude_agent_sdk.types import (
 from .cli_paths import resolve_claude_cli
 from .config import Config
 from .session_config import SessionConfig
+from . import stream_logger
 
 log = logging.getLogger("clauded.claude_bridge")
 
@@ -260,7 +261,33 @@ class ClaudeBridge:
         client = self._client
         if client is None or not self._active:
             return None
-        return await client.get_server_info()
+        # #223: instrument control-plane call so /log dump (#224) and
+        # observability can see when SDK init info is requested / what
+        # it returns. Failure raises (existing contract); we don't catch.
+        log.debug("get_server_info -> requesting")
+        try:
+            result = await client.get_server_info()
+            log.debug(
+                "get_server_info -> %s (%d keys)",
+                "None" if result is None else "dict",
+                len(result or {}),
+            )
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_server_info",
+                    "result_keys": list(result.keys()) if result else None,
+                })
+            return result
+        except Exception:
+            log.warning("get_server_info failed", exc_info=True)
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_server_info",
+                    "error": True,
+                })
+            raise
 
     async def get_context_usage(self) -> dict | None:
         """Return current context-window usage, or ``None`` if not connected.
@@ -278,7 +305,31 @@ class ClaudeBridge:
         client = self._client
         if client is None or not self._active:
             return None
-        return await client.get_context_usage()
+        # #223: this was the #220 footer-🧠-always-0% bug's blind spot —
+        # neither success nor failure left a log line. Now: success at
+        # DEBUG, failure at WARNING with exc_info, plus a ControlPlane
+        # event in stream-debug.jsonl when enabled.
+        log.debug("get_context_usage -> requesting")
+        try:
+            result = await client.get_context_usage()
+            log.debug("get_context_usage -> %r", result)
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_context_usage",
+                    "result_pct": (result or {}).get("percentage"),
+                    "result_keys": list(result.keys()) if result else None,
+                })
+            return result
+        except Exception:
+            log.warning("get_context_usage failed", exc_info=True)
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_context_usage",
+                    "error": True,
+                })
+            raise
 
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
