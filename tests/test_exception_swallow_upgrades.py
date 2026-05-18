@@ -25,26 +25,62 @@ import pytest
 # ---------------------------------------------------------------------------
 
 
-def test_file_seek_failure_now_logs_warning(caplog):
-    """#223 PR-B A2: silent seek failure caused empty-attachment bug; now logs."""
+@pytest.mark.asyncio
+async def test_file_seek_failure_now_logs_warning(caplog):
+    """#223 PR-B A2: silent seek failure caused empty-attachment bug; now logs.
+
+    R1 tester correction: elevate from source-grep to REAL trigger. Build
+    a stub _safe_send call that exercises the inner _reset_file() closure
+    with a planted seek failure.
+    """
     from clauded.discord_renderer import DiscordRenderer
 
-    # Build a minimal renderer + reset closure
+    # Build a minimal renderer to call _safe_send. We don't actually send;
+    # we just need _reset_file() to fire on a retry attempt. Simpler path:
+    # invoke _reset_file directly via inspecting the closure is brittle, so
+    # we drive _safe_send with a target.send that raises a transient error
+    # — the retry path calls _reset_file before re-attempting.
     renderer = DiscordRenderer.__new__(DiscordRenderer)
-    renderer.target = MagicMock()
+    renderer._last_msg = None
+
+    target = MagicMock()
+    # First call raises transient (triggers retry + _reset_file); second succeeds
+    call_count = {"n": 0}
+    async def _send(**kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            import discord
+            resp = MagicMock()
+            resp.status = 503
+            raise discord.HTTPException(resp, "transient")
+        return MagicMock(id=999)
+    target.send = _send
+    renderer.target = target
 
     # discord.File-shaped object with a broken fp.seek
     bad_fp = MagicMock()
-    bad_fp.seek = MagicMock(side_effect=OSError("disk full"))
+    bad_fp.seek = MagicMock(side_effect=OSError("planted-disk-full"))
     bad_file = MagicMock()
     bad_file.fp = bad_fp
 
-    # Source-grep: the warning string must reference file.fp.seek failure
-    src = inspect.getsource(DiscordRenderer._safe_send)
-    assert "file.fp.seek(0) failed" in src
-    assert "files[i].fp.seek(0) failed" in src
-    # Confirm OLD silent pattern gone
-    assert src.count("except Exception:\n                    pass") == 0
+    caplog.set_level(logging.WARNING, logger="clauded.discord_renderer")
+    await renderer._safe_send(content="test", file=bad_file)
+
+    # The retry kicked in (call_count == 2), _reset_file ran, seek failed,
+    # log.warning fired with the planted error.
+    assert call_count["n"] == 2, (
+        f"Retry didn't fire; got {call_count['n']} send calls. "
+        f"_reset_file path may not have been exercised."
+    )
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    seek_warns = [r for r in warns if "file.fp.seek(0) failed" in r.getMessage()]
+    assert seek_warns, (
+        f"#223 PR-B A2: file.fp.seek failure must log.warning; got: "
+        f"{[r.getMessage() for r in warns]}"
+    )
+    assert "planted-disk-full" in seek_warns[0].getMessage(), (
+        "WARNING should include the exception message for diagnosis"
+    )
 
 
 # ---------------------------------------------------------------------------
