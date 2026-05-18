@@ -16,11 +16,16 @@
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>ThrottleInterval</key><integer>30</integer>
-    <key>ProcessType</key><string>Background</string>
     <key>StandardOutPath</key><string>{{HOME}}/Library/Logs/clauded/out.log</string>
     <!-- #168 dropped: ``StandardErrorPath`` previously pointed at err.log, which
          mirrored every Python log line (Python's stderr handler in bot.py +
          launchd's redirect both wrote the same content). RotatingFileHandler
          at ~/Library/Logs/clauded/clauded.log is now the canonical log. -->
+    <!-- #232 removed: ``ProcessType=Background`` told launchd this is a
+         low-priority occasional task, so it SIGKILL'd us every 15-25 min
+         with the "because inefficient" reason. clauded is a long-running
+         interactive service (Discord gateway + SDK long-poll). Falling
+         back to the implicit default (Standard) gives us no launchd-side
+         resource judgement. See docs/prd/v1.18-fix-launchagent-process-type.md. -->
 </dict>
 </plist>
