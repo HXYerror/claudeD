@@ -296,7 +296,7 @@ async def _fetch_context_pct_settled(
     settle_delay: float = 0.5,
     log_label: str = "footer",
 ) -> float | None:
-    """Fetch context_usage percentage with settle delay + retry-on-0 (#220).
+    """Fetch context-window usage percentage with settle delay + retry-on-0 (#220).
 
     The CLI control plane doesn't immediately reflect the just-finished
     turn's token state when ``ResultMessage`` is emitted. Calling
@@ -306,34 +306,63 @@ async def _fetch_context_pct_settled(
 
     Strategy:
       1. Sleep ``settle_delay`` (default 0.5s) — lets the CLI commit.
-      2. Call ``bridge.get_context_usage()``. If ``percentage > 0``, return.
-      3. If ``percentage == 0``, sleep ``settle_delay`` again and call once
-         more. Accept whatever the second call returns (including 0 —
+      2. Call ``bridge.get_context_usage()``. Compute precise percentage.
+      3. If precise percentage == 0, sleep ``settle_delay`` again and call
+         once more. Accept whatever the second call returns (including 0 —
          first message in a fresh session is legitimately 0%).
+
+    **#v1.18 precision fix**: the SDK's ``ContextUsageResponse.percentage``
+    is documented as float but the live wire format returns an INT —
+    anything ``< 0.5%`` rounds to ``0`` and the user sees ``🧠 0%``
+    forever on small conversations under wide context windows (Opus-4
+    at 1M tokens means a 28k-token turn rounds to ``0``). Compute the
+    percentage ourselves from ``totalTokens / maxTokens`` so a 2.8%
+    conversation renders as ``🧠 2.8%`` not ``🧠 0%``.
+
+    Falls back to the SDK-supplied ``percentage`` int when ``totalTokens``
+    or ``maxTokens`` is missing (old/different SDK versions).
 
     ``settle_delay`` is a single knob (R1 simplicity #225: pre-PR had
     separate ``initial_delay``/``retry_delay`` that were always set
     together). Tests pass ``settle_delay=0.0`` to skip actual sleep.
 
     Returns the percentage float, or ``None`` on any error / missing field.
-    Caller's :func:`_format_context_segment` already handles the
+    Caller's :func:`_format_context_segment` handles the
     ``None`` / ``0`` / ``0 < pct < 1`` cases.
     """
+    def _compute(cu: dict[str, Any] | None) -> float | None:
+        if cu is None:
+            return None
+        # Prefer self-computed ratio for precision (#v1.18: SDK rounds to int).
+        total = cu.get("totalTokens")
+        max_t = cu.get("maxTokens")
+        if (
+            isinstance(total, (int, float))
+            and isinstance(max_t, (int, float))
+            and max_t > 0
+        ):
+            return (float(total) / float(max_t)) * 100.0
+        # Fallback to SDK-provided percentage (legacy / unfamiliar shape).
+        if "percentage" not in cu:
+            return None
+        try:
+            return float(cu["percentage"])
+        except (TypeError, ValueError):
+            return None
+
     try:
         await asyncio.sleep(settle_delay)
         cu = await bridge.get_context_usage()
-        if cu is None or "percentage" not in cu:
-            log.debug("%s: get_context_usage returned no percentage", log_label)
+        pct = _compute(cu)
+        if pct is None:
+            log.debug("%s: get_context_usage returned no usable percentage", log_label)
             return None
-        pct = cu["percentage"]
         if pct > 0:
             return pct
         # Retry once — CLI likely hasn't fully committed turn state yet.
         await asyncio.sleep(settle_delay)
         cu = await bridge.get_context_usage()
-        if cu is None or "percentage" not in cu:
-            return None
-        return cu["percentage"]
+        return _compute(cu)
     except Exception:
         log.debug("%s: get_context_usage failed", log_label, exc_info=True)
         return None
@@ -378,6 +407,15 @@ def _format_context_segment(stats: dict[str, Any] | None) -> str | None:
     # Floor sub-1% to ``<1%`` so a 0.4% turn doesn't render as ``0%``.
     if 0 < pct_f < 1:
         return f" │ {emoji} <1%"
+    # #v1.18 precision tier: SDK's ``percentage`` field is int-rounded,
+    # so a 2.8% conversation showed as ``🧠 0%`` (or ``3%`` if SDK gave
+    # us the rounded value directly). We now compute pct ourselves from
+    # ``totalTokens / maxTokens`` for precision; honor that precision by
+    # showing 1 decimal in the 1–10% range where the difference matters
+    # most. ``0`` exact stays ``0%`` (no decimal noise on truly empty);
+    # values >= 10% stay int (🔥 92.4% reads no better than 🔥 92%).
+    if 0 < pct_f < 10:
+        return f" │ {emoji} {pct_f:.1f}%"
     return f" │ {emoji} {int(pct_f)}%"
 
 
