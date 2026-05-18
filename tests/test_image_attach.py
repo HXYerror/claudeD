@@ -37,6 +37,8 @@ from clauded.discord_renderer import (
 @pytest.mark.parametrize("text,expected", [
     ("![alt](/tmp/x.png)", ["/tmp/x.png"]),
     ("![alt](/tmp/x.PNG)", ["/tmp/x.PNG"]),
+    ("![alt](/tmp/x.Png)", ["/tmp/x.Png"]),
+    ("![alt](/tmp/x.JpEg)", ["/tmp/x.JpEg"]),
     ("![a](/tmp/a.png) and ![b](/tmp/b.jpg)", ["/tmp/a.png", "/tmp/b.jpg"]),
     ("![](/tmp/no-alt.gif)", ["/tmp/no-alt.gif"]),
     ("![alt](https://example.com/x.png)", ["https://example.com/x.png"]),
@@ -184,7 +186,8 @@ def test_process_image_inlines_leaves_rejected_paths(tmp_path, caplog):
 
 
 def test_process_image_inlines_rejects_oversize(tmp_path, monkeypatch):
-    """Files > _IMG_MAX_BYTES are rejected with size in the log."""
+    """#222 AC5: Files > _IMG_MAX_BYTES are rejected with size in the log."""
+    import logging
     from clauded import discord_renderer
 
     # Build a stub that reports a huge size without actually allocating
@@ -192,9 +195,28 @@ def test_process_image_inlines_rejects_oversize(tmp_path, monkeypatch):
     img.write_bytes(b"x")  # 1 byte; we'll fake stat
     monkeypatch.setattr(discord_renderer, "_IMG_MAX_BYTES", 0)  # force any size to fail
     r = _make_renderer(project_path=tmp_path)
-    cleaned, attachments = r._process_image_inlines(f"![]({img})")
-    assert attachments == []
-    assert f"![]({img})" in cleaned  # not stripped
+    import logging
+    caplog_records: list = []
+    handler = logging.Handler()
+    handler.emit = lambda r: caplog_records.append(r)
+    logging.getLogger("clauded.discord_renderer").addHandler(handler)
+    logging.getLogger("clauded.discord_renderer").setLevel(logging.WARNING)
+    try:
+        cleaned, attachments = r._process_image_inlines(f"![]({img})")
+        assert attachments == []
+        assert f"![]({img})" in cleaned  # not stripped
+        # AC5 strengthened: log mentions size + cap explicitly
+        size_warns = [
+            rec for rec in caplog_records
+            if rec.levelno == logging.WARNING
+            and "size" in rec.getMessage() and "cap" in rec.getMessage()
+        ]
+        assert size_warns, (
+            f"AC5: oversize WARNING must include 'size' + 'cap'; "
+            f"got: {[r.getMessage() for r in caplog_records]}"
+        )
+    finally:
+        logging.getLogger("clauded.discord_renderer").removeHandler(handler)
 
 
 def test_process_image_inlines_multi_image_partial_reject(tmp_path):
@@ -298,3 +320,111 @@ def test_renderer_init_project_path_default_none():
     target = MagicMock()
     r = DiscordRenderer(target, bot=None)
     assert r._project_path is None
+
+
+# ---------------------------------------------------------------------------
+# Integration: _finalize_typewriter wires _process_image_inlines into the
+# pipeline. Mental revert R1 tester finding — ensure deletion of the
+# try/finally drain breaks something.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_drains_attachments_no_tables(tmp_path):
+    """#222 R1 tester: integration test. _finalize_typewriter must call
+    _send_text_with_attachments when text contains image markdown.
+    Removing the try/finally drain would silently drop attachments —
+    this test would FAIL.
+    """
+    img = tmp_path / "final.png"
+    img.touch()
+    target = MagicMock()
+    target.send = AsyncMock(return_value=MagicMock(id=1))
+    r = DiscordRenderer.__new__(DiscordRenderer)
+    r._project_path = tmp_path
+    r.target = target
+    r._last_msg = None
+    r._last_msg_text = ""
+    r._bot = None
+
+    drained_paths: list = []
+    async def _spy_send_attachments(text, attachments):
+        drained_paths.extend(attachments)
+    r._send_text_with_attachments = _spy_send_attachments
+
+    # Stub the rest of the pipeline
+    r._process_markers = AsyncMock(side_effect=lambda t: t)
+    r._extract_and_render_tables = AsyncMock(return_value=("hi", []))
+    r._smart_split = lambda t, limit: [t]
+    r._safe_send = AsyncMock(return_value=MagicMock(id=2))
+    r._typewriter_apply = AsyncMock(return_value=MagicMock(id=3))
+
+    live_msg = MagicMock()
+    buffer = f"Look ![alt]({img}) here"
+    await r._finalize_typewriter(live_msg, buffer)
+
+    assert drained_paths == [img], (
+        f"#222 wire-in: _finalize_typewriter must drain image attachments. "
+        f"Got drained={drained_paths!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_drains_attachments_is_final_false(tmp_path):
+    """Same as above but for the pre-tool-use interleave path (is_final=False).
+
+    The try/finally drain MUST fire on this early-return branch too.
+    """
+    img = tmp_path / "final.png"
+    img.touch()
+    r = DiscordRenderer.__new__(DiscordRenderer)
+    r._project_path = tmp_path
+    r.target = MagicMock()
+    r._last_msg = None
+    r._last_msg_text = ""
+    r._bot = None
+
+    drained: list = []
+    async def _spy(text, attachments):
+        drained.extend(attachments)
+    r._send_text_with_attachments = _spy
+    r._process_markers = AsyncMock(side_effect=lambda t: t)
+    r._smart_split = lambda t, limit: [t]
+    r._safe_send = AsyncMock(return_value=MagicMock(id=2))
+    r._safe_edit = AsyncMock(return_value=True)
+
+    buffer = f"![alt]({img})"
+    await r._finalize_typewriter(None, buffer, is_final=False)
+    assert drained == [img]
+
+
+@pytest.mark.asyncio
+async def test_finalize_typewriter_drains_even_on_exception(tmp_path):
+    """R1 simplicity rationale: try/finally means even a mid-flight
+    exception in the body still drains the attachments — we never
+    leak handles or silently drop images.
+    """
+    img = tmp_path / "final.png"
+    img.touch()
+    r = DiscordRenderer.__new__(DiscordRenderer)
+    r._project_path = tmp_path
+    r.target = MagicMock()
+    r._last_msg = None
+    r._last_msg_text = ""
+    r._bot = None
+
+    drained: list = []
+    async def _spy(text, attachments):
+        drained.extend(attachments)
+    r._send_text_with_attachments = _spy
+    # Make markers raise
+    async def _boom(t):
+        raise RuntimeError("planted-mid-flight")
+    r._process_markers = _boom
+
+    buffer = f"![alt]({img})"
+    with pytest.raises(RuntimeError, match="planted-mid-flight"):
+        await r._finalize_typewriter(MagicMock(), buffer)
+    assert drained == [img], (
+        "try/finally must drain even if body raises"
+    )

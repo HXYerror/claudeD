@@ -2243,6 +2243,10 @@ class DiscordRenderer:
         refs to local files into a queue of attachments. Attachments
         are sent at the END (after typewriter + tables), as one or more
         attachment-only follow-up messages (Discord cap 10/msg).
+
+        #222 R1 simplicity: image-attachment drain happens in ONE place
+        — a ``try/finally`` wrapper — so a future return-branch that
+        forgets to drain can't silently drop attachments.
         """
         # #222: image inlining — strip text + queue attachments. Done
         # BEFORE marker processing because ``_THREAD_PATTERN`` doesn't
@@ -2250,15 +2254,27 @@ class DiscordRenderer:
         # claude's output mixes both. Done BEFORE table extraction so
         # ``![alt|foo](path)`` doesn't get misread as a table row.
         buffer, _image_attachments = self._process_image_inlines(buffer)
+        try:
+            await self._finalize_typewriter_body(live_msg, buffer, is_final=is_final)
+        finally:
+            if _image_attachments:
+                await self._send_text_with_attachments("", _image_attachments)
+
+    async def _finalize_typewriter_body(
+        self,
+        live_msg: discord.Message,
+        buffer: str,
+        *,
+        is_final: bool,
+    ) -> None:
+        """#222: inner body of _finalize_typewriter; drain wrapper above
+        owns the attachment-flush. This split lets us keep all the
+        early ``return`` paths without scattering drain calls."""
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
 
         if not is_final:
             if not buffer:
-                # #222: even on empty buffer, if we extracted attachments
-                # in the same flush, drain them now.
-                if _image_attachments:
-                    await self._send_text_with_attachments("", _image_attachments)
                 return
             if len(buffer) <= DISCORD_MAX_LEN:
                 chunks = [buffer]
@@ -2271,9 +2287,6 @@ class DiscordRenderer:
                 await self._safe_send(content=first)
             for chunk in chunks[1:]:
                 await self._safe_send(content=chunk)
-            # #222: drain image attachments after the pre-tool-use dump.
-            if _image_attachments:
-                await self._send_text_with_attachments("", _image_attachments)
             return
 
         # v1.12 — extract tables → PNG follow-ups (PRD R2). On the first
@@ -2297,9 +2310,6 @@ class DiscordRenderer:
                 sent = await self._safe_send(content=chunk)
                 if sent is not None:
                     self._last_msg = sent
-            # #222: drain image attachments after the text (no tables case).
-            if _image_attachments:
-                await self._send_text_with_attachments("", _image_attachments)
             return
 
         # Interleaved path (PRD R2.2): split ``stripped_text`` on
@@ -2338,12 +2348,6 @@ class DiscordRenderer:
         # final tail). ``_send_text_and_tables`` handles the residual.
         await self._send_table_renders([table_renders[0]])
         await self._send_text_and_tables(rest_text, table_renders[1:])
-
-        # #222: after all text + table follow-ups have landed, drain any
-        # image attachments as attachment-only messages (no text body so
-        # they don't duplicate what's already on screen).
-        if _image_attachments:
-            await self._send_text_with_attachments("", _image_attachments)
 
     async def _flush(
         self,
