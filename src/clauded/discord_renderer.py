@@ -31,9 +31,11 @@ import asyncio
 import io
 import json
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 import aiohttp
@@ -211,6 +213,72 @@ CODE_FILE_UPLOAD_THRESHOLD = 3000
 # Regex patterns for Claude channel/thread management markers.
 _THREAD_PATTERN = re.compile(r'\[CREATE_THREAD:\s*(.+?)\]')
 _CHANNEL_PATTERN = re.compile(r'\[CREATE_CHANNEL:\s*(.+?)\]')
+
+# #222: markdown image syntax pointing at a local file.
+#   ![alt-text](/tmp/foo.png)   — stripped + uploaded as attachment
+#   ![alt-text](http://...)     — left untouched (Discord previews http
+#                                  directly; only LOCAL paths need lifting)
+# Captures: 1 = alt-text (discarded), 2 = path.
+_IMG_PATTERN = re.compile(
+    r'!\[([^\]]*)\]\(([^)\s]+\.(?:png|jpg|jpeg|gif|webp))\)',
+    re.IGNORECASE,
+)
+
+# #222: cap per-attachment size at the conservative Discord non-boost
+# limit. Larger files → reject + leave the markdown in place + log.
+_IMG_MAX_BYTES = 8 * 1024 * 1024
+
+# #222: Discord hard limit per message.
+_IMG_MAX_PER_MESSAGE = 10
+
+
+def _is_path_allowed(path: Path, project_path: Path | None) -> bool:
+    """True iff ``path.resolve()`` lives under an allowed root (#222).
+
+    Roots (default):
+    - ``/tmp`` (resolved — macOS ``/tmp→/private/tmp``)
+    - ``$TMPDIR`` (macOS per-user system temp, e.g.
+      ``/var/folders/<hash>/T/``)
+    - ``project_path`` (the bot-bound project subtree, if any)
+
+    NOT ``$HOME`` — too wide. claude could inline ``~/.ssh/id_rsa``
+    or ``~/.aws/credentials`` and we MUST NOT lift those.
+
+    The check uses ``Path.resolve(strict=True)`` so:
+    1. Symlinks are resolved before the under-root test (defeats
+       ``/tmp/link-to-etc-passwd`` escape).
+    2. Missing files reject immediately (avoid leaking "file existed"
+       side-channels via WARN log).
+    """
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+
+    allowed_roots: list[Path] = []
+    try:
+        allowed_roots.append(Path("/tmp").resolve())
+    except OSError:
+        pass
+    sys_tmp = os.environ.get("TMPDIR")
+    if sys_tmp:
+        try:
+            allowed_roots.append(Path(sys_tmp).resolve())
+        except OSError:
+            pass
+    if project_path is not None:
+        try:
+            allowed_roots.append(project_path.resolve())
+        except OSError:
+            pass
+
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
 
 
 
@@ -543,6 +611,7 @@ class DiscordRenderer:
         target: discord.abc.Messageable,
         *,
         bot: discord.Client | None = None,
+        project_path: "Path | None" = None,
     ) -> None:
         self.target = target
         # Optional bot reference — when provided, persistent views (e.g.
@@ -552,6 +621,11 @@ class DiscordRenderer:
         # restarts (discord.py only re-dispatches custom_id interactions
         # to views that are in the client's persistent view store).
         self._bot = bot
+        # #222: bound project path is part of the markdown-image allowlist;
+        # claude can inline ``![alt](./project/img.png)`` and we'll lift it
+        # to a Discord attachment iff it resolves under here. ``None`` =
+        # only the temp dirs are allowed.
+        self._project_path = project_path
         self._last_msg: discord.Message | None = None
         # Shadow of the text we last wrote to ``_last_msg``. discord.py 2.0+
         # Message.edit() is not in-place; reading msg.content post-edit returns
@@ -1814,6 +1888,121 @@ class DiscordRenderer:
     # Streaming helpers
     # ------------------------------------------------------------------
 
+    def _process_image_inlines(self, text: str) -> tuple[str, list[Path]]:
+        """Strip markdown image refs to local files; queue paths for upload (#222).
+
+        Returns ``(cleaned_text, planned_attachments)``. For each match:
+
+        * Path under the allowlist + exists + readable + ≤ ``_IMG_MAX_BYTES``
+          → strip from text, append Path to attachments list.
+        * Otherwise → leave the original markdown in place + ``log.warning``
+          the rejection reason.
+
+        Does not perform IO except ``Path.resolve(strict=True)`` and a
+        ``stat()`` for size; the actual file open happens inside
+        ``discord.File`` on send.
+        """
+        attachments: list[Path] = []
+        offset = 0
+        out_parts: list[str] = []
+        for m in _IMG_PATTERN.finditer(text):
+            raw = m.group(2)
+            # Always emit everything before this match unchanged.
+            out_parts.append(text[offset:m.start()])
+            offset = m.end()
+
+            path = Path(raw)
+            # Reject http(s) URLs (Discord previews those natively) — the
+            # regex doesn't allow whitespace/colons in path so http:// fails
+            # match anyway, but defensively: if path looks like URL keep it.
+            if not path.is_absolute() and self._project_path is not None:
+                # Resolve relative to bound project so claude can write
+                # ``![x](./build/foo.png)``.
+                path = (self._project_path / path)
+
+            if not _is_path_allowed(path, self._project_path):
+                log.warning(
+                    "#222: rejected image attachment %r; not under allowlist or missing",
+                    raw,
+                )
+                out_parts.append(m.group(0))  # keep original markdown
+                continue
+
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                log.warning(
+                    "#222: rejected image attachment %r; stat() failed: %s",
+                    raw, exc,
+                )
+                out_parts.append(m.group(0))
+                continue
+            if size > _IMG_MAX_BYTES:
+                log.warning(
+                    "#222: rejected image attachment %r; size %d > cap %d",
+                    raw, size, _IMG_MAX_BYTES,
+                )
+                out_parts.append(m.group(0))
+                continue
+
+            attachments.append(path)
+
+        out_parts.append(text[offset:])
+        return ("".join(out_parts), attachments)
+
+    async def _send_text_with_attachments(
+        self,
+        text: str,
+        attachments: list[Path],
+    ) -> None:
+        """Send ``text`` then batch ``attachments`` 10-per-message (#222).
+
+        First message carries the text + first up-to-10 files; subsequent
+        messages carry the remaining files in batches. Mirrors the
+        ``_send_text_and_tables`` interleave contract: empty text is
+        OK (attachment-only); empty attachments degrades to plain text
+        via ``_safe_send``.
+        """
+        first_batch = attachments[:_IMG_MAX_PER_MESSAGE]
+        rest = attachments[_IMG_MAX_PER_MESSAGE:]
+
+        files = [discord.File(p) for p in first_batch]
+        text_or_none = text if text.strip() else None
+        if text_or_none is None and not files:
+            return
+
+        # Smart-split text if oversized, send only first chunk with files.
+        if text_or_none is not None and len(text_or_none) > DISCORD_MAX_LEN:
+            chunks = self._smart_split(text_or_none, limit=DISCORD_MAX_LEN) or [
+                text_or_none[:DISCORD_MAX_LEN]
+            ]
+            sent = await self._safe_send(content=chunks[0], files=files or None)
+            if sent is not None:
+                self._last_msg = sent
+                self._last_msg_text = chunks[0]
+            for chunk in chunks[1:]:
+                sent = await self._safe_send(content=chunk)
+                if sent is not None:
+                    self._last_msg = sent
+                    self._last_msg_text = chunk
+        else:
+            sent = await self._safe_send(
+                content=text_or_none, files=files or None
+            )
+            if sent is not None:
+                self._last_msg = sent
+                self._last_msg_text = text_or_none or ""
+
+        # Drain remaining files in 10-batches with no text.
+        while rest:
+            batch = rest[:_IMG_MAX_PER_MESSAGE]
+            rest = rest[_IMG_MAX_PER_MESSAGE:]
+            files = [discord.File(p) for p in batch]
+            sent = await self._safe_send(files=files)
+            if sent is not None:
+                self._last_msg = sent
+                self._last_msg_text = ""
+
     async def _process_markers(self, text: str) -> str:
         """Replace [CREATE_THREAD: x] and [CREATE_CHANNEL: x] markers with results."""
 
@@ -2049,12 +2238,27 @@ class DiscordRenderer:
         extraction — caller resets ``buffer`` so any table content here
         renders as markdown, not PNG. Final flush (``is_final=True``):
         run v1.12 extract + PNG interleave. See #141.
+
+        #222: BEFORE marker / table processing, lift any markdown image
+        refs to local files into a queue of attachments. Attachments
+        are sent at the END (after typewriter + tables), as one or more
+        attachment-only follow-up messages (Discord cap 10/msg).
         """
+        # #222: image inlining — strip text + queue attachments. Done
+        # BEFORE marker processing because ``_THREAD_PATTERN`` doesn't
+        # touch ``![...](...)`` and we want symmetry of order even if
+        # claude's output mixes both. Done BEFORE table extraction so
+        # ``![alt|foo](path)`` doesn't get misread as a table row.
+        buffer, _image_attachments = self._process_image_inlines(buffer)
         # E1: Process channel/thread markers before finalizing.
         buffer = await self._process_markers(buffer)
 
         if not is_final:
             if not buffer:
+                # #222: even on empty buffer, if we extracted attachments
+                # in the same flush, drain them now.
+                if _image_attachments:
+                    await self._send_text_with_attachments("", _image_attachments)
                 return
             if len(buffer) <= DISCORD_MAX_LEN:
                 chunks = [buffer]
@@ -2067,6 +2271,9 @@ class DiscordRenderer:
                 await self._safe_send(content=first)
             for chunk in chunks[1:]:
                 await self._safe_send(content=chunk)
+            # #222: drain image attachments after the pre-tool-use dump.
+            if _image_attachments:
+                await self._send_text_with_attachments("", _image_attachments)
             return
 
         # v1.12 — extract tables → PNG follow-ups (PRD R2). On the first
@@ -2090,6 +2297,9 @@ class DiscordRenderer:
                 sent = await self._safe_send(content=chunk)
                 if sent is not None:
                     self._last_msg = sent
+            # #222: drain image attachments after the text (no tables case).
+            if _image_attachments:
+                await self._send_text_with_attachments("", _image_attachments)
             return
 
         # Interleaved path (PRD R2.2): split ``stripped_text`` on
@@ -2128,6 +2338,12 @@ class DiscordRenderer:
         # final tail). ``_send_text_and_tables`` handles the residual.
         await self._send_table_renders([table_renders[0]])
         await self._send_text_and_tables(rest_text, table_renders[1:])
+
+        # #222: after all text + table follow-ups have landed, drain any
+        # image attachments as attachment-only messages (no text body so
+        # they don't duplicate what's already on screen).
+        if _image_attachments:
+            await self._send_text_with_attachments("", _image_attachments)
 
     async def _flush(
         self,
