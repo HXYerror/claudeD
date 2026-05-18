@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Optional
 import discord
 
 from ._errors import is_transient_discord_error
+from . import stream_logger
 
 log = logging.getLogger("clauded.http_retry")
 
@@ -55,6 +56,17 @@ async def safe_http(
                     type(exc).__name__,
                     delay,
                 )
+                # #223: emit stream-debug event so /log dump (#224) can
+                # show transient retry storms (Discord 5xx waves).
+                if stream_logger.is_enabled():
+                    stream_logger.log_event({
+                        "type": "DiscordHTTPRetry",
+                        "label": label,
+                        "attempt": attempt + 1,
+                        "retries": retries,
+                        "exc_type": type(exc).__name__,
+                        "status": getattr(exc, "status", None),
+                    })
                 await asyncio.sleep(delay)
             else:
                 logger.error(
@@ -63,6 +75,16 @@ async def safe_http(
                     retries,
                     type(exc).__name__,
                 )
+                if stream_logger.is_enabled():
+                    stream_logger.log_event({
+                        "type": "DiscordHTTPRetry",
+                        "label": label,
+                        "attempt": attempt + 1,
+                        "retries": retries,
+                        "exc_type": type(exc).__name__,
+                        "status": getattr(exc, "status", None),
+                        "giveup": True,
+                    })
     logger.debug("safe_http[%s] exhausted (last_exc=%r)", label, last_exc)
     return None
 
