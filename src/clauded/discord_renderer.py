@@ -819,11 +819,72 @@ class DiscordRenderer:
                                 if hasattr(sub_renderer, '_tool_log_lines') and sub_renderer._tool_log_lines:
                                     is_err = bool(getattr(block, "is_error", False))
                                     status = "✅" if not is_err else "❌"
+                                    # #204: extract content + apply short-tier
+                                    # parity. Sub-agent rolling log previously
+                                    # just sliced ``[2:]`` to swap 🔄 → ✅/❌
+                                    # — losing the inline content surfaced on
+                                    # the main thread by #161 / #165 / #180.
+                                    # Medium-tier button is out-of-scope (per
+                                    # #204): sub-renderer doesn't own a
+                                    # persistent view store; per-sub-thread
+                                    # button persistence is a separate piece
+                                    # of work.
+                                    content_str = _extract_block_content_text(block.content)
+                                    is_short = (
+                                        len(content_str) < 200
+                                        and content_str.strip() != ""
+                                    )
                                     # Update last matching entry
                                     for i in range(len(sub_renderer._tool_log_lines) - 1, -1, -1):
-                                        if sub_renderer._tool_log_lines[i].startswith("🔄"):
-                                            sub_renderer._tool_log_lines[i] = f"{status} {sub_renderer._tool_log_lines[i][2:]}"
-                                            break
+                                        line = sub_renderer._tool_log_lines[i]
+                                        if not line.startswith("🔄"):
+                                            continue
+                                        # Existing line shape is ``🔄 Bash: `cmd` `` —
+                                        # `[2:]` strips the running emoji + space
+                                        # and we keep the rest as the "name fragment"
+                                        # (full ``Bash: `cmd` `` rather than just
+                                        # ``Bash`` to preserve sub-renderer's
+                                        # current display). For #204 short tier we
+                                        # need the bare tool name to format
+                                        # ``✅ Bash → content``; pull it from the
+                                        # fragment by splitting on the first ``:``
+                                        # or space.
+                                        body = line[2:].lstrip()
+                                        # Tool-name heuristic: everything up to
+                                        # the first ``:`` (Bash/Read/Edit/Write
+                                        # all use ``Name: ...`` shape) OR everything
+                                        # before the first space (WebSearch "🔍 ..."
+                                        # / fallback "name...").
+                                        if ":" in body:
+                                            tool_label = body.split(":", 1)[0].strip()
+                                        elif " " in body:
+                                            tool_label = body.split(" ", 1)[0].strip()
+                                        else:
+                                            tool_label = body.strip()
+                                        if is_err:
+                                            error_text = content_str[:100] if content_str else "Failed"
+                                            sub_renderer._tool_log_lines[i] = (
+                                                f"{status} {tool_label}: {error_text}"
+                                            )
+                                        elif is_short:
+                                            # Same backtick-strip + newline-collapse
+                                            # contract as the main-thread short tier.
+                                            safe = (
+                                                content_str.strip()
+                                                .replace("`", "'")
+                                                .replace("\n", " │ ")
+                                            )
+                                            sub_renderer._tool_log_lines[i] = (
+                                                f"{status} {tool_label} → {safe}"
+                                            )
+                                        else:
+                                            # Fallback to current behavior:
+                                            # keep the original line body, just
+                                            # flip the leading emoji.
+                                            sub_renderer._tool_log_lines[i] = (
+                                                f"{status} {body}"
+                                            )
+                                        break
                                     has_errors = any("❌" in l for l in sub_renderer._tool_log_lines)
                                     tl_embed = discord.Embed(title="🔧 Tool Activity", description="\n".join(sub_renderer._tool_log_lines[-15:]), color=COLOR_TOOL_FAILURE if has_errors else COLOR_TOOL_SUCCESS)
                                     if sub_renderer._tool_log_msg:
