@@ -738,3 +738,134 @@ def test_207_rolling_log_uses_bold_n_prefix_matching_button_order():
     button_label = f"📄 #{medium_index} {name}"
     assert f"#{medium_index} {name}" in button_label
     assert f"#{medium_index} {name}" in line  # same shared identifier in both surfaces
+
+
+# ---------------------------------------------------------------------------
+# #226 — UnboundLocalError fix: ToolResultBlock without matching rolling-log line
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_226_toolresult_no_matching_rolling_log_does_not_crash(caplog):
+    """#226: when a ToolResultBlock arrives but no `🔄 ToolName` line is
+    found in tool_log_lines (out-of-order event — ResultBlock for a tool
+    we never saw a ToolUseBlock for), the renderer used to crash with
+    `UnboundLocalError: cannot access local variable 'is_medium'`.
+    Defaults pre-loop now prevent the crash; a log.warning surfaces the
+    no-match for diagnostic.
+
+    Reproducer: a ToolResultBlock arrives for tool_id `"ghost-tool"`
+    that has NO matching `🔄 ToolName` line because no ToolUseBlock for
+    "ghost-tool" was ever emitted (simulates the out-of-order race that
+    PM forensics identified as one of the no-match causes).
+    """
+    import sys, logging
+    sys.path.insert(0, "src")
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    # One real tool to seed tool_log_lines with a `🔄 Bash` line (proves
+    # the rolling log is alive and has entries), then a ResultBlock for
+    # a *different* tool name that was never ToolUseBlock-ed.
+    events = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="real-tool", name="Bash", input={"command": "echo 1"})],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[
+                # ToolResultBlock for a ghost tool: never had a ToolUseBlock
+                # so no `🔄 GhostTool` line exists in tool_log_lines.
+                ToolResultBlock(
+                    tool_use_id="ghost-tool",
+                    content="orphan result",
+                    is_error=False,
+                ),
+            ],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=10, duration_api_ms=5,
+            is_error=False, num_turns=1, session_id="sess-226",
+            total_cost_usd=0.0,
+        ),
+    ]
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    caplog.set_level(logging.WARNING, logger="clauded.discord_renderer")
+    # MUST NOT raise (was UnboundLocalError pre-fix)
+    await renderer.render_response(FakeBridge(events), "do things")
+
+    # The diagnostic warning must have fired for the orphan result
+    warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "no-matched rolling-log" in r.getMessage()
+    ]
+    assert warnings, (
+        f"Expected diagnostic warning for no-matched ToolResultBlock; "
+        f"got log records: {[(r.levelname, r.getMessage()[:80]) for r in caplog.records]}"
+    )
+    # Warning includes the diagnostic fields per #223 / #224 epic
+    msg = warnings[0].getMessage()
+    assert "ghost-tool" in msg, f"Warning missing tool_id: {msg!r}"
+    assert "rolling_log_len=" in msg, f"Warning missing rolling_log_len: {msg!r}"
+
+
+@pytest.mark.asyncio
+async def test_226_matched_path_still_works_after_defaults_added(caplog):
+    """Regression pin: the matched path (rolling log has the line) still
+    transitions `🔄 Bash → ✅ Bash → 42` correctly. Pre-fix code worked
+    because matching branches assigned all variables; post-fix code now
+    has pre-loop defaults but matched branches must still set
+    `matched = True` so the no-match warning DOESN'T fire incorrectly."""
+    import sys, logging
+    sys.path.insert(0, "src")
+    from claude_agent_sdk.types import (
+        AssistantMessage, ToolUseBlock, ToolResultBlock, ResultMessage,
+    )
+    from clauded.discord_renderer import DiscordRenderer
+
+    events = [
+        # Single tool use + matching result — typical happy path
+        AssistantMessage(
+            content=[ToolUseBlock(id="tool-1", name="Bash", input={"command": "echo 42"})],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        AssistantMessage(
+            content=[ToolResultBlock(tool_use_id="tool-1", content="42", is_error=False)],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=10, duration_api_ms=5,
+            is_error=False, num_turns=1, session_id="sess-226-ok",
+            total_cost_usd=0.0,
+        ),
+    ]
+
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    caplog.set_level(logging.WARNING, logger="clauded.discord_renderer")
+    await renderer.render_response(FakeBridge(events), "do one thing")
+
+    # NO no-matched warning should have fired (the matched path took it)
+    spurious = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING
+        and "no-matched rolling-log" in r.getMessage()
+    ]
+    assert not spurious, (
+        f"Matched path falsely emitted no-match warning: "
+        f"{[r.getMessage() for r in spurious]}"
+    )
+    # Rolling log embed shows the short-tier inline content
+    rolling = [
+        m for m in target._sent
+        if m.embeds and (m.embeds[0].title or "") == "🔧 Tool Activity"
+    ]
+    assert rolling
+    desc = rolling[-1].embeds[0].description
+    assert "✅ Bash → 42" in desc, f"Expected short-tier `✅ Bash → 42`; got: {desc!r}"
