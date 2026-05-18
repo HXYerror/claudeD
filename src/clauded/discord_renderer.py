@@ -222,6 +222,55 @@ def _fmt_tokens(n: int) -> str:
     return str(n)
 
 
+async def _fetch_context_pct_settled(
+    bridge: Any,
+    *,
+    settle_delay: float = 0.5,
+    log_label: str = "footer",
+) -> float | None:
+    """Fetch context_usage percentage with settle delay + retry-on-0 (#220).
+
+    The CLI control plane doesn't immediately reflect the just-finished
+    turn's token state when ``ResultMessage`` is emitted. Calling
+    ``get_context_usage()`` in that window returns ``percentage == 0``.
+    By the time the user runs ``/context`` manually, state has settled —
+    confirms it's a timing window, not a data-path bug.
+
+    Strategy:
+      1. Sleep ``settle_delay`` (default 0.5s) — lets the CLI commit.
+      2. Call ``bridge.get_context_usage()``. If ``percentage > 0``, return.
+      3. If ``percentage == 0``, sleep ``settle_delay`` again and call once
+         more. Accept whatever the second call returns (including 0 —
+         first message in a fresh session is legitimately 0%).
+
+    ``settle_delay`` is a single knob (R1 simplicity #225: pre-PR had
+    separate ``initial_delay``/``retry_delay`` that were always set
+    together). Tests pass ``settle_delay=0.0`` to skip actual sleep.
+
+    Returns the percentage float, or ``None`` on any error / missing field.
+    Caller's :func:`_format_context_segment` already handles the
+    ``None`` / ``0`` / ``0 < pct < 1`` cases.
+    """
+    try:
+        await asyncio.sleep(settle_delay)
+        cu = await bridge.get_context_usage()
+        if cu is None or "percentage" not in cu:
+            log.debug("%s: get_context_usage returned no percentage", log_label)
+            return None
+        pct = cu["percentage"]
+        if pct > 0:
+            return pct
+        # Retry once — CLI likely hasn't fully committed turn state yet.
+        await asyncio.sleep(settle_delay)
+        cu = await bridge.get_context_usage()
+        if cu is None or "percentage" not in cu:
+            return None
+        return cu["percentage"]
+    except Exception:
+        log.debug("%s: get_context_usage failed", log_label, exc_info=True)
+        return None
+
+
 def _format_context_segment(stats: dict[str, Any] | None) -> str | None:
     """Return ``│ 🧠 N%`` (or thresholded ⚠️ / 🔥) for the cost footer, or
     ``None`` when no usable percentage is available.
@@ -728,23 +777,21 @@ class DiscordRenderer:
                         'model': getattr(event, 'model', '') or '',
                         'stop_reason': _last_stop_reason,
                     }
-                    # #182: pull context-window usage and fold percentage
-                    # into stats so the footer can render `🧠 N%` segment.
-                    # ResultMessage.usage carries per-turn API tokens only;
-                    # the cumulative-vs-max ratio lives on a separate SDK
-                    # control-plane call (already wired for /context cmd,
-                    # #163 sub-task 3). Mirrors #160's graceful-fallback
-                    # discipline — any exception logs at DEBUG and the
-                    # footer simply omits the segment.
-                    try:
-                        cu = await bridge.get_context_usage()
-                        if cu and "percentage" in cu:
-                            stats["context_percentage"] = cu["percentage"]
-                    except Exception:
-                        log.debug(
-                            "get_context_usage failed; footer omits 🧠",
-                            exc_info=True,
-                        )
+                    # #182 + #220: pull context-window usage and fold
+                    # percentage into stats so the footer can render
+                    # `🧠 N%` segment. ResultMessage.usage carries per-turn
+                    # API tokens only; the cumulative-vs-max ratio lives
+                    # on a separate SDK control-plane call (already wired
+                    # for /context cmd, #163 sub-task 3). #220 wraps the
+                    # call in `_fetch_context_pct_settled` which adds a
+                    # short settle delay + retry-on-0 to side-step a CLI
+                    # control-plane race that previously made the footer
+                    # always show `🧠 0%`. Mirrors #160's graceful-fallback
+                    # discipline — helper returns None on any error, and
+                    # `_format_context_segment` omits the segment then.
+                    stats["context_percentage"] = await _fetch_context_pct_settled(
+                        bridge, log_label="footer"
+                    )
                     break
 
 

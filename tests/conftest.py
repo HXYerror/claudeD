@@ -129,3 +129,46 @@ class FakeTarget:
             msg.attachments = list(kwargs["files"])
         self._sent.append(msg)
         return msg
+
+
+# ---------------------------------------------------------------------------
+# #220 — speed up ALL tests that hit `_fetch_context_pct_settled` (footer).
+# Without this autouse fixture, every render_response integration test pays
+# the helper's 0.5s+0.5s sleep on each turn — adds ~1s per test, ~25s suite-wide.
+# Tests can override by passing explicit kwargs in their own monkey-patching.
+# ---------------------------------------------------------------------------
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _zero_context_settle_delay(monkeypatch):
+    """Auto-zero the #220 footer settle delay across all tests.
+
+    The helper's default (0.5s) is correct for production but makes the
+    test suite slow. Tests that specifically exercise the timing behavior
+    can re-patch via direct ``monkeypatch`` or by calling the helper
+    directly (see `tests/test_footer_context_race.py`).
+
+    R1 simplicity fix: this fixture HARD-OVERWRITES the delay to 0.0;
+    it does NOT accept a caller-supplied ``settle_delay`` and silently
+    discard it (the previous wrapper shape misled future debuggers).
+    Tests that need a non-zero delay must `monkeypatch.setattr` again.
+    """
+    try:
+        import clauded.discord_renderer as _renderer_mod
+    except ImportError:  # safety: tests that don't load the renderer don't need this
+        return
+    if not hasattr(_renderer_mod, "_fetch_context_pct_settled"):
+        return
+    real_helper = _renderer_mod._fetch_context_pct_settled
+
+    async def _zero_delay_helper(bridge, *, log_label="footer", **_ignored):
+        # _ignored swallows any settle_delay kwarg callers may pass.
+        # We deliberately force settle_delay=0.0 — see docstring.
+        return await real_helper(
+            bridge, settle_delay=0.0, log_label=log_label
+        )
+
+    monkeypatch.setattr(_renderer_mod, "_fetch_context_pct_settled", _zero_delay_helper)
