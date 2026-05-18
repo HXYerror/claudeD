@@ -7,11 +7,13 @@ messages to a per-thread :class:`ClaudeBridge` session.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import shutil
 import tempfile
 import time
+import traceback
 import sys
 import asyncio
 from pathlib import Path
@@ -137,6 +139,12 @@ def _build_retry_session_config(
 # repo for the matching string in those files.
 # --------------------------------------------------------------------------
 _LAUNCHD_LABEL = "com.hxy.clauded"
+
+# #224 R1 simplicity: cooldown between consecutive auto-crash bundle
+# dispatches on the SAME thread. 5 minutes is the sweet spot: rare
+# enough that a thrashing bug doesn't spam attachments, short enough
+# that a 1-hour-later second crash gets its own bundle.
+AUTO_CRASH_COOLDOWN_S = 300
 # _LOG_DIR and _CACHE_DIR live in _logging_setup.py (v1.18 stage-28 trim);
 # imported above. _HEARTBEAT_PATH stays here because it belongs to the
 # heartbeat task, not to logging setup.
@@ -317,6 +325,8 @@ class ClaudedBot(commands.Bot):
             send_to_claude, pin_message, ratelimit_info,
             debug_toggle, notify_toggle, unbound_fallback_toggle, btw_cmd,
         )
+        # #224 epic: /log dump diagnostic bundle (slash + auto-crash).
+        from .cogs.log_dump import log_group
 
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
@@ -345,6 +355,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(btw_cmd)
         self.tree.add_command(context_cmd)
         self.tree.add_command(diff_cmd)
+        # #224: /log dump
+        self.tree.add_command(log_group)
         # #185: do NOT sync globally here — historically claudeD synced
         # via both ``tree.sync()`` (global) AND PR-specific per-guild
         # PUT calls, so commands ended up registered in BOTH scopes and
@@ -1111,6 +1123,14 @@ class ClaudedBot(commands.Bot):
                     "exc_class": type(exc).__name__,
                     "traceback": _tb.format_exc(),
                 })
+            # #224 epic Subtask 4: auto-crash bundle dispatch. Rate-limited
+            # per thread (5min cooldown) so a thrash-cycle bug doesn't
+            # spam the channel with bundles.
+            await self._maybe_dispatch_auto_crash_bundle(
+                thread=thread,
+                exc=exc,
+                bridge=bridge,
+            )
             thread_id = getattr(thread, "id", None)
             if thread_id is not None:
                 await self.session_manager.stop_session(thread_id)
@@ -1170,6 +1190,87 @@ class ClaudedBot(commands.Bot):
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
+
+    # ------------------------------------------------------------------
+    # #224 epic Subtask 4 — auto-crash bundle dispatch
+    # ------------------------------------------------------------------
+
+    async def _maybe_dispatch_auto_crash_bundle(
+        self,
+        *,
+        thread: "discord.abc.Messageable | None",
+        exc: BaseException,
+        bridge: "object | None",
+    ) -> None:
+        """#224: generate and upload an auto-crash diagnostic bundle.
+
+        Rate-limited per-thread (``AUTO_CRASH_COOLDOWN_S``) so a thrash-
+        cycle bug doesn't spam the channel with bundles. Best-effort:
+        any failure inside this method is logged but never re-raised
+        (the caller is already in an ``except Exception`` block recovering
+        from the original crash).
+        """
+        if thread is None:
+            return
+        thread_id = getattr(thread, "id", None)
+        if thread_id is None:
+            return
+
+        # Per-thread rate-limiter (dict of thread_id -> last dispatch ts)
+        if not hasattr(self, "_auto_crash_last_dispatch"):
+            self._auto_crash_last_dispatch: dict[int, float] = {}
+        now = time.time()
+        last = self._auto_crash_last_dispatch.get(thread_id, 0)
+        if now - last < AUTO_CRASH_COOLDOWN_S:
+            log.info(
+                "#224: skip auto-crash bundle (cooldown active) thread=%s",
+                thread_id,
+            )
+            return
+        self._auto_crash_last_dispatch[thread_id] = now
+
+        # Build the bundle. Run in executor so we don't block recovery.
+        from .diagnostics import bundle as _bundle_mod
+        crash_context = {
+            "where": "render_response",
+            "thread_id": thread_id,
+            "exc_class": type(exc).__name__,
+            "exc_message": str(exc)[:500],
+            "session_id": getattr(bridge, "session_id", None),
+            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__),
+        }
+        loop = asyncio.get_running_loop()
+        try:
+            out_path = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    _bundle_mod.generate_bundle,
+                    bot=self,
+                    generated_by="auto-crash",
+                    crash_context=crash_context,
+                ),
+            )
+        except Exception:
+            log.exception("#224: auto-crash bundle generation failed")
+            return
+
+        try:
+            embed = discord.Embed(
+                title="📋 Diagnostic bundle attached",
+                description=(
+                    "Renderer crashed mid-turn. Send this `.zip` to PM "
+                    "for root-cause analysis.\n\n"
+                    f"Crash: `{type(exc).__name__}`"
+                ),
+                color=COLOR_TOOL_FAILURE,
+            )
+            await safe_send_message(
+                thread,
+                embed=embed,
+                file=discord.File(out_path),
+            )
+        except Exception:
+            log.exception("#224: auto-crash bundle upload failed")
 
 
 # ---------------------------------------------------------------------------
