@@ -1608,6 +1608,7 @@ class DiscordRenderer:
                                 # event is a safe no-op (correct since
                                 # there's no rolling-log line to update).
                                 is_medium = False
+                                is_xlong = False  # #181 xlong tier marker
                                 content_str = ""
                                 medium_index = None
                                 matched = False  # for the diagnostic log below
@@ -1654,6 +1655,20 @@ class DiscordRenderer:
                                         and 200 <= len(content_str) < 8000
                                         and content_str.strip() != ""
                                     )
+                                    # #181 xlong tier: ``len >= 8000``. Button-
+                                    # tier rate-limit + 25-component cap make
+                                    # the medium-tier ephemeral button approach
+                                    # impractical at this size. Send the result
+                                    # as a standalone .txt file attachment
+                                    # message immediately, and surface a summary
+                                    # line on the rolling log. Errors stay
+                                    # capped at 100 chars regardless of size.
+                                    is_xlong = (
+                                        not is_short
+                                        and not is_err
+                                        and len(content_str) >= 8000
+                                        and content_str.strip() != ""
+                                    )
                                     if is_err:
                                         error_text = content_str[:100] if content_str else "Failed"
                                         tool_log_lines[i] = f"{status} {name}: {error_text}"
@@ -1695,6 +1710,18 @@ class DiscordRenderer:
                                             f"{status} **#{medium_index} {name}**: "
                                             f"{line_count} lines / "
                                             f"{len(content_str)} chars (⬇ click to view)"
+                                        )
+                                    elif is_xlong:
+                                        # #181: summary line on rolling log;
+                                        # file attachment is sent as a
+                                        # separate message AFTER the rolling-
+                                        # log embed update (so order is
+                                        # "✅ log update + 📄 file").
+                                        line_count = content_str.count("\n") + 1
+                                        tool_log_lines[i] = (
+                                            f"{status} {name}: "
+                                            f"{line_count} lines / "
+                                            f"{len(content_str)} chars (see attached file)"
                                         )
                                     else:
                                         tool_log_lines[i] = f"{status} {name}"
@@ -1825,6 +1852,28 @@ class DiscordRenderer:
                                         if f"#{medium_index} {name}" in tool_log_lines[j] and "click to view" in tool_log_lines[j]:
                                             tool_log_lines[j] = f"{status} **#{medium_index} {name}** ({len(content_str)} chars; view button unavailable)"
                                             break
+                                # #181 xlong tier: send the .txt attachment
+                                # as a follow-up message AFTER the rolling-
+                                # log embed is updated. The summary line
+                                # already promises "(see attached file)";
+                                # honor that promise here.
+                                if is_xlong and not is_err and tool_id:
+                                    line_count = content_str.count("\n") + 1
+                                    safe_name = name.lower().replace(" ", "_")
+                                    file_bytes = content_str.encode(
+                                        "utf-8", errors="replace"
+                                    )
+                                    await self._safe_send(
+                                        content=(
+                                            f"📄 **{name} result** — "
+                                            f"{len(content_str)} chars / "
+                                            f"{line_count} lines"
+                                        ),
+                                        file=discord.File(
+                                            fp=io.BytesIO(file_bytes),
+                                            filename=f"{safe_name}_result.txt",
+                                        ),
+                                    )
                             elif tool_id and tool_id in tool_msgs:
                                 orig_msg = tool_msgs[tool_id]
                                 if is_err:
