@@ -7,11 +7,13 @@ messages to a per-thread :class:`ClaudeBridge` session.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import shutil
 import tempfile
 import time
+import traceback
 import sys
 import asyncio
 from pathlib import Path
@@ -137,6 +139,12 @@ def _build_retry_session_config(
 # repo for the matching string in those files.
 # --------------------------------------------------------------------------
 _LAUNCHD_LABEL = "com.hxy.clauded"
+
+# #224 R1 simplicity: cooldown between consecutive auto-crash bundle
+# dispatches on the SAME thread. 5 minutes is the sweet spot: rare
+# enough that a thrashing bug doesn't spam attachments, short enough
+# that a 1-hour-later second crash gets its own bundle.
+AUTO_CRASH_COOLDOWN_S = 300
 # _LOG_DIR and _CACHE_DIR live in _logging_setup.py (v1.18 stage-28 trim);
 # imported above. _HEARTBEAT_PATH stays here because it belongs to the
 # heartbeat task, not to logging setup.
@@ -1187,8 +1195,6 @@ class ClaudedBot(commands.Bot):
     # #224 epic Subtask 4 — auto-crash bundle dispatch
     # ------------------------------------------------------------------
 
-    _AUTO_CRASH_COOLDOWN_S = 300  # 5 min
-
     async def _maybe_dispatch_auto_crash_bundle(
         self,
         *,
@@ -1198,7 +1204,7 @@ class ClaudedBot(commands.Bot):
     ) -> None:
         """#224: generate and upload an auto-crash diagnostic bundle.
 
-        Rate-limited per-thread (``_AUTO_CRASH_COOLDOWN_S``) so a thrash-
+        Rate-limited per-thread (``AUTO_CRASH_COOLDOWN_S``) so a thrash-
         cycle bug doesn't spam the channel with bundles. Best-effort:
         any failure inside this method is logged but never re-raised
         (the caller is already in an ``except Exception`` block recovering
@@ -1213,10 +1219,9 @@ class ClaudedBot(commands.Bot):
         # Per-thread rate-limiter (dict of thread_id -> last dispatch ts)
         if not hasattr(self, "_auto_crash_last_dispatch"):
             self._auto_crash_last_dispatch: dict[int, float] = {}
-        import time as _time
-        now = _time.time()
+        now = time.time()
         last = self._auto_crash_last_dispatch.get(thread_id, 0)
-        if now - last < self._AUTO_CRASH_COOLDOWN_S:
+        if now - last < AUTO_CRASH_COOLDOWN_S:
             log.info(
                 "#224: skip auto-crash bundle (cooldown active) thread=%s",
                 thread_id,
@@ -1226,21 +1231,19 @@ class ClaudedBot(commands.Bot):
 
         # Build the bundle. Run in executor so we don't block recovery.
         from .diagnostics import bundle as _bundle_mod
-        import functools as _ft
-        import traceback as _tb
         crash_context = {
             "where": "render_response",
             "thread_id": thread_id,
             "exc_class": type(exc).__name__,
             "exc_message": str(exc)[:500],
             "session_id": getattr(bridge, "session_id", None),
-            "traceback": _tb.format_exception(type(exc), exc, exc.__traceback__),
+            "traceback": traceback.format_exception(type(exc), exc, exc.__traceback__),
         }
         loop = asyncio.get_running_loop()
         try:
             out_path = await loop.run_in_executor(
                 None,
-                _ft.partial(
+                functools.partial(
                     _bundle_mod.generate_bundle,
                     bot=self,
                     generated_by="auto-crash",

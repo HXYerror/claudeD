@@ -51,30 +51,52 @@ ENV_ALLOWLIST: frozenset[str] = frozenset({
 ENV_PREFIX_ALLOWLIST: tuple[str, ...] = ("LC_",)
 
 # Pattern matching var names that MUST be redacted (case-insensitive).
+# #224 R1 security: extended beyond the original TOKEN/SECRET/etc. to
+# include OAuth-era names (AUTH, OAUTH, BEARER, JWT, COOKIE, SIGNING)
+# as defense-in-depth. Default-deny on unknown keys still catches them,
+# but pattern-match wins early so any future allowlist addition can't
+# accidentally pass them through.
 ENV_SENSITIVE_PATTERN = re.compile(
-    r"TOKEN|SECRET|API_KEY|PASSWORD|PRIVATE_KEY|PASSPHRASE",
+    r"TOKEN|SECRET|API_KEY|PASSWORD|PRIVATE_KEY|PASSPHRASE"
+    r"|AUTH|OAUTH|BEARER|JWT|COOKIE|SIGNING|CREDENTIAL",
     re.IGNORECASE,
 )
 
 
 def _digest_marker(value: str) -> str:
-    """Return ``len=<N> sha256=<first8>`` provenance for a redacted value."""
+    """Return ``len=<N> sha256=<first8>`` provenance for a redacted value.
+
+    #224 R1 security: for short values (<= 12 chars), the
+    ``len=N sha256=<first8>`` envelope is brute-forceable via rainbow
+    tables (especially 4-digit PINs / short passphrases). Drop the
+    sha256 prefix for short values — length alone still helps PM
+    distinguish "empty" from "set" without leaking guessable hash.
+    """
     if not value:
-        return "len=0 sha256=empty"
+        return "len=0 empty"
+    n = len(value)
+    if n <= 12:
+        # Short — don't ship a hash a rainbow table could invert.
+        return f"len={n} <redacted-short>"
     digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
-    return f"len={len(value)} sha256={digest[:8]}"
+    return f"len={n} sha256={digest[:8]}"
 
 
 def redact_env(env: dict[str, str] | None = None) -> dict[str, str]:
     """Return a copy of ``env`` ready to dump to the bundle.
 
-    - Allowlisted keys → verbatim value
+    - Allowlisted keys → verbatim value (with path redaction on path-shape vars)
     - Keys matching ``ENV_SENSITIVE_PATTERN`` → ``len=N sha256=...``
     - Everything else → omitted entirely (keep the bundle small, avoid
       leaking app-internal env we haven't audited)
+
+    #224 R1 security: ``HOME`` / ``USER`` / ``PWD`` carry the operator's
+    actual username ("/Users/alice", "alice"). Apply the same path-redact
+    treatment to their values so the bundle doesn't leak the account name.
     """
     if env is None:
         env = dict(os.environ)
+    username = _current_username()
     out: dict[str, str] = {}
     for key, value in env.items():
         # Sensitive override always wins (TOKEN-named keys never leak even
@@ -83,7 +105,14 @@ def redact_env(env: dict[str, str] | None = None) -> dict[str, str]:
             out[key] = _digest_marker(value)
             continue
         if key in ENV_ALLOWLIST:
-            out[key] = value
+            # #224 R1 security: path-redact the value for path-shape vars
+            # so the username doesn't leak via env-redacted.txt.
+            if key in ("HOME", "PWD"):
+                out[key] = redact_path(value, username=username)
+            elif key == "USER":
+                out[key] = "<user>" if value == username else value
+            else:
+                out[key] = value
             continue
         if any(key.startswith(p) for p in ENV_PREFIX_ALLOWLIST):
             out[key] = value

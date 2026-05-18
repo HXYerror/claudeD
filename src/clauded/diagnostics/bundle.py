@@ -208,7 +208,12 @@ def _build_manifest(
     crash_context: dict | None,
     bot: Any,
 ) -> dict:
-    """Assemble the manifest dict per PRD §Bundle Contents."""
+    """Assemble the manifest dict per PRD §Bundle Contents.
+
+    #224 R1 security: ``crash_context['traceback']`` and ``exc_message``
+    can contain ``/Users/<actual>/`` from stack frames or SDK error
+    strings. Apply path redaction before embedding into manifest.
+    """
     now = datetime.now(timezone.utc)
     start_time = getattr(bot, "_start_time", None) if bot is not None else None
     uptime_s = (
@@ -216,6 +221,20 @@ def _build_manifest(
         if isinstance(start_time, (int, float))
         else None
     )
+    # Redact crash_context in place (shallow copy so we don't mutate caller's dict).
+    redacted_crash = None
+    if crash_context is not None:
+        redacted_crash = dict(crash_context)
+        if isinstance(redacted_crash.get("traceback"), list):
+            redacted_crash["traceback"] = [
+                redact.redact_text(str(line)) for line in redacted_crash["traceback"]
+            ]
+        elif isinstance(redacted_crash.get("traceback"), str):
+            redacted_crash["traceback"] = redact.redact_text(redacted_crash["traceback"])
+        if isinstance(redacted_crash.get("exc_message"), str):
+            redacted_crash["exc_message"] = redact.redact_text(
+                redacted_crash["exc_message"]
+            )
     return {
         "bundle_version": 1,
         "generated_at": now.isoformat().replace("+00:00", "Z"),
@@ -224,8 +243,9 @@ def _build_manifest(
         "bot_uptime_s": uptime_s,
         "claude_cli_version": getattr(bot, "_claude_version", "unknown") if bot else "unknown",
         "python_version": sys.version.split()[0],
+        "python_executable": sys.executable,
         "platform": sys.platform,
-        "crash_context": crash_context,
+        "crash_context": redacted_crash,
     }
 
 
@@ -302,13 +322,15 @@ def generate_bundle(
             data = _tail_bytes(log_dir / log_name, byte_limit)
             if not data:
                 continue
-            # Path redaction on text logs (jsonl skipped — would break parsing)
-            if log_name.endswith(".log") or log_name.endswith(".log.1"):
-                try:
-                    text = data.decode("utf-8", errors="replace")
-                    data = redact.redact_text(text).encode("utf-8")
-                except Exception:
-                    pass
+            # #224 R1 security: path-redact ALL log tails, including
+            # jsonl. The earlier "would break JSON parsing" rationale
+            # was wrong: substring substitution of /Users/<actual>/
+            # → /Users/<user>/ is JSON-safe (path strings stay valid).
+            try:
+                text = data.decode("utf-8", errors="replace")
+                data = redact.redact_text(text).encode("utf-8")
+            except Exception:
+                pass
             archive_name = f"logs/{log_name}"
             if log_name == "stream-debug.jsonl":
                 archive_name = "logs/stream-debug.tail.jsonl"
@@ -337,33 +359,20 @@ def generate_bundle(
                 json.dumps(_snapshot_bot_flags(bot), indent=2, ensure_ascii=False),
             )
 
-        # diagnostics/
-        diag = {
-            "python_executable": sys.executable,
-            "sys_path_len": len(sys.path),
-        }
-        zf.writestr(
-            "diagnostics/info.json",
-            json.dumps(diag, indent=2, ensure_ascii=False),
-        )
+        # #224 R1 simplicity: diagnostics/info.json had 2 fields
+        # (python_executable + sys_path_len); merged into manifest.json's
+        # python_version/platform fields above. Directory dropped.
 
     # Write + size-budget check + truncate-on-overrun. Truncation strategy:
-    # re-build with HALF the log byte budget; rare on normal bots.
+    # drop the bulky logs/ entries; keep manifest + state + runtime (the
+    # high-value PM-debug data).
     data = buf.getvalue()
     if len(data) > size_budget:
         log.warning(
-            "#224: bundle %d bytes exceeds budget %d; re-tailing logs",
+            "#224: bundle %d bytes exceeds budget %d; dropping logs/",
             len(data), size_budget,
         )
-        return generate_bundle(
-            bot=bot,
-            data_dir=data_dir,
-            out_dir=out_dir,
-            generated_by=generated_by,
-            crash_context=crash_context,
-            log_dir=log_dir,
-            size_budget=size_budget,
-        ) if False else _emergency_truncate(
+        return _emergency_truncate(
             buf=buf,
             out_path=out_path,
             size_budget=size_budget,

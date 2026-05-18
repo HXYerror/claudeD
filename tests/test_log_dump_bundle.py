@@ -57,18 +57,21 @@ def test_redact_env_drops_unknown_keys():
     ("DISCORD_BOT_TOKEN", "actual-token-string-here-32chars"),
     ("ANTHROPIC_API_KEY", "sk-ant-abc123"),
     ("GITHUB_TOKEN", "ghp_xxx"),
-    ("MY_SECRET_KEY", "redacted"),
-    ("APP_PASSWORD", "redacted"),
-    ("PRIVATE_KEY_PEM", "-----BEGIN..."),
+    ("MY_SECRET_KEY", "hush-value-x"),
+    ("APP_PASSWORD", "hush-value-y"),
+    ("PRIVATE_KEY_PEM", "-----BEGIN-this-is-a-long-pem-string-here-32+chars"),
 ])
 def test_redact_env_redacts_sensitive_pattern(key, value):
     """Any key matching TOKEN/SECRET/API_KEY/PASSWORD/PRIVATE_KEY/PASSPHRASE
-    gets replaced with ``len=N sha256=...`` marker."""
+    gets replaced with a redaction marker (long values: ``len=N sha256=<first8>``;
+    short values: ``len=N <redacted-short>`` per R1 security finding).
+    """
     out = redact.redact_env({key: value})
     assert key in out
     assert value not in out[key], f"actual value leaked for {key}: {out[key]!r}"
     assert out[key].startswith("len=")
-    assert "sha256=" in out[key]
+    # Either a hash (long values) or the explicit short marker.
+    assert "sha256=" in out[key] or "<redacted-short>" in out[key]
 
 
 def test_redact_env_sensitive_wins_over_allowlist():
@@ -217,7 +220,9 @@ def test_generate_bundle_produces_zip(tmp_path):
     assert "manifest.json" in names
     assert "env-redacted.txt" in names
     assert "state/projects.json" in names
-    assert "diagnostics/info.json" in names
+    # #224 R1 simplicity: diagnostics/info.json merged into manifest;
+    # no separate diagnostics/ directory.
+    assert "diagnostics/info.json" not in names
 
 
 def test_generate_bundle_manifest_shape(tmp_path):
@@ -236,6 +241,9 @@ def test_generate_bundle_manifest_shape(tmp_path):
     assert manifest["bot_pid"] == os.getpid()
     assert isinstance(manifest["generated_at"], str)
     assert manifest["generated_at"].endswith("Z")
+    # #224 R1 simplicity: diagnostics/info.json merged into manifest.
+    assert "python_executable" in manifest
+    assert manifest["python_executable"] == sys.executable
 
 
 def test_generate_bundle_no_token_leaks(tmp_path, monkeypatch):
@@ -476,3 +484,238 @@ async def test_auto_crash_dispatches_when_cooldown_expired(tmp_path, monkeypatch
     assert captured["kwargs"]["generated_by"] == "auto-crash"
     assert sent_args, "bundle must be uploaded to the thread"
     assert sent_args[0][0] is thread
+
+
+# ---------------------------------------------------------------------------
+# R1 retrofits
+# ---------------------------------------------------------------------------
+
+
+def test_r1_env_redacts_home_value(monkeypatch):
+    """R1 security: HOME / PWD values get path-redacted so the operator's
+    username doesn't leak via env-redacted.txt."""
+    monkeypatch.setattr(redact, "_current_username", lambda: "alice")
+    out = redact.redact_env({
+        "HOME": "/Users/alice",
+        "PWD": "/Users/alice/proj",
+        "USER": "alice",
+        "PATH": "/usr/bin",
+    })
+    assert out["HOME"] == "/Users/<user>"
+    assert out["PWD"] == "/Users/<user>/proj"
+    assert out["USER"] == "<user>"
+    assert out["PATH"] == "/usr/bin"  # unchanged
+
+
+def test_r1_env_user_passes_other_users():
+    """If USER somehow equals an OTHER user (not the current process
+    owner), don't redact — it might be useful debug info."""
+    out = redact.redact_env({"USER": "claude-runner"})
+    assert out["USER"] == "claude-runner"
+
+
+def test_r1_env_extended_sensitive_pattern():
+    """R1 security: pattern extended to AUTH/OAUTH/BEARER/JWT/COOKIE/SIGNING/CREDENTIAL."""
+    for key, val in [
+        ("AUTH_TOKEN_X", "secret"),  # AUTH AND TOKEN — either should match
+        ("OAUTH_CLIENT", "secret"),
+        ("BEARER_TKN", "secret"),
+        ("JWT_KEY", "secret"),  # JWT AND KEY — either should match
+        ("COOKIE_VAL", "secret"),
+        ("SIGNING_KEY_PROD", "secret"),
+        ("CREDENTIALS_FILE", "secret"),
+    ]:
+        out = redact.redact_env({key: val})
+        assert key in out
+        assert "secret" not in out[key], f"{key} leaked: {out[key]!r}"
+
+
+def test_r1_digest_marker_short_value_no_hash():
+    """R1 security: short values get `<redacted-short>` instead of brute-forceable hash."""
+    out = redact._digest_marker("1234")  # 4-char PIN
+    assert "sha256" not in out
+    assert "<redacted-short>" in out
+    assert "len=4" in out
+
+
+def test_r1_digest_marker_long_value_keeps_hash():
+    """Long values keep the hash — useful for fingerprinting without brute-force risk."""
+    out = redact._digest_marker("this-is-a-very-long-token-string-32+chars")
+    assert "sha256=" in out
+    assert "len=" in out
+
+
+def test_r1_bundle_jsonl_tail_path_redacted(tmp_path, monkeypatch):
+    """R1 security: stream-debug.jsonl tail now also gets path-redacted.
+
+    Previous code skipped jsonl with wrong rationale ("would break parsing").
+    """
+    monkeypatch.setattr(redact, "_current_username", lambda: "alice")
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    jsonl = log_dir / "stream-debug.jsonl"
+    jsonl.write_text(
+        '{"type":"ControlPlane","path":"/Users/alice/repo/foo"}\n'
+        '{"type":"DiscordHTTPRetry","url":"/Users/alice/scratch"}\n'
+    )
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=log_dir,
+    )
+    with zipfile.ZipFile(out_path) as z:
+        jsonl_data = z.read("logs/stream-debug.tail.jsonl")
+    assert b"/Users/alice" not in jsonl_data, (
+        "#224 R1 security: jsonl tail must be path-redacted"
+    )
+    assert b"/Users/<user>" in jsonl_data
+
+
+def test_r1_bundle_crash_context_traceback_redacted(tmp_path, monkeypatch):
+    """R1 security: crash traceback in manifest is path-redacted."""
+    monkeypatch.setattr(redact, "_current_username", lambda: "alice")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    crash_context = {
+        "where": "render_response",
+        "thread_id": 42,
+        "exc_class": "RuntimeError",
+        "exc_message": "failed in /Users/alice/proj/foo.py line 99",
+        "traceback": [
+            'File "/Users/alice/.venv/lib/foo.py", line 1, in bar\n',
+            'File "/Users/alice/repo/main.py", line 2, in baz\n',
+        ],
+    }
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=tmp_path / "x",
+        generated_by="auto-crash",
+        crash_context=crash_context,
+    )
+    with zipfile.ZipFile(out_path) as z:
+        manifest = json.loads(z.read("manifest.json"))
+    tb_text = " ".join(manifest["crash_context"]["traceback"])
+    assert "/Users/alice" not in tb_text
+    assert "/Users/<user>" in tb_text
+    assert "/Users/alice" not in manifest["crash_context"]["exc_message"]
+
+
+def test_r1_bundle_emergency_truncate_drops_logs(tmp_path):
+    """R1 tester: AC5 size budget overflow → logs/ dropped, manifest+state kept."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    # Plant a giant log of HIGH-ENTROPY data so DEFLATE can't compress it
+    # below the budget. 200 KB of compressed-resistant bytes.
+    import secrets
+    big = log_dir / "clauded.log"
+    big.write_bytes(secrets.token_bytes(200 * 1024))
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "projects.json").write_text(json.dumps({"1": {"path": "/x"}}))
+    # Force overrun with a tiny budget
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=log_dir,
+        size_budget=5 * 1024,  # 5 KB
+    )
+    with zipfile.ZipFile(out_path) as z:
+        names = set(z.namelist())
+    assert "logs/clauded.log" not in names, (
+        "#224 R1 tester: emergency truncate must drop logs/ entries"
+    )
+    assert "logs/TRUNCATED.txt" in names
+    # Manifest + state preserved
+    assert "manifest.json" in names
+    assert "state/projects.json" in names
+
+
+def test_r1_bundle_no_diagnostics_directory(tmp_path):
+    """R1 simplicity: 4 dirs → 3 dirs (diagnostics/ merged into manifest)."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=tmp_path / "x",
+    )
+    with zipfile.ZipFile(out_path) as z:
+        dirs = {n.split("/")[0] for n in z.namelist() if "/" in n}
+    assert "diagnostics" not in dirs
+
+
+def test_r1_module_level_auto_crash_cooldown():
+    """R1 simplicity: cooldown is now module-level, not class-attr."""
+    from clauded import bot as bot_mod
+    assert hasattr(bot_mod, "AUTO_CRASH_COOLDOWN_S")
+    assert bot_mod.AUTO_CRASH_COOLDOWN_S == 300
+
+
+def test_r1_stream_debug_jsonl_renamed_in_archive(tmp_path):
+    """R1 tester: stream-debug.jsonl is archived as stream-debug.tail.jsonl."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "stream-debug.jsonl").write_text('{"a":1}\n')
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=log_dir,
+    )
+    with zipfile.ZipFile(out_path) as z:
+        names = set(z.namelist())
+    assert "logs/stream-debug.tail.jsonl" in names
+    assert "logs/stream-debug.jsonl" not in names
+
+
+def test_r1_bot_flags_includes_runtime_overrides():
+    """R1 tester: AC7 — runtime sessions snapshot must include model_override etc."""
+    bot = _build_bot_stub(has_session_manager=True)
+    snap = bundle_mod._snapshot_live_sessions(bot)
+    assert len(snap) == 1
+    s = snap[0]
+    # AC7 needs PM to see the override matrix
+    assert "model_override" in s
+    assert "sdk_model" in s
+    assert "permission_mode_override" in s
+
+
+@pytest.mark.asyncio
+async def test_r1_log_dump_cog_runtime_dispatch(tmp_path, monkeypatch):
+    """R1 tester: real-runtime test for the /log dump command.
+
+    Drive the callback with a mock interaction; assert (a) defer fires,
+    (b) generate_bundle invoked, (c) followup with file attachment.
+    """
+    from clauded.cogs.log_dump import log_dump
+
+    # Stub the underlying coroutine: log_dump is an app_commands.Command,
+    # find its callback (callback or _callback).
+    callback = getattr(log_dump, "callback", None) or log_dump._callback
+
+    # Patch bundle generation to a tmp file
+    fake_zip = tmp_path / "fake.zip"
+    fake_zip.write_bytes(b"PK\x03\x04")
+    from clauded.diagnostics import bundle as _bundle_mod
+    orig = _bundle_mod.generate_bundle
+    _bundle_mod.generate_bundle = lambda **kw: fake_zip
+    try:
+        interaction = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.followup.send = AsyncMock()
+        interaction.client = MagicMock()
+
+        await callback(interaction)
+
+        # AC1: defer fired
+        interaction.response.defer.assert_called_once()
+        # AC1: followup with file
+        interaction.followup.send.assert_called_once()
+        kwargs = interaction.followup.send.call_args.kwargs
+        assert "file" in kwargs
+    finally:
+        _bundle_mod.generate_bundle = orig
