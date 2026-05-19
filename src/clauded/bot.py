@@ -273,6 +273,25 @@ class ClaudedBot(commands.Bot):
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
         self.agent_manager = AgentManager()
+        # #241: scheduler subsystem. Store loads existing schedules from
+        # disk; manager wraps it with the tick / fire / CRUD API.
+        from .scheduler_store import SchedulerStore
+        from .scheduler import SchedulerManager
+        self.scheduler_store = SchedulerStore()
+        self.scheduler = SchedulerManager(
+            self.scheduler_store,
+            fire_callback=self._fire_schedule,
+            get_lock=self.session_manager.get_lock,
+        )
+        # MCP tool layer needs a global ref to the manager + a context
+        # provider so claude knows which thread the active session is in.
+        from . import scheduler_mcp
+        scheduler_mcp.set_scheduler_manager(
+            self.scheduler,
+            ctx_provider=self._scheduler_ctx_provider,
+        )
+        # The active per-thread MCP context, set when a bridge spins up.
+        self._scheduler_active_ctx: dict[int, dict] = {}
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
         # v1.18 #160: runtime-toggleable allow_unbound_fallback. Initialized
@@ -308,6 +327,10 @@ class ClaudedBot(commands.Bot):
             self._claude_version = "unknown"
         self._cleanup_task.start()
         self._heartbeat_task.start()
+        # #241: scheduler tick. Loop fires every 15s; catch_up runs once
+        # on first invocation to handle missed fires across restart.
+        self._scheduler_catch_up_done = False
+        self._scheduler_tick.start()
 
         # PRD R3.3 — register the persistent Copy-as-text button view so
         # the button keeps working after a bot restart.
@@ -334,6 +357,8 @@ class ClaudedBot(commands.Bot):
         from .cogs.skill import skill_group
         from .cogs.context import context_cmd
         from .cogs.diff import diff_cmd
+        # #241: scheduler cog
+        from .cogs.schedule import schedule_group
         from .cogs.ops import (
             cost_group, health_check, review_pr, plugin_group,
             send_to_claude, pin_message, ratelimit_info,
@@ -371,6 +396,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(diff_cmd)
         # #224: /log dump
         self.tree.add_command(log_group)
+        # #241: /schedule
+        self.tree.add_command(schedule_group)
         # #185: do NOT sync globally here — historically claudeD synced
         # via both ``tree.sync()`` (global) AND PR-specific per-guild
         # PUT calls, so commands ended up registered in BOTH scopes and
@@ -425,6 +452,26 @@ class ClaudedBot(commands.Bot):
         heartbeat → kickstart loop bounded only by ``ThrottleInterval``).
         """
         _touch_heartbeat()
+
+    @tasks.loop(seconds=15)
+    async def _scheduler_tick(self) -> None:
+        """#241: tick the scheduler loop.
+
+        First invocation also runs ``catch_up`` once to handle missed
+        fires from across a bot restart. Subsequent invocations are
+        plain ``tick`` (scan due + dispatch).
+        """
+        try:
+            if not getattr(self, "_scheduler_catch_up_done", False):
+                await self.scheduler.catch_up()
+                self._scheduler_catch_up_done = True
+            await self.scheduler.tick()
+        except Exception:
+            log.exception("#241 scheduler tick failed; will retry next interval")
+
+    @_scheduler_tick.before_loop
+    async def _before_scheduler_tick(self) -> None:
+        await self.wait_until_ready()
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -1184,6 +1231,14 @@ class ClaudedBot(commands.Bot):
         to the original requester (#179 R1 security).
         """
         try:
+            # #241: register scheduler context BEFORE the bridge runs so
+            # any MCP tool the claude turn invokes (schedule_create / list /
+            # delete / toggle) knows the active thread + channel + guild.
+            self._register_scheduler_ctx(
+                thread_id=getattr(thread, "id", 0) or 0,
+                channel_id=getattr(thread, "parent_id", None) or getattr(thread, "id", None),
+                guild_id=getattr(getattr(thread, "guild", None), "id", None),
+            )
             await renderer.render_response(bridge, user_text, author_id=author_id)
         except Exception as exc:
             if is_transient_discord_error(exc):
@@ -1366,6 +1421,112 @@ class ClaudedBot(commands.Bot):
             )
         except Exception:
             log.exception("#224: auto-crash bundle upload failed")
+
+    # ------------------------------------------------------------------
+    # #241 — scheduler wiring (tick / fire / MCP context)
+    # ------------------------------------------------------------------
+
+    def _scheduler_ctx_provider(self) -> dict:
+        """Return the current thread's scheduler context, used by MCP tools.
+
+        Set by :meth:`_register_scheduler_ctx` before each bridge invocation.
+        Returns ``{}`` if not currently in a scheduler-aware turn.
+        """
+        return getattr(self, "_scheduler_current_ctx", {}) or {}
+
+    def _register_scheduler_ctx(
+        self, *, thread_id: int, channel_id: int | None,
+        guild_id: int | None, tz_name: str = "Asia/Shanghai",
+    ) -> None:
+        """Set the active scheduler context for the next turn.
+
+        Called by ``_handle_thread_message`` / ``_handle_channel_message``
+        before invoking the bridge, so MCP tool handlers know which
+        thread the current turn belongs to.
+        """
+        self._scheduler_current_ctx = {
+            "thread_id": thread_id,
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "tz_name": tz_name,
+        }
+
+    async def _fire_schedule(self, sched: dict) -> None:
+        """Fire executor: inject ``sched.payload.what`` into the target
+        thread's active session, marking the message with a scheduled-fire
+        prefix so users know it's not a real message.
+
+        Called from :class:`SchedulerManager` under the per-thread lock
+        and global in-flight cap.
+        """
+        thread_id = sched.get("target_thread_id")
+        channel_id = sched.get("channel_id")
+        if not isinstance(thread_id, int):
+            raise ValueError(f"schedule missing target_thread_id: {sched.get('schedule_id')}")
+
+        # Resolve the thread + parent channel
+        thread = self.get_channel(thread_id)
+        if thread is None:
+            try:
+                thread = await self.fetch_channel(thread_id)
+            except discord.NotFound:
+                # Re-raise so the manager catches it and disables the schedule
+                raise
+        if not isinstance(thread, discord.Thread):
+            raise RuntimeError(
+                f"target_thread_id {thread_id} is not a Thread"
+            )
+
+        # Resolve binding (parent channel)
+        parent_id = getattr(thread, "parent_id", None) or channel_id
+        if parent_id is None:
+            raise RuntimeError("can't resolve parent channel for schedule")
+        project_path = self.project_manager.get_path(parent_id)
+        if not project_path:
+            raise RuntimeError(f"channel {parent_id} not bound")
+
+        # Get or create the session
+        bridge = self.session_manager.get_session(thread_id)
+        if bridge is None or not bridge.is_active:
+            # Spin up a fresh session using the standard flow
+            stored = self.session_manager.get_stored_session(thread_id)
+            resume_id = stored.get("session_id") if stored else None
+            sc = SessionConfig(
+                system_prompt=self.project_manager.get_system_prompt(parent_id),
+                resume_session_id=resume_id,
+                add_dirs=self.project_manager.get_extra_dirs(parent_id) or None,
+                mcp_servers=self.project_manager.get_mcp_servers(parent_id) or None,
+                env=self.project_manager.get_env(parent_id) or None,
+                user="scheduled-fire",
+            )
+            bridge = await self.session_manager.create_session(
+                thread_id, project_path, self.config, sc,
+            )
+
+        # Wire scheduler context so the MCP tools (if claude calls them
+        # during this turn) know the target thread
+        self._register_scheduler_ctx(
+            thread_id=thread_id,
+            channel_id=parent_id,
+            guild_id=sched.get("guild_id"),
+        )
+
+        # Post a prefix message before render so user knows this is scheduled
+        fire_label = sched.get("name") or sched.get("schedule_id", "")[:8]
+        try:
+            await safe_send_message(
+                thread,
+                content=f"-# ⏰ Scheduled fire: {fire_label}",
+            )
+        except Exception as exc:
+            log.warning(
+                "#241 prefix message failed for schedule=%s: %s",
+                sched.get("schedule_id"), exc,
+            )
+
+        what = sched.get("payload", {}).get("what", "")
+        renderer = DiscordRenderer(thread, bot=self, project_path=Path(project_path))
+        await renderer.render_response(bridge, what)
 
 
 # ---------------------------------------------------------------------------

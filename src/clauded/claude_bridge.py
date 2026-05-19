@@ -331,6 +331,29 @@ class ClaudeBridge:
                 })
             raise
 
+    def _build_mcp_servers(self) -> dict:
+        """Merge user-configured MCP servers with the in-process
+        scheduler MCP server (#241).
+
+        We always include the scheduler server so Claude can manage
+        schedules via natural conversation (per spec §3 "tool 永久
+        enabled"). Server name ``clauded-scheduler`` is reserved.
+        """
+        merged: dict = dict(self._mcp_servers or {})
+        try:
+            from .scheduler_mcp import build_scheduler_mcp_server
+            merged["clauded-scheduler"] = build_scheduler_mcp_server()
+        except Exception as exc:
+            # If MCP server build fails (missing SDK dep, etc.), log
+            # and continue without scheduler tools. Bot still works for
+            # everything else.
+            log.warning(
+                "#241: failed to build scheduler MCP server; "
+                "schedule_* tools won't be available: %s",
+                exc,
+            )
+        return merged
+
     async def start(self) -> None:
         """Create and connect the underlying ``ClaudeSDKClient``."""
         full_system_prompt = (self.system_prompt or "") + _CHANNEL_MGMT_PROMPT
@@ -487,7 +510,7 @@ class ClaudeBridge:
             disallowed_tools=self._disallowed_tools,
             extra_args=extra_args,
             add_dirs=self._add_dirs,
-            mcp_servers=self._mcp_servers or {},
+            mcp_servers=self._build_mcp_servers(),
             max_turns=self._max_turns,
             # Feature #60: SDK hooks
             hooks=hooks,
