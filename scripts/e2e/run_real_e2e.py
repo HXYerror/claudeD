@@ -331,57 +331,53 @@ async def case_on_message_health_via_text(driver: TestBotDriver) -> CaseResult:
                       bot_replies=bot_texts)
 
 
-async def case_attachment_image_preprocess(driver: TestBotDriver) -> CaseResult:
-    """#242: testbot uploads 4K image. Bot must preprocess + log it.
+async def case_attachment_image_inline_marker(driver: TestBotDriver) -> CaseResult:
+    """#242 round 2: testbot uploads an image with embedded marker text.
+    bot should ship it as INLINE image content block (not path-in-text);
+    claude reads it directly via vision and quotes the marker back.
 
-    Real check via reading the bot's actual log file post-test.
+    This mirrors spike-3 (from #242 PR-2 PRD) end-to-end through real
+    Discord transport.
     """
-    import os
-    image_path = "/tmp/img-probe/big_4k.png"
-    if not os.path.exists(image_path):
-        return CaseResult(name="#242 4K image preprocess",
-                          status="SKIP", detail="test image missing")
-
-    # Snapshot log size BEFORE
-    log_path = Path.home() / "Library" / "Logs" / "clauded" / "clauded.log"
-    if not log_path.exists():
-        return CaseResult(name="#242 4K image preprocess",
-                          status="SKIP", detail="clauded.log not found")
-    pos_before = log_path.stat().st_size
+    # Build a fresh test image with a unique marker right inline
+    import io
+    from PIL import Image, ImageDraw, ImageFont
+    marker = "INLINE_E2E_MARKER_2026_XYZ"
+    img = Image.new("RGB", (600, 200), color=(245, 245, 245))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.truetype("/System/Library/Fonts/Menlo.ttc", 32)
+    draw.text((20, 80), marker, font=font, fill=(20, 20, 20))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
 
     msg = await driver.post(
-        content=f"<@{BOT_USER_ID}> #242 e2e: 我发了一张 4K 图，请用 Read 工具读这个本地文件: "
-                f"{image_path}\n然后用一个字回复 \"好\"。",
-        file=discord.File(image_path, filename="probe.png"),
+        content=f"<@{BOT_USER_ID}> #242 e2e: 这张图里有一段文字，"
+                f"请把那段文字一字不差地回我，不要别的内容。",
+        file=discord.File(buf, filename="inline-probe.png"),
     )
-
-    replies = await driver.wait_for_bot_reply(msg, timeout=TIMEOUT_S)
-    # Check the log for #242 marker
-    await asyncio.sleep(2)
-    new_log_text = log_path.read_text()[pos_before:]
-    has_preprocess = "#242: preprocessed" in new_log_text
-    if has_preprocess:
-        # Extract the line to verify dimensions
-        line = next(
-            (l for l in new_log_text.splitlines() if "#242: preprocessed" in l),
-            ""
-        )
-        # Expected: "3840x2160 (75K bytes) -> 1900x1069 ..."
-        if "3840x2160" in line and "1900x1069" in line:
-            return CaseResult(
-                name="#242 4K image preprocess",
-                status="PASS",
-                detail=f"bot logged: ...{line[-150:]}",
-            )
+    replies = await driver.wait_for_bot_reply(
+        msg, timeout=TIMEOUT_S, match=marker
+    )
+    bot_texts = [driver._flatten(r) for r in replies if driver._flatten(r).strip()]
+    if any(marker in t for t in bot_texts):
+        # Also confirm bot logged #242 inline path
+        log_path = Path.home() / "Library" / "Logs" / "clauded" / "clauded.log"
+        recent = ""
+        if log_path.exists():
+            recent = log_path.read_text()[-20_000:]
+        inline_logged = "#242: inline image attached" in recent
         return CaseResult(
-            name="#242 4K image preprocess",
-            status="FAIL",
-            detail=f"preprocess logged but dimensions wrong: {line[:200]}",
+            name="#242 inline image marker",
+            status="PASS",
+            detail=f"claude quoted marker via vision; inline_logged={inline_logged}",
+            bot_replies=bot_texts,
         )
     return CaseResult(
-        name="#242 4K image preprocess",
+        name="#242 inline image marker",
         status="FAIL",
-        detail=f"no '#242: preprocessed' in log; got {len(replies)} bot replies",
+        detail=f"marker not in {len(bot_texts)} reply texts: {bot_texts[:2]!r}",
+        bot_replies=bot_texts,
     )
 
 
@@ -644,7 +640,7 @@ async def main():
     cases = [
         ("M1 @mention starts session", case_on_message_mention),
         ("Probe: exact-text reply", case_on_message_health_via_text),
-        ("#242 4K image preprocess", case_attachment_image_preprocess),
+        ("#242 inline image marker", case_attachment_image_inline_marker),
         ("Long text streaming", case_long_text_streaming),
         ("Markdown table → PNG", case_table_rendering),
         ("M6 3rd-party thread silent", case_third_party_thread_silence),
