@@ -19,6 +19,7 @@ before any turn runs; tests reset it via ``set_scheduler_manager(None)``.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 from typing import Callable
 
@@ -33,6 +34,39 @@ log = logging.getLogger(__name__)
 
 _GLOBAL_MGR: SchedulerManager | None = None
 _GLOBAL_CTX: Callable[[], dict] | None = None
+
+# B2: per-task scheduler context. ``ContextVar.set`` mutates only the
+# current asyncio task's copy of the context, so two concurrent fires or
+# turns no longer race on a single bot-instance dict between
+# ``set_ctx`` and the eventual tool call. ``set_ctx`` is called by the
+# bot immediately before kicking off the turn / fire; ``_resolve_ctx``
+# prefers the ContextVar value when set, falling back to the legacy
+# ``_GLOBAL_CTX`` callable for code paths (older tests, callers wiring a
+# custom ctx_provider) that haven't migrated yet.
+_scheduler_ctx_var: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "scheduler_ctx", default={}
+)
+
+
+def set_ctx(ctx: dict) -> None:
+    """Set the per-task scheduler context (B2 ContextVar entry-point).
+
+    Stores ``ctx`` in :data:`_scheduler_ctx_var`. Because ``ContextVar``
+    is task-local, the value seen by tool handlers running inside the
+    *current* asyncio task isolated from any sibling fire/turn that may
+    be running concurrently. Pass an empty dict to clear.
+    """
+    _scheduler_ctx_var.set(ctx or {})
+
+
+def get_ctx() -> dict:
+    """Return the current task's scheduler context (B2 ContextVar getter).
+
+    Defaults to ``{}`` so callers can dispatch on truthiness. Reads from
+    :data:`_scheduler_ctx_var` only — :func:`_resolve_ctx` handles the
+    fallback to the legacy ``_GLOBAL_CTX`` provider.
+    """
+    return _scheduler_ctx_var.get() or {}
 
 
 def set_scheduler_manager(
@@ -60,7 +94,18 @@ def _require_mgr() -> SchedulerManager | None:
 
 
 def _resolve_ctx() -> dict:
-    """Call the ctx_provider safely. Returns ``{}`` on missing/raising."""
+    """Return the active scheduler context for the current tool call.
+
+    B2: the ``ContextVar`` is consulted first — a non-empty value there
+    means a recent ``set_ctx`` in this task already provided the context.
+    If empty, fall back to the legacy ``_GLOBAL_CTX`` callable wired via
+    :func:`set_scheduler_manager` (kept for compatibility with code paths
+    or tests that haven't migrated to ``set_ctx``). Returns ``{}`` on
+    missing/raising provider.
+    """
+    cv_ctx = _scheduler_ctx_var.get() or {}
+    if cv_ctx:
+        return cv_ctx
     if _GLOBAL_CTX is None:
         return {}
     try:
@@ -293,9 +338,19 @@ async def schedule_list_tool(args: dict) -> dict:
         fire_count = state.get("fire_count", 0)
         enabled = state.get("enabled", False)
         enabled_marker = "" if enabled else " (disabled)"
+        # M10: include missed_count + last_fired_at + max_lifetime so
+        # claude can reason about whether a recurring schedule has been
+        # firing reliably or has accumulated missed_fires (catch_up
+        # rollforwards) since last user interaction. The MCP tool surface
+        # has no embed-size budget like /schedule list, so we always emit.
+        missed = state.get("missed_count", 0) or 0
+        last_fired = state.get("last_fired_at") or "—"
+        max_life = s.get("max_lifetime_seconds")
+        max_life_str = f"{max_life}s" if max_life else "—"
         lines.append(
             f"{kind_marker} {cb_marker} `{sid}` {name} — next={next_at} "
-            f"fires={fire_count}{enabled_marker}\n"
+            f"fires={fire_count} missed={missed} last={last_fired} "
+            f"max_lifetime={max_life_str}{enabled_marker}\n"
             f"   what: {what_preview!r}"
         )
 

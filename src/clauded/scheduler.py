@@ -211,6 +211,7 @@ def parse_duration(s: str) -> int:
 
 FireCallback = Callable[[dict], Awaitable[None]]
 LockProvider = Callable[[int], asyncio.Lock]
+BoundChecker = Callable[[int], bool]
 
 
 class SchedulerManager:
@@ -230,11 +231,18 @@ class SchedulerManager:
         fire_new_task_callback: FireCallback,
         expire_notify_callback: FireCallback | None = None,
         get_lock: LockProvider | None = None,
+        bound_checker: BoundChecker | None = None,
     ) -> None:
         self.store = store
         self.fire_message_callback = fire_message_callback
         self.fire_new_task_callback = fire_new_task_callback
         self.expire_notify_callback = expire_notify_callback
+        # M4: optional bound-channel validator. If supplied, ``create``
+        # rejects ``kind=new_task`` schedules whose ``target_channel_id``
+        # is not bound to a project (avoiding the late "channel not bound"
+        # RuntimeError at fire time). Defaults to ``None`` (no check) so
+        # tests / non-Discord callers don't need a project_manager.
+        self.bound_checker = bound_checker
 
         if get_lock is None:
             # Default: per-target (thread_id or channel_id) ``asyncio.Lock``s,
@@ -258,6 +266,14 @@ class SchedulerManager:
         # Bound concurrent in-flight fires across all schedules — PRD §3.8
         # (``MAX_GLOBAL_INFLIGHT = 10``). Acquired inside ``_fire_one``.
         self._inflight_sem = asyncio.Semaphore(MAX_GLOBAL_INFLIGHT)
+
+        # B1: track schedule_ids currently being fired so a slow callback
+        # whose tick interval is shorter than its execution time can't be
+        # re-dispatched on the next ``tick()`` / ``catch_up()`` pass. The
+        # set is read by ``tick``/``catch_up`` before creating a fire task,
+        # and ``_fire_one`` removes the id on completion (success, terminal,
+        # or unexpected raise) so a transient outage can't strand the entry.
+        self._inflight_ids: set[str] = set()
 
     # ----------------------------------------------------- Permission
 
@@ -347,6 +363,18 @@ class SchedulerManager:
             ):
                 raise ValueError(
                     "kind=new_task requires positive int target_channel_id"
+                )
+            # M4: surface the unbound-channel error at create() time rather
+            # than letting the fire callback raise RuntimeError("not bound")
+            # 1..30 days later. The checker is optional so library/test
+            # callers without a project_manager are unaffected.
+            if (
+                self.bound_checker is not None
+                and not self.bound_checker(target_channel_id)
+            ):
+                raise ValueError(
+                    f"target_channel_id {target_channel_id} is not bound "
+                    "to a project (run /project bind <path> first)"
                 )
         else:
             raise ValueError(f"unknown kind: {kind!r}")
@@ -550,20 +578,36 @@ class SchedulerManager:
 
         Called on a periodic loop (PRD §3.8 ``TICK_INTERVAL_S = 15``). For
         every enabled schedule whose ``state.next_fire_at`` is ``<=`` now,
-        an :meth:`_fire_one` task is scheduled via ``asyncio.create_task``
+        an :meth:`_fire_one_safe` task is scheduled via ``asyncio.create_task``
         and this method returns immediately — the semaphore inside
         ``_fire_one`` is the only thing that bounds in-flight concurrency.
+
+        B1: schedules currently being fired (id in ``self._inflight_ids``)
+        are skipped — a slow callback whose runtime exceeds
+        :data:`TICK_INTERVAL_S` must not be double-dispatched. The
+        ``_inflight_ids.add(sid)`` happens HERE (synchronously, before the
+        task is created) so the guard is effective on the very next
+        ``tick`` iteration; if we deferred the add into ``_fire_one`` the
+        check above could pass spuriously between two ticks both racing
+        to dispatch the same schedule.
         """
         now = self._now_utc()
         for sched in self.store.list_all().values():
             state = sched.get("state") or {}
             if not state.get("enabled", False):
                 continue
+            sid = sched.get("schedule_id")
+            if sid in self._inflight_ids:
+                continue
             next_fire = self._parse_next_fire(state.get("next_fire_at"))
             if next_fire is None:
                 continue
             if next_fire <= now:
-                asyncio.create_task(self._fire_one(sched))
+                if sid is not None:
+                    self._inflight_ids.add(sid)
+                    asyncio.create_task(self._fire_one_safe(sid, sched))
+                else:
+                    asyncio.create_task(self._fire_one(sched))
 
     async def catch_up(self) -> None:
         """One-shot scan called on bot startup to handle missed fires.
@@ -572,11 +616,18 @@ class SchedulerManager:
         :data:`MISSED_FIRE_GRACE_S` (300s) get dispatched normally.
         Anything older is marked missed and rolled forward without
         firing (recurring) or disabled (one-shot deep past).
+
+        B1: schedules currently in-flight are skipped here too — catch_up
+        only runs once at startup, but the same belt-and-braces guard
+        keeps the contract consistent with ``tick()``.
         """
         now = self._now_utc()
         for sched in self.store.list_all().values():
             state = sched.get("state") or {}
             if not state.get("enabled", False):
+                continue
+            sid = sched.get("schedule_id")
+            if sid in self._inflight_ids:
                 continue
             next_fire = self._parse_next_fire(state.get("next_fire_at"))
             if next_fire is None:
@@ -586,7 +637,11 @@ class SchedulerManager:
 
             age = (now - next_fire).total_seconds()
             if age <= MISSED_FIRE_GRACE_S:
-                asyncio.create_task(self._fire_one(sched))
+                if sid is not None:
+                    self._inflight_ids.add(sid)
+                    asyncio.create_task(self._fire_one_safe(sid, sched))
+                else:
+                    asyncio.create_task(self._fire_one(sched))
                 continue
 
             # Too stale to fire — mark missed and roll forward.
@@ -608,6 +663,22 @@ class SchedulerManager:
 
     # ---------------------------------------------------- _fire_one core
 
+    async def _fire_one_safe(self, sched_id: str, sched: dict) -> None:
+        """Wrapper around :meth:`_fire_one` that guarantees inflight cleanup.
+
+        B1: ``tick()`` / ``catch_up()`` add the ``sched_id`` to
+        ``self._inflight_ids`` synchronously *before* creating this task
+        (so the very next tick sees the guard). This wrapper makes the
+        symmetric removal bulletproof — even if ``_fire_one`` raises an
+        unexpected exception (cancelled task, programming error, etc.),
+        the id is still discarded so the schedule isn't stranded out of
+        the inflight set forever.
+        """
+        try:
+            await self._fire_one(sched)
+        finally:
+            self._inflight_ids.discard(sched_id)
+
     async def _fire_one(self, sched: dict) -> None:
         """Acquire concurrency budget + per-target lock, then run the fire.
 
@@ -616,7 +687,20 @@ class SchedulerManager:
         (thread_id for ``kind=message``, channel_id for ``kind=new_task``)
         serializes fires aimed at the same destination so two due
         schedules can't interleave their callbacks.
+
+        B1: inflight-id bookkeeping lives in :meth:`_fire_one_safe` (the
+        dispatch-site wrapper) so the add/discard pair brackets the task
+        rather than the body of this method. This keeps the ``tick`` /
+        ``catch_up`` guard race-free without depending on an internal
+        try/finally here.
+
+        M1+M9: after acquiring the per-target lock we re-read the schedule
+        state from the store. If a concurrent ``delete()`` / ``toggle()``
+        flipped ``enabled=False`` or removed the row, this run is aborted
+        cleanly instead of firing the stale snapshot we were dispatched
+        with.
         """
+        sid = sched.get("schedule_id")
         async with self._inflight_sem:
             kind = sched.get("kind")
             if kind == "message":
@@ -632,6 +716,25 @@ class SchedulerManager:
                 await self._fire_with_retry(sched)
                 return
             async with self.get_lock(lock_id):
+                # M1+M9: re-read state under the lock so a delete/toggle
+                # that landed between dispatch and lock-acquire wins.
+                if sid is not None:
+                    fresh = self.store.get(sid)
+                    if fresh is None:
+                        log.info(
+                            "#241 _fire_one aborted (deleted): %s", sid,
+                        )
+                        return
+                    fresh_state = fresh.get("state") or {}
+                    if not fresh_state.get("enabled", False):
+                        log.info(
+                            "#241 _fire_one aborted (disabled): %s",
+                            sid,
+                        )
+                        return
+                    # Continue with the freshest snapshot — bookkeeping
+                    # in ``_on_fire_*`` writes through the same dict.
+                    sched = fresh
                 await self._fire_with_retry(sched)
 
     async def _fire_with_retry(self, sched: dict) -> None:
@@ -694,6 +797,16 @@ class SchedulerManager:
         state["last_error"] = None
         if state.get("first_fired_at") is None:
             state["first_fired_at"] = now.isoformat()
+
+        # M2: clear the cached "thread for this in-progress fire" id used
+        # by ``_fire_schedule_new_task`` to stay retry-idempotent (so a
+        # transient post-create_thread failure can reuse the same thread
+        # on the next attempt). A successful fire is the natural reset
+        # point — the next scheduled occurrence of a recurring kind=new_task
+        # MUST create a fresh thread; reusing the previous one would
+        # silently turn weekly tasks into "one thread, many turns".
+        if "_new_task_thread_id" in state:
+            state["_new_task_thread_id"] = None
 
         trigger = sched.get("trigger") or {}
         recurring = (

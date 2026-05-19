@@ -16,6 +16,7 @@ import time
 import traceback
 import sys
 import asyncio
+import contextvars
 from pathlib import Path
 
 import discord
@@ -32,6 +33,7 @@ from .session_store import SessionStore
 from .scheduler_store import SchedulerStore
 from .scheduler import SchedulerManager
 from . import scheduler_mcp
+from .scheduler_mcp import set_ctx as _scheduler_set_ctx, get_ctx as _scheduler_get_ctx
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
 from . import stream_logger
@@ -71,6 +73,26 @@ _VISION_MEDIA_TYPE = {
     ".gif": "image/gif",
     ".webp": "image/webp",
 }
+
+
+# --------------------------------------------------------------------------
+# #241 — module-level ContextVar for the per-turn scheduler context.
+#
+# Architect R1 + Engineer R1 (BLOCKER #2): per-turn ctx (thread_id /
+# channel_id / guild_id / tz_name) used to live on ``ClaudedBot`` as a
+# single mutable instance attribute. Every concurrent claude turn — be it
+# two ``@bot`` messages in different threads or two scheduled-fire
+# callbacks aimed at different targets — overwrites the same dict between
+# its register-ctx and its ``renderer.render_response`` await. When the
+# in-process scheduler MCP tools resolved "current thread" they read
+# whatever fire/turn last touched the attribute, occasionally pointing at
+# a sibling turn's thread. Fix: put ctx in a ``contextvars.ContextVar``;
+# asyncio copies the running context per ``create_task``, so each task
+# has its own snapshot for free.
+# --------------------------------------------------------------------------
+_scheduler_ctx_var: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "scheduler_ctx", default={}
+)
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +351,11 @@ class ClaudedBot(commands.Bot):
             fire_new_task_callback=self._fire_schedule_new_task,
             expire_notify_callback=self._notify_schedule_expired,
             get_lock=self.session_manager.get_lock,
+            # M4: surface "channel not bound" at create() time rather than
+            # 30 days later at fire time. The manager calls this for every
+            # kind=new_task create; unbound channels are rejected before
+            # they hit the store.
+            bound_checker=self.project_manager.is_bound,
         )
         # Per-turn context, set by `_register_scheduler_ctx` immediately
         # before every claude turn so the MCP tool handlers can resolve
@@ -1369,8 +1396,19 @@ class ClaudedBot(commands.Bot):
         ``target_channel_id`` to the thread/channel the turn originated
         from. Returns ``{}`` if no turn is active (tool would then need an
         explicit arg or surface a ctx-missing error).
+
+        B2: prefers :func:`scheduler_mcp.get_ctx` (the module-level
+        ``ContextVar``) over the local bot-instance copy. This makes the
+        provider correct under concurrent fires/turns — each task's
+        ``ContextVar`` slot was set by its own ``_register_scheduler_ctx``
+        call and is invisible to siblings. The bot-instance
+        ``_scheduler_ctx_var`` / ``_scheduler_current_ctx`` are kept as
+        fallback / mirror for legacy tests reading the attribute directly.
         """
-        return getattr(self, "_scheduler_current_ctx", {}) or {}
+        cv = _scheduler_get_ctx()
+        if cv:
+            return cv
+        return _scheduler_ctx_var.get() or {}
 
     def _register_scheduler_ctx(
         self,
@@ -1387,13 +1425,35 @@ class ClaudedBot(commands.Bot):
         via :mod:`clauded.cogs.schedule`, scheduled-fire turns via the
         ``_fire_schedule_*`` methods). PRD §3.7 — the ctx is what makes
         the in-process MCP tools "know" which thread they're acting on.
+
+        B2: this now writes to BOTH the module-level ContextVar in
+        :mod:`scheduler_mcp` (via :func:`scheduler_mcp.set_ctx`) AND the
+        bot-instance ``contextvars.ContextVar``. The scheduler_mcp one
+        is what tool handlers actually read via :func:`scheduler_mcp.get_ctx`
+        / :func:`scheduler_mcp._resolve_ctx`; the bot-instance ContextVar
+        is kept for the legacy ``_scheduler_ctx_provider`` fallback. Both
+        ``set`` calls only mutate the current asyncio task's context, so
+        two concurrent fires / turns can't clobber each other's "current
+        thread" between register-ctx and ``render_response``. The
+        mirroring instance attribute is kept purely so existing tests
+        that read ``bot._scheduler_current_ctx`` directly continue to
+        pass — production code should never reach for it; use
+        :meth:`_scheduler_ctx_provider` instead.
         """
-        self._scheduler_current_ctx = {
+        ctx = {
             "thread_id": thread_id,
             "channel_id": channel_id,
             "guild_id": guild_id,
             "tz_name": tz_name,
         }
+        _scheduler_ctx_var.set(ctx)
+        # B2: also publish into scheduler_mcp's ContextVar so tool
+        # handlers running in this task pick it up via _resolve_ctx
+        # without depending on the bot-instance provider callable.
+        _scheduler_set_ctx(ctx)
+        # Mirror for legacy direct-attribute readers (tests). The
+        # ContextVars are the source of truth.
+        self._scheduler_current_ctx = ctx
 
     @tasks.loop(seconds=15)
     async def _scheduler_tick(self) -> None:
@@ -1416,6 +1476,113 @@ class ClaudedBot(commands.Bot):
     @_scheduler_tick.before_loop
     async def _before_scheduler_tick(self) -> None:
         await self.wait_until_ready()
+
+    # ------------------------------------------------------------------
+    # #241 — fire-callback shared helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_fire_quoted_what(what: str) -> str:
+        """Format ``what`` as a Discord block-quoted snippet for the fire prefix.
+
+        B6 / PRD §3.8 (AC13): every line of the injected ``what`` is
+        independently wrapped in 「…」 corner brackets and then prefixed
+        with Discord's ``>`` quote marker, so the user sees a clearly
+        visible record of exactly what string was injected into claude's
+        context. Empty input renders an empty block-quote rather than the
+        old ``"> "`` (literal "> " plus empty line) fallback.
+
+        Wrapping happens per line (not once around the whole multi-line
+        body) so each visible line in the channel reads as a self-contained
+        bracketed unit — important when ``what`` contains tool output or
+        anything multi-paragraph.
+        """
+        lines = what.splitlines() if what else []
+        if not lines:
+            # Empty / single-newline what: render an empty quote so the
+            # AC13 marker still shows but no bogus content leaks.
+            return "> 「」"
+        return "\n".join(f"> 「{line}」" for line in lines)
+
+    async def _send_fire_prefix_and_quote(
+        self,
+        thread,
+        fire_label: str,
+        what: str,
+        *,
+        sched_id_for_log: str = "",
+    ) -> None:
+        """Best-effort send of the AC13 prefix line + block-quoted ``what``.
+
+        Failures are swallowed + logged: the actual claude turn still
+        runs even if these "humans can see what just got injected" sends
+        fail (network blip, permissions). The 1900-char ceiling leaves
+        headroom under Discord's 2000-char message limit.
+        """
+        try:
+            await thread.send(content=f"-# ⏰ Scheduled fire: {fire_label}")
+            quoted = self._format_fire_quoted_what(what)
+            await thread.send(content=quoted[:1900])
+        except Exception as exc:
+            log.warning(
+                "#241 prefix/quoted send failed for sched=%s: %s",
+                sched_id_for_log, exc,
+            )
+
+    async def _safe_fire_render(
+        self,
+        *,
+        renderer: DiscordRenderer,
+        bridge,  # ClaudeBridge — typed loosely to avoid an extra import
+        what: str,
+        thread,
+    ) -> None:
+        """Run ``renderer.render_response`` for a scheduled fire with crash safety.
+
+        M3: scheduled fires used to call ``renderer.render_response``
+        directly, which meant any renderer crash propagated up to
+        ``_fire_with_retry`` → 1s/4s/16s backoff → permanent
+        terminal-disable for a one-off presentation-layer bug. Worse, no
+        #224 auto-crash bundle was dispatched, so the scheduled-fire
+        crash never made it into the audit trail.
+
+        This helper mirrors :meth:`_render_with_retry` but without the
+        Retry button (a scheduled fire has no human to click it) and
+        without bridge-resurrection (the next fire will create or
+        resurrect on its own). Renderer crashes are still ``raise``-d so
+        ``_fire_with_retry`` can classify them — but the auto-crash
+        bundle dispatch happens regardless.
+        """
+        try:
+            await renderer.render_response(bridge, what)
+        except Exception as exc:
+            if is_transient_discord_error(exc):
+                # _retry_http exhausted at the lower layer; let the
+                # scheduler treat this as transient + retry.
+                log.warning(
+                    "#241 fire render exhausted retries (transient); "
+                    "bubbling for scheduler retry: %s", exc,
+                )
+                raise
+            log.exception(
+                "#241 scheduled-fire renderer crashed; dispatching crash bundle"
+            )
+            # #224 auto-crash bundle — same as human-driven turns get via
+            # ``_render_with_retry``. The scheduled-fire surface is the
+            # one most likely to crash without a human nearby, so the
+            # audit trail matters more here than elsewhere.
+            try:
+                await self._maybe_dispatch_auto_crash_bundle(
+                    thread=thread,
+                    exc=exc,
+                    bridge=bridge,
+                )
+            except Exception:
+                log.exception(
+                    "#241 auto-crash bundle dispatch itself crashed; "
+                    "swallowing so we still raise the original"
+                )
+            raise
 
     async def _fire_schedule_message(self, sched: dict) -> None:
         """Kind=message fire: inject ``what`` as a user message into the
@@ -1485,28 +1652,24 @@ class ClaudedBot(commands.Bot):
 
         fire_label = sched.get("name") or (sched.get("schedule_id", "") or "")[:8]
         what = (sched.get("payload") or {}).get("what", "") or ""
-        # Prefix + Discord-quoted view of `what` so the injection is visible
-        # to humans (PRD AC13). 1900-char ceiling leaves headroom under
-        # Discord's hard 2000 limit for the quote prefix characters.
-        try:
-            await thread.send(content=f"-# ⏰ Scheduled fire: {fire_label}")
-            quoted = (
-                "\n".join(f"> {line}" for line in what.splitlines())
-                or f"> {what}"
-            )
-            await thread.send(content=quoted[:1900])
-        except Exception as exc:
-            log.warning(
-                "#241 prefix/quoted send failed for sched=%s: %s",
-                sched.get("schedule_id"), exc,
-            )
+        # B6/AC13: prefix + per-line 「<line>」 quote so humans can see what
+        # got injected. M3: helper centralizes the format + best-effort send.
+        await self._send_fire_prefix_and_quote(
+            thread, fire_label, what,
+            sched_id_for_log=sched.get("schedule_id", "") or "",
+        )
 
         renderer = DiscordRenderer(
             thread,
             bot=self,
             project_path=Path(project_path) if project_path else None,
         )
-        await renderer.render_response(bridge, what)
+        # M3: wrap render in crash-bundle-safe helper so a one-off renderer
+        # exception doesn't terminal-disable a recurring schedule + lose
+        # the #224 audit trail.
+        await self._safe_fire_render(
+            renderer=renderer, bridge=bridge, what=what, thread=thread,
+        )
 
     async def _fire_schedule_new_task(self, sched: dict) -> None:
         """Kind=new_task fire: spawn a fresh thread + fresh session, inject
@@ -1553,11 +1716,50 @@ class ClaudedBot(commands.Bot):
         )
         thread_name = thread_name_raw[:100]
 
-        thread = await channel.create_thread(
-            name=thread_name,
-            type=discord.ChannelType.public_thread,
-            auto_archive_duration=1440,
-        )
+        # M2 idempotency: if a prior attempt of THIS fire already created
+        # a thread (transient failure between create_thread and the rest
+        # of the callback), reuse it instead of creating a sibling. The
+        # cached id lives in ``state._new_task_thread_id`` and is cleared
+        # in ``_on_fire_success``, so the *next* scheduled occurrence
+        # still creates a fresh thread.
+        state = sched.setdefault("state", {})
+        cached_thread_id = state.get("_new_task_thread_id")
+        thread = None
+        if cached_thread_id:
+            cached = self.get_channel(cached_thread_id)
+            if cached is None:
+                try:
+                    cached = await self.fetch_channel(cached_thread_id)
+                except Exception:
+                    cached = None
+            if isinstance(cached, discord.Thread):
+                thread = cached
+                log.info(
+                    "#241 new_task fire reusing thread %s for retry sched=%s",
+                    cached_thread_id, sched.get("schedule_id"),
+                )
+            else:
+                # Cached id no longer resolves to a thread (deleted,
+                # archived to nothing). Drop the cache and create fresh.
+                state["_new_task_thread_id"] = None
+
+        if thread is None:
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440,
+            )
+            # Persist the new thread id immediately so a transient failure
+            # after this point reuses it on retry. Best-effort: a save
+            # failure logs but doesn't abort the fire.
+            try:
+                state["_new_task_thread_id"] = thread.id
+                self.scheduler_store.save(sched)
+            except Exception as exc:
+                log.warning(
+                    "#241 failed to persist _new_task_thread_id sched=%s: %s",
+                    sched.get("schedule_id"), exc,
+                )
 
         # Parent-channel announce — best-effort. PRD §3.8: lets channel
         # members see that the bot just spun up a scheduled-task thread.
@@ -1601,24 +1803,23 @@ class ClaudedBot(commands.Bot):
         )
 
         what = (sched.get("payload") or {}).get("what", "") or ""
-        try:
-            await thread.send(content=f"-# ⏰ Scheduled fire: {fire_label}")
-            quoted = (
-                "\n".join(f"> {line}" for line in what.splitlines())
-                or f"> {what}"
-            )
-            await thread.send(content=quoted[:1900])
-        except Exception as exc:
-            log.warning(
-                "#241 newtask prefix/quoted send failed: %s", exc
-            )
+        # B6/AC13: shared prefix + per-line 「<line>」 quote helper.
+        await self._send_fire_prefix_and_quote(
+            thread, fire_label, what,
+            sched_id_for_log=sched.get("schedule_id", "") or "",
+        )
 
         renderer = DiscordRenderer(
             thread,
             bot=self,
             project_path=Path(project_path) if project_path else None,
         )
-        await renderer.render_response(bridge, what)
+        # M3: crash-bundle-safe render. See ``_fire_schedule_message`` for
+        # full rationale — renderer crash here would terminal-disable a
+        # weekly recurring task on a one-off bug, with no audit trail.
+        await self._safe_fire_render(
+            renderer=renderer, bridge=bridge, what=what, thread=thread,
+        )
 
     async def _notify_schedule_expired(self, sched: dict) -> None:
         """Notify the schedule's created channel that its max_lifetime fired.
