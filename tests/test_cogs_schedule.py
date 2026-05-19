@@ -227,13 +227,31 @@ async def test_schedule_message_happy_path_renders_reminder(fake_bot):
 
 
 @pytest.mark.asyncio
-async def test_schedule_new_task_outside_thread_rejects(fake_bot):
+async def test_schedule_new_task_in_channel_creates_helper_thread(fake_bot):
+    """M11: /schedule new_task from a TextChannel should auto-create a
+    helper thread for the create-time reminder injection, NOT reject."""
     interaction = _make_channel_interaction(fake_bot)
-    await schedule_new_task_cmd.callback(interaction, "weekly report")
-    interaction.response.send_message.assert_awaited_once()
-    args, kwargs = interaction.response.send_message.await_args
-    assert "thread" in args[0].lower()
-    assert kwargs.get("ephemeral") is True
+    ch = interaction.channel
+    # Mock create_thread to return a fake thread
+    helper_thread = MagicMock(spec=discord.Thread)
+    helper_thread.id = 8888
+    helper_thread.parent_id = ch.id
+    helper_thread.guild = ch.guild
+    ch.create_thread = AsyncMock(return_value=helper_thread)
+
+    with patch("clauded.cogs.schedule.DiscordRenderer") as RendererCls:
+        renderer_inst = MagicMock()
+        renderer_inst.render_response = AsyncMock()
+        RendererCls.return_value = renderer_inst
+        await schedule_new_task_cmd.callback(interaction, "weekly report")
+
+    # Should have created a helper thread with scheduling prefix
+    ch.create_thread.assert_awaited_once()
+    call_kwargs = ch.create_thread.await_args[1] if ch.create_thread.await_args[1] else {}
+    call_args = ch.create_thread.await_args
+    # Thread name should contain scheduling indicator
+    name_arg = call_kwargs.get("name", call_args[0][0] if call_args[0] else "")
+    assert "schedule" in name_arg.lower() or "⏰" in name_arg or "📅" in name_arg
 
 
 @pytest.mark.asyncio

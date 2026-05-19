@@ -1085,12 +1085,23 @@ class TestFireOne:
         persisted = store.get("tx3retry")
         assert persisted["state"]["enabled"] is False
         assert "boom" in (persisted["state"]["last_error"] or "")
-        # backoff sleeps were attempted between attempts 1→2 and 2→3
-        # (no sleep before terminal disable after attempt 3).
+        # M12: pin the EXACT scheduler-backoff sleep sequence.
+        # The 5/19 directive requires strict assertions; the previous
+        # ``(1,) in sleep_calls and (4,) in sleep_calls`` subset check
+        # would have missed a regression that (a) swapped the 1↔4 order,
+        # (b) added a spurious 16s sleep before terminal disable (the
+        # contract is "no sleep after the 3rd failure — disable immediately"),
+        # or (c) regressed to a single retry.
         sleep_calls = [c.args for c in sleep_mock.await_args_list]
-        # Only assert that at least the two scheduler backoff sleeps fired.
-        assert (1,) in sleep_calls
-        assert (4,) in sleep_calls
+        # Filter to just the scheduler retry backoffs in case the
+        # production code grows an unrelated asyncio.sleep elsewhere in
+        # the path (e.g. for log flush).
+        backoff_sleeps = [c for c in sleep_calls if c in ((1,), (4,), (16,))]
+        # Exactly 2, in order, with NO 16-second sleep before terminal.
+        assert backoff_sleeps == [(1,), (4,)], (
+            f"expected [(1,), (4,)] in order, got {backoff_sleeps!r} "
+            f"(all sleep calls: {sleep_calls!r})"
+        )
 
     @pytest.mark.asyncio
     async def test_fire_one_transient_recovers_on_attempt_2(
@@ -1167,6 +1178,69 @@ class TestFireOne:
             "fire_invoked",
             "lock_released",
         ]
+
+    @pytest.mark.asyncio
+    async def test_two_fires_same_lock_id_serialize(self, store):
+        """M13 / R1 Tester #3: the per-target lock's actual contract is
+        *mutual exclusion of overlapping fires aimed at the same target* —
+        not "a lock is acquired somewhere around the call." A buggy
+        ``_fire_one`` that ``await``-ed the lock but never wrapped the
+        callback in ``async with`` would still pass the
+        ``test_fire_one_acquires_lock`` event-trace test.
+
+        This test pins serialization directly: two schedules with the
+        same ``target_thread_id`` (and therefore the same lock id) are
+        dispatched concurrently. Each callback sleeps 0.05s between
+        ``enter`` and ``exit`` events. With the lock honoured, the
+        events must be one of two ordered, non-interleaved sequences.
+        Without the lock (regression), an interleaved sequence like
+        ``[enter:A, enter:B, exit:A, exit:B]`` would land.
+        """
+        events: list[str] = []
+
+        async def cb(sched):
+            sid = sched["schedule_id"]
+            events.append(f"enter:{sid}")
+            await asyncio.sleep(0.05)
+            events.append(f"exit:{sid}")
+
+        # Shared lock pool: one asyncio.Lock per lock-id, returned to both
+        # _fire_one calls. _build_mgr's default get_lock already uses a
+        # shared map, so we just use it here.
+        mgr = _build_mgr(store, fire_message=cb)
+
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        sched_a = _due_sched_dict(
+            schedule_id="serialA",
+            target_thread_id=9999,  # SAME lock id
+            next_fire_at=past,
+        )
+        sched_b = _due_sched_dict(
+            schedule_id="serialB",
+            target_thread_id=9999,  # SAME lock id
+            next_fire_at=past,
+        )
+        store.add(sched_a)
+        store.add(sched_b)
+
+        # Dispatch concurrently — gather forces both _fire_one calls
+        # onto the event loop simultaneously, so without the lock they
+        # would interleave inside the 0.05s callback sleep.
+        await asyncio.gather(
+            mgr._fire_one(sched_a),
+            mgr._fire_one(sched_b),
+        )
+
+        # Strict: events must be one of the two non-interleaved orders.
+        # A regression that removed the ``async with self.get_lock(...)``
+        # would produce an interleaved sequence like
+        # ``["enter:serialA", "enter:serialB", "exit:serialA", "exit:serialB"]``.
+        assert events in (
+            ["enter:serialA", "exit:serialA", "enter:serialB", "exit:serialB"],
+            ["enter:serialB", "exit:serialB", "enter:serialA", "exit:serialA"],
+        ), f"fires interleaved (lock contract broken): {events!r}"
 
     @pytest.mark.asyncio
     async def test_max_global_inflight_cap(self, store):

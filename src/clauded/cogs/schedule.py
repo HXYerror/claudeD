@@ -285,14 +285,87 @@ async def schedule_new_task_cmd(
     """
     bot = interaction.client
     channel = interaction.channel
-    if not isinstance(channel, discord.Thread):
+    # M11: ``/schedule new_task`` is the natural surface for "schedule a
+    # task that should run in its OWN thread later." The original
+    # implementation forced the *creating* turn to also be inside a
+    # thread — but the user often discovers this command in the bound
+    # channel itself ("hey bot, set up a weekly task here"). Allow a
+    # text-channel entry by auto-spinning a one-shot helper thread for
+    # the creation turn; the schedule, once created, still spawns a
+    # fresh thread at each fire-time per PRD §3.8 Kind 2.
+    if isinstance(channel, discord.Thread):
+        thread = channel
+        binding_id = channel.parent_id
+    elif isinstance(channel, discord.TextChannel):
+        binding_id = channel.id
+        if binding_id is None or not bot.project_manager.is_bound(binding_id):
+            await interaction.response.send_message(
+                "❌ This channel isn't bound to a project. "
+                "Run `/project bind <path>` first.",
+                ephemeral=True,
+            )
+            return
+        # Acknowledge before the (potentially slow) thread creation so
+        # we don't blow the 3s Discord interaction window.
         await interaction.response.send_message(
-            "/schedule new_task must be used inside a thread "
-            "(claude needs a session to call the tool).",
+            "⏰ Opening helper thread for schedule creation…",
+            ephemeral=False,
+        )
+        try:
+            thread = await channel.create_thread(
+                name=f"⏰ schedule {interaction.user.display_name}"[:100],
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=60,  # 1h — this thread is transient
+            )
+        except Exception as exc:
+            log.exception("/schedule new_task: helper thread create failed")
+            try:
+                await channel.send(embed=discord.Embed(
+                    title="❌ Failed to create helper thread",
+                    description=f"```\n{str(exc)[:500]}\n```",
+                    color=COLOR_TOOL_FAILURE,
+                ))
+            except Exception:
+                pass
+            return
+        try:
+            bridge = await _ensure_bridge(
+                bot, thread.id, binding_id, interaction.user.name,
+            )
+        except Exception as exc:
+            log.exception("/schedule new_task: failed to start bridge")
+            await thread.send(embed=discord.Embed(
+                title="❌ Failed to open session",
+                description=f"```\n{str(exc)[:500]}\n```",
+                color=COLOR_TOOL_FAILURE,
+            ))
+            return
+        bot._register_scheduler_ctx(
+            thread_id=thread.id,
+            channel_id=binding_id,
+            guild_id=getattr(channel.guild, "id", None),
+        )
+        full = _REMINDER_NEW_TASK.format(user_text=text)
+        project_path = bot.project_manager.get_path(binding_id)
+        renderer = DiscordRenderer(
+            thread,
+            bot=bot,
+            project_path=Path(project_path) if project_path else None,
+        )
+        try:
+            await renderer.render_response(
+                bridge, full, author_id=interaction.user.id,
+            )
+        except Exception:
+            log.exception("/schedule new_task render failed (channel branch)")
+        return
+    else:
+        await interaction.response.send_message(
+            "/schedule new_task must be used inside a thread or text channel.",
             ephemeral=True,
         )
         return
-    binding_id = channel.parent_id
+
     if binding_id is None:
         await interaction.response.send_message(
             NO_CHANNEL_MESSAGE, ephemeral=True,
@@ -313,11 +386,11 @@ async def schedule_new_task_cmd(
 
     try:
         bridge = await _ensure_bridge(
-            bot, channel.id, binding_id, interaction.user.name,
+            bot, thread.id, binding_id, interaction.user.name,
         )
     except Exception as exc:
         log.exception("/schedule new_task: failed to start bridge")
-        await channel.send(embed=discord.Embed(
+        await thread.send(embed=discord.Embed(
             title="❌ Failed to open session",
             description=f"```\n{str(exc)[:500]}\n```",
             color=COLOR_TOOL_FAILURE,
@@ -325,14 +398,14 @@ async def schedule_new_task_cmd(
         return
 
     bot._register_scheduler_ctx(
-        thread_id=channel.id,
+        thread_id=thread.id,
         channel_id=binding_id,
-        guild_id=getattr(channel.guild, "id", None),
+        guild_id=getattr(thread.guild, "id", None),
     )
     full = _REMINDER_NEW_TASK.format(user_text=text)
     project_path = bot.project_manager.get_path(binding_id)
     renderer = DiscordRenderer(
-        channel,
+        thread,
         bot=bot,
         project_path=Path(project_path) if project_path else None,
     )
@@ -412,9 +485,20 @@ async def schedule_list_cmd(
         nfa = state.get("next_fire_at", "") or "?"
         cnt = state.get("fire_count", 0)
         en_suffix = "" if state.get("enabled") else " (disabled)"
+        # M10: surface missed_count + last_fired_at + max_lifetime so
+        # ``/schedule list`` shows the same diagnostic detail that
+        # ``schedule_list`` (claude-facing MCP tool) returns. Without these
+        # fields users can't tell from the embed whether a schedule has
+        # ever fired, has been missing fires (catch_up rolled it forward),
+        # or is racing against its lifetime cap.
+        missed = state.get("missed_count", 0) or 0
+        last_fired = state.get("last_fired_at") or "—"
+        max_life = s.get("max_lifetime_seconds")
+        max_life_str = f"{max_life}s" if max_life else "—"
         lines.append(
             f"{kind_marker} {by_marker} `{sid}` {name} — next={nfa} "
-            f"fires={cnt}{en_suffix}"
+            f"fires={cnt} missed={missed} last={last_fired} "
+            f"max_lifetime={max_life_str}{en_suffix}"
         )
 
     embed = discord.Embed(
