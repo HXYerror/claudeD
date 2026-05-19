@@ -17,6 +17,7 @@ dependencies = [
     "claude-agent-sdk==0.1.80",
     "python-dotenv>=1.0",
     "Pillow>=10",
+    "croniter>=2.0",
 ]
 
 [project.optional-dependencies]
