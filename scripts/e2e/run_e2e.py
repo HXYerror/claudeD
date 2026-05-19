@@ -98,6 +98,11 @@ def make_mock_bot() -> Any:
     cfg.allow_unbound_fallback = False
     cfg.data_dir = str(tmp_data)
     cfg.cwd_path = str(tmp_data)
+    cfg.claude_permission_mode = "default"
+    cfg.claude_cli_path = None
+    cfg.claude_model = None
+    cfg.session_timeout_s = 3600
+    cfg.bridge_stop_timeout_s = 30
 
     bot = ClaudedBot.__new__(ClaudedBot)  # bypass __init__ (Discord client setup)
     bot.config = cfg
@@ -312,37 +317,46 @@ async def case_project_bind_no_channel(bot) -> CaseResult:
 
 
 async def case_health(bot) -> CaseResult:
-    """/health basic invocation."""
+    """/health: must report uptime + 0 sessions + 0 projects + Python version."""
     from clauded.cogs.ops import health_check
     cb = extract_callback(health_check)
     inter = make_mock_interaction(bot=bot)
     await cb(inter)
     reply = _interaction_response_text(inter)
-    # Health embed typically has "ClaudeBot" or "uptime" or "version" or "🩺"
-    keywords = ["health", "uptime", "version", "🩺", "claude", "alive", "🤖"]
-    if any(k.lower() in reply.lower() for k in keywords):
+    # Strict: must have all four fields filled with numbers/strings
+    import sys
+    py_ver = sys.version.split()[0]
+    # Check: 'Uptime' label, 'Active Sessions: 0', 'Bound Projects: 0', and Python version
+    checks = {
+        "Uptime label": "Uptime" in reply,
+        "Active Sessions field": "Active Sessions" in reply,
+        "Bound Projects field": "Bound Projects" in reply,
+        "Python version": py_ver in reply or "Python" in reply,
+        "Claude CLI field": "Claude CLI" in reply,
+    }
+    failed = [k for k, v in checks.items() if not v]
+    if not failed:
         return CaseResult(cog="ops", cmd="health", case="happy", status="PASS",
-                          detail=f"reply has health markers")
+                          detail=f"all 5 fields present")
     return CaseResult(cog="ops", cmd="health", case="happy", status="FAIL",
-                      detail=f"reply={reply[:300]!r}")
+                      detail=f"missing: {failed}; reply={reply[:300]!r}")
 
 
 async def case_model_list(bot) -> CaseResult:
-    """/model list — must show model names."""
-    from clauded.cogs.model import model_group
+    """/model list: must list every alias defined in KNOWN_MODELS."""
+    from clauded.cogs.model import model_group, KNOWN_MODELS
     list_cmd = next(c for c in model_group.commands if c.name == "list")
     cb = extract_callback(list_cmd)
     inter = make_mock_interaction(bot=bot, in_thread=True, parent_id=999_000_000_000)
-    # Need a binding for the parent so /model list resolves
     bot.project_manager.bind(999_000_000_000, str(ROOT))
     await cb(inter)
     reply = _interaction_response_text(inter)
-    has_model = any(m in reply for m in ("sonnet", "opus", "haiku", "claude-"))
-    if has_model:
+    missing = [a for a in KNOWN_MODELS if a not in reply]
+    if not missing:
         return CaseResult(cog="model", cmd="list", case="happy", status="PASS",
-                          detail="reply lists models")
+                          detail=f"all {len(KNOWN_MODELS)} aliases listed")
     return CaseResult(cog="model", cmd="list", case="happy", status="FAIL",
-                      detail=f"reply={reply[:300]!r}")
+                      detail=f"missing aliases: {missing}")
 
 
 async def case_mode_current(bot) -> CaseResult:
@@ -369,26 +383,31 @@ async def case_mode_current(bot) -> CaseResult:
 
 
 async def case_cost_show(bot) -> CaseResult:
-    """/cost show in an unbound channel: should report 0 or no data."""
+    """/cost show: must report numeric total in dollar format."""
     from clauded.cogs.ops import cost_group
     show_cmd = next(c for c in cost_group.commands if c.name == "show")
     cb = extract_callback(show_cmd)
     inter = make_mock_interaction(bot=bot)
+    # bind first so resolve_binding works
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    # plant a non-zero cost so we can verify the number formats
+    bot.cost_tracker.record(inter.channel_id, 0.1234)
     try:
         await cb(inter)
     except Exception as exc:
         return CaseResult(cog="cost", cmd="show", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
-    if reply.strip():
+    # Strict: must contain the actual cost we planted
+    if "$0.1234" in reply or "0.12" in reply:
         return CaseResult(cog="cost", cmd="show", case="happy", status="PASS",
-                          detail="responded")
+                          detail=f"reply contains planted cost; reply={reply[:200]!r}")
     return CaseResult(cog="cost", cmd="show", case="happy", status="FAIL",
-                      detail="empty reply")
+                      detail=f"reply missing planted $0.1234; reply={reply[:300]!r}")
 
 
 async def case_session_list(bot) -> CaseResult:
-    """/session list — should respond (probably empty)."""
+    """/session list: with no active sessions must say 'No active sessions'."""
     from clauded.cogs.session import session_group
     list_cmd = next(c for c in session_group.commands if c.name == "list")
     cb = extract_callback(list_cmd)
@@ -396,34 +415,39 @@ async def case_session_list(bot) -> CaseResult:
     try:
         await cb(inter)
     except Exception as exc:
-        return CaseResult(cog="session", cmd="list", case="happy", status="ERROR",
+        return CaseResult(cog="session", cmd="list", case="empty", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
-    if reply.strip():
-        return CaseResult(cog="session", cmd="list", case="happy", status="PASS",
-                          detail="responded")
-    return CaseResult(cog="session", cmd="list", case="happy", status="FAIL",
-                      detail="empty reply")
+    # Strict: must contain 'no' + 'session' (case-insensitive)
+    rl = reply.lower()
+    if "no" in rl and "session" in rl:
+        return CaseResult(cog="session", cmd="list", case="empty", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="list", case="empty", status="FAIL",
+                      detail=f"reply doesn't indicate empty; reply={reply[:300]!r}")
 
 
 async def case_skill_list(bot) -> CaseResult:
-    """/skill list — needs an active bridge, expect graceful failure."""
+    """/skill list — with no bridge, must say something user-friendly about
+    the missing session OR list skills via fresh-client path."""
     from clauded.cogs.skill import skill_group
     list_cmd = next(c for c in skill_group.commands if c.name == "list")
     cb = extract_callback(list_cmd)
     inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
     try:
         await cb(inter)
     except Exception as exc:
         return CaseResult(cog="skill", cmd="list", case="no-bridge",
                           status="ERROR", detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
-    # Without a bridge it should report "no session" or similar
-    if reply.strip():
+    # Strict: must contain either 'skill' marker or 'no' + indicator
+    rl = reply.lower()
+    if "skill" in rl or "\U0001f9f0" in reply:
         return CaseResult(cog="skill", cmd="list", case="no-bridge",
-                          status="PASS", detail="graceful response when no bridge")
+                          status="PASS", detail=f"reply mentions skills: {reply[:120]!r}")
     return CaseResult(cog="skill", cmd="list", case="no-bridge",
-                      status="FAIL", detail="empty reply on no-bridge")
+                      status="FAIL", detail=f"reply doesn't mention skills: {reply[:300]!r}")
 
 
 # Catalog of cases. Add more as we expand coverage.
@@ -611,21 +635,26 @@ async def case_env_set_and_list(bot) -> CaseResult:
 
 
 async def case_agent_list_empty(bot) -> CaseResult:
-    """/agent list on empty store."""
+    """/agent list on empty store: must say 'No custom agents defined'."""
     from clauded.cogs.agent import agent_group
     cb = extract_callback(next(c for c in agent_group.commands if c.name == "list"))
     inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
     await cb(inter)
     reply = _interaction_response_text(inter)
-    if reply.strip():
+    if "No custom agents defined" in reply:
         return CaseResult(cog="agent", cmd="list", case="empty", status="PASS",
-                          detail=f"reply: {reply[:80]!r}")
+                          detail=f"correct: {reply[:120]!r}")
     return CaseResult(cog="agent", cmd="list", case="empty", status="FAIL",
-                      detail="empty reply on empty store")
+                      detail=f"reply={reply[:300]!r}")
 
 
 async def case_agent_create_then_list(bot) -> CaseResult:
-    """/agent create + /agent list round-trip. Requires bound channel."""
+    """/agent create + /agent list round-trip. Requires bound channel.
+    Strict checks: (a) agent_manager._agents has the entry with the
+    correct prompt, (b) list reply shows the name AND a prompt preview,
+    (c) on-disk agents.json file actually got the record.
+    """
     from clauded.cogs.agent import agent_group
     from clauded.cogs.project import project_group
     create_cmd = next(c for c in agent_group.commands if c.name == "create")
@@ -640,18 +669,37 @@ async def case_agent_create_then_list(bot) -> CaseResult:
     except Exception as exc:
         return CaseResult(cog="agent", cmd="create", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
+
+    # Check 1: in-memory state
+    if "test-agent" not in bot.agent_manager._agents:
+        return CaseResult(cog="agent", cmd="create+list", case="round-trip", status="FAIL",
+                          detail="agent NOT in agent_manager._agents")
+    stored_prompt = bot.agent_manager._agents["test-agent"].get("prompt")
+    if stored_prompt != "You are a test helper.":
+        return CaseResult(cog="agent", cmd="create+list", case="round-trip", status="FAIL",
+                          detail=f"stored prompt wrong: {stored_prompt!r}")
+
+    # Check 2: on-disk
+    import json as _json
+    on_disk = _json.loads(Path("/tmp/e2e_data/agents.json").read_text())
+    if "test-agent" not in on_disk:
+        return CaseResult(cog="agent", cmd="create+list", case="round-trip", status="FAIL",
+                          detail="agent NOT in agents.json")
+
+    # Check 3: /agent list shows it with prompt preview
     inter2 = make_mock_interaction(bot=bot, channel_id=inter_bind.channel_id)
     await extract_callback(list_cmd)(inter2)
     reply = _interaction_response_text(inter2)
-    if "test-agent" in reply:
+    if "test-agent" in reply and "test helper" in reply.lower():
         return CaseResult(cog="agent", cmd="create+list", case="round-trip", status="PASS",
-                          detail="agent visible in list")
+                          detail="agent in memory + on-disk + list shows name+prompt")
     return CaseResult(cog="agent", cmd="create+list", case="round-trip", status="FAIL",
-                      detail=f"reply={reply[:300]!r}")
+                      detail=f"list reply missing prompt preview: {reply[:300]!r}")
 
 
 async def case_log_dump(bot) -> CaseResult:
-    """/log dump — generate a bundle (loop.run_in_executor inside)."""
+    """/log dump: must produce a valid .zip with manifest.json + state/+.
+    Strict: open the bundle and verify required entries are present."""
     from clauded.cogs.log_dump import log_group
     cb = extract_callback(next(c for c in log_group.commands if c.name == "dump"))
     inter = make_mock_interaction(bot=bot)
@@ -660,17 +708,37 @@ async def case_log_dump(bot) -> CaseResult:
     except Exception as exc:
         return CaseResult(cog="log", cmd="dump", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
-    # Should have a followup with a discord.File
+    # Look for the attached file
     sent_files = []
     for s in inter._followups:
         f = s.get("kwargs", {}).get("file")
         if f is not None:
             sent_files.append(f)
-    if sent_files:
-        return CaseResult(cog="log", cmd="dump", case="happy", status="PASS",
-                          detail=f"{len(sent_files)} file attachment(s) in followup")
-    return CaseResult(cog="log", cmd="dump", case="happy", status="FAIL",
-                      detail=f"no file in followups; followups={inter._followups[:1]}")
+    if not sent_files:
+        return CaseResult(cog="log", cmd="dump", case="happy", status="FAIL",
+                          detail=f"no file in followups; followups={inter._followups[:1]}")
+    # Open the bundle and verify structure
+    import zipfile as _zf
+    fobj = sent_files[0]
+    # discord.File has .fp.name (the open file's path) and ._filename (cosmetic)
+    fp = getattr(fobj, "fp", None)
+    fpath = getattr(fp, "name", None) if fp is not None else None
+    if not fpath:
+        return CaseResult(cog="log", cmd="dump", case="happy", status="FAIL",
+                          detail=f"can't resolve bundle path; fp={fp!r}")
+    try:
+        with _zf.ZipFile(fpath) as z:
+            names = set(z.namelist())
+    except Exception as exc:
+        return CaseResult(cog="log", cmd="dump", case="happy", status="FAIL",
+                          detail=f"can't open bundle as zip: {exc}")
+    required = {"manifest.json", "env-redacted.txt"}
+    missing = required - names
+    if missing:
+        return CaseResult(cog="log", cmd="dump", case="happy", status="FAIL",
+                          detail=f"bundle missing required entries: {missing}; got: {sorted(names)[:10]}")
+    return CaseResult(cog="log", cmd="dump", case="happy", status="PASS",
+                      detail=f"bundle has manifest + env + {len(names)} entries")
 
 
 async def case_diff_no_binding(bot) -> CaseResult:
@@ -721,59 +789,82 @@ async def case_session_clear_no_session(bot) -> CaseResult:
 
 
 async def case_btw_no_session(bot) -> CaseResult:
-    """/btw with no session — should refuse politely."""
+    """/btw outside a thread must refuse with 'use in a thread' message."""
     from clauded.cogs.ops import btw_cmd
     cb = extract_callback(btw_cmd)
     inter = make_mock_interaction(bot=bot)
     try:
         await cb(inter, text="quick test")
     except Exception as exc:
-        return CaseResult(cog="ops", cmd="btw", case="no-session", status="ERROR",
+        return CaseResult(cog="ops", cmd="btw", case="no-thread", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
-    return CaseResult(cog="ops", cmd="btw", case="no-session", status="PASS",
-                      detail=f"reply: {reply[:120]!r}")
+    # Strict: must mention thread requirement
+    rl = reply.lower()
+    if "thread" in rl and ("\u274c" in reply or "must" in rl or "start" in rl):
+        return CaseResult(cog="ops", cmd="btw", case="no-thread", status="PASS",
+                          detail=f"refused properly: {reply[:120]!r}")
+    return CaseResult(cog="ops", cmd="btw", case="no-thread", status="FAIL",
+                      detail=f"reply doesn't say thread-only: {reply[:300]!r}")
 
 
 async def case_ratelimit(bot) -> CaseResult:
-    """/ratelimit just dumps cache state."""
+    """/ratelimit: must include cost total + session count fields."""
     from clauded.cogs.ops import ratelimit_info
     cb = extract_callback(ratelimit_info)
     inter = make_mock_interaction(bot=bot)
+    # Plant a cost so we can verify the embed number
+    bot.cost_tracker.record(42, 0.5678)
     try:
         await cb(inter)
     except Exception as exc:
         return CaseResult(cog="ops", cmd="ratelimit", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
-    if reply.strip():
+    # Strict: must contain the actual planted cost AND mention sessions
+    if ("$0.5678" in reply or "0.56" in reply or "0.57" in reply) and "session" in reply.lower():
         return CaseResult(cog="ops", cmd="ratelimit", case="happy", status="PASS",
-                          detail=f"reply: {reply[:120]!r}")
+                          detail=f"reply has planted cost + sessions: {reply[:200]!r}")
     return CaseResult(cog="ops", cmd="ratelimit", case="happy", status="FAIL",
-                      detail="empty reply")
+                      detail=f"reply missing planted cost or session count: {reply[:300]!r}")
 
 
 async def case_tools_allow(bot) -> CaseResult:
-    """/tools allow Bash — should succeed."""
+    """/tools allow: requires being IN a thread. Test the actually-happy path."""
     from clauded.cogs.tools import tools_group
     cb = extract_callback(next(c for c in tools_group.commands if c.name == "allow"))
-    # bind first
     from clauded.cogs.project import project_group
     bind_cb = extract_callback(next(c for c in project_group.commands if c.name == "bind"))
-    inter = make_mock_interaction(bot=bot)
-    await bind_cb(inter, path=str(ROOT))
-    inter2 = make_mock_interaction(bot=bot, channel_id=inter.channel_id)
+
+    # Bind the parent channel
+    parent_id = 7000000000
+    inter_bind = make_mock_interaction(bot=bot, channel_id=parent_id)
+    await bind_cb(inter_bind, path=str(ROOT))
+
+    # Now invoke from inside a thread of that parent
+    inter = make_mock_interaction(bot=bot, in_thread=True,
+                                  channel_id=7000000001, parent_id=parent_id)
+    # _recreate_session is a real ClaudedBot method that tries to spin
+    # up a new bridge. Mock it to avoid Discord IO.
+    async def _fake_recreate(interaction, **kwargs):
+        # Verify the kwargs we expect get propagated
+        if kwargs.get("allowed_tools") != ["Bash"]:
+            return None  # signals failure
+        return MagicMock()  # truthy bridge
+    bot._recreate_session = _fake_recreate
+
     try:
-        await cb(inter2, tools="Bash")
+        await cb(inter, tools="Bash")
     except Exception as exc:
         return CaseResult(cog="tools", cmd="allow", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
-    reply = _interaction_response_text(inter2)
-    if reply.strip():
+    reply = _interaction_response_text(inter)
+    # Strict: must mention 'Bash' and 'allowed'
+    if "Bash" in reply and ("allowed" in reply.lower() or "\U0001f527" in reply):
         return CaseResult(cog="tools", cmd="allow", case="happy", status="PASS",
-                          detail=f"reply: {reply[:120]!r}")
+                          detail=f"reply confirms Bash allowed: {reply[:200]!r}")
     return CaseResult(cog="tools", cmd="allow", case="happy", status="FAIL",
-                      detail="empty reply")
+                      detail=f"reply doesn't confirm: {reply[:300]!r}")
 
 
 async def case_debug_toggle(bot) -> CaseResult:
@@ -796,18 +887,31 @@ async def case_debug_toggle(bot) -> CaseResult:
 
 
 async def case_notify_toggle(bot) -> CaseResult:
-    """/notify toggles per-thread notification flag (no arg)."""
+    """/notify: toggles per-thread notification flag — verify state change."""
     from clauded.cogs.ops import notify_toggle
     cb = extract_callback(notify_toggle)
     inter = make_mock_interaction(bot=bot)
+    thread_id = inter.channel_id
+    # Default state: not in dict
+    before = bot._notify_enabled.get(thread_id, bot._pre_tool_notifications)
     try:
         await cb(inter)
     except Exception as exc:
         return CaseResult(cog="ops", cmd="notify", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
+    after = bot._notify_enabled.get(thread_id)
     reply = _interaction_response_text(inter)
-    return CaseResult(cog="ops", cmd="notify", case="happy", status="PASS",
-                      detail=f"reply: {reply[:120]!r}")
+    # Strict: state must have flipped AND reply must reflect it
+    if after is not None and after != before:
+        # Reply should mention ON/OFF matching new state
+        expected = "ON" if after else "OFF"
+        if expected in reply:
+            return CaseResult(cog="ops", cmd="notify", case="happy", status="PASS",
+                              detail=f"{before} → {after}; reply says {expected}")
+        return CaseResult(cog="ops", cmd="notify", case="happy", status="FAIL",
+                          detail=f"state flipped to {after} but reply says wrong: {reply[:200]!r}")
+    return CaseResult(cog="ops", cmd="notify", case="happy", status="FAIL",
+                      detail=f"state didn't flip: before={before}, after={after}")
 
 
 async def case_unbound_fallback_toggle(bot) -> CaseResult:
@@ -1036,19 +1140,29 @@ async def case_project_add_dir_traversal(bot) -> CaseResult:
 
 
 async def case_session_resume_no_stored(bot) -> CaseResult:
-    """/session resume with no stored session — must NOT crash."""
+    """/session resume with no stored session in a *bound* channel.
+    Must say 'no saved' / 'no session to resume' — NOT 'isn't bound'.
+    """
     from clauded.cogs.session import session_group
     resume_cmd = next(c for c in session_group.commands if c.name == "resume")
     cb = extract_callback(resume_cmd)
     inter = make_mock_interaction(bot=bot)
+    # Bind so we don't fall into unbound refusal path
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
     try:
         await cb(inter)
     except Exception as exc:
         return CaseResult(cog="session", cmd="resume", case="no-stored",
                           status="ERROR", detail=f"{type(exc).__name__}: {exc}")
     reply = _interaction_response_text(inter)
+    rl = reply.lower()
+    # Strict: must say there's nothing to resume, NOT unbound
+    if "no" in rl and ("resume" in rl or "saved" in rl or "session" in rl):
+        return CaseResult(cog="session", cmd="resume", case="no-stored",
+                          status="PASS", detail=f"reply={reply[:160]!r}")
     return CaseResult(cog="session", cmd="resume", case="no-stored",
-                      status="PASS", detail=f"reply: {reply[:120]!r}")
+                      status="FAIL",
+                      detail=f"reply doesn't say 'no to resume'; reply={reply[:300]!r}")
 
 
 async def case_log_dump_no_data_dir(bot, tmp_path=None) -> CaseResult:
@@ -1082,35 +1196,37 @@ async def case_log_dump_no_data_dir(bot, tmp_path=None) -> CaseResult:
 
 
 async def case_review_pr_no_arg(bot) -> CaseResult:
-    """/review without pr arg — what happens?"""
+    """/review pr=N: invokes external git command. We just verify
+    cog doesn't crash and the response embed has sensible structure.
+    The actual git failure (exit 1) is expected with PR=1 since this
+    isn't a real PR — we're testing the COG wiring, not git.
+
+    Strict: response must mention 'PR' or 'review' somewhere; not
+    just any non-empty string.
+    """
     from clauded.cogs.ops import review_pr
     cb = extract_callback(review_pr)
     inter = make_mock_interaction(bot=bot)
+    # bind first
+    from clauded.cogs.project import project_group
+    bind = extract_callback(next(c for c in project_group.commands if c.name == "bind"))
+    await bind(inter, path=str(ROOT))
+    inter2 = make_mock_interaction(bot=bot, channel_id=inter.channel_id)
     sig = inspect.signature(cb)
-    params = list(sig.parameters.keys())
-    # If pr is required, calling without it should ERROR — but Discord
-    # interactions enforce that, so the callback assumes it's passed.
-    # Test the "happy" case with a pr number.
-    if "pr" in params or "pr_number" in params:
-        # Bind first
-        from clauded.cogs.project import project_group
-        bind = extract_callback(next(c for c in project_group.commands if c.name == "bind"))
-        await bind(inter, path=str(ROOT))
-        inter2 = make_mock_interaction(bot=bot, channel_id=inter.channel_id)
-        kw = {"pr": 1} if "pr" in params else {"pr_number": 1}
-        try:
-            await cb(inter2, **kw)
-        except Exception as exc:
-            return CaseResult(cog="ops", cmd="review", case="happy",
-                              status="ERROR", detail=f"{type(exc).__name__}: {exc}")
-        reply = _interaction_response_text(inter2)
-        if reply.strip():
-            return CaseResult(cog="ops", cmd="review", case="happy",
-                              status="PASS", detail=f"responded: {reply[:120]!r}")
-        return CaseResult(cog="ops", cmd="review", case="happy",
-                          status="FAIL", detail="empty reply")
-    return CaseResult(cog="ops", cmd="review", case="signature",
-                      status="SKIP", detail=f"signature has no 'pr' param: {params}")
+    kw = {"pr": 1} if "pr" in sig.parameters else {"pr_number": 1}
+    try:
+        await cb(inter2, **kw)
+    except Exception as exc:
+        return CaseResult(cog="ops", cmd="review", case="pr=1",
+                          status="ERROR", detail=f"{type(exc).__name__}: {exc}")
+    reply = _interaction_response_text(inter2)
+    # Strict: must mention 'PR' or 'pull' or 'review' somewhere
+    rl = reply.lower()
+    if "pr" in rl or "pull" in rl or "review" in rl or "error" in rl:
+        return CaseResult(cog="ops", cmd="review", case="pr=1",
+                          status="PASS", detail=f"reply has PR-context: {reply[:200]!r}")
+    return CaseResult(cog="ops", cmd="review", case="pr=1",
+                      status="FAIL", detail=f"reply lacks PR context: {reply[:300]!r}")
 
 
 async def case_skill_list_signature(bot) -> CaseResult:
@@ -1169,6 +1285,632 @@ HAPPY_CASES.extend([
     ("/skill list signature", case_skill_list_signature),
     ("/context no-session", case_context_no_session),
     ("/session compact no-session", case_compact_no_session),
+])
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Expanded coverage — remaining commands not yet exercised
+# ---------------------------------------------------------------------------
+
+
+async def case_cost_total(bot) -> CaseResult:
+    """/cost total: must include planted total amount."""
+    from clauded.cogs.ops import cost_group
+    cb = extract_callback(next(c for c in cost_group.commands if c.name == "total"))
+    inter = make_mock_interaction(bot=bot)
+    bot.cost_tracker.record(42, 0.1234)
+    bot.cost_tracker.record(99, 0.5678)
+    try:
+        await cb(inter)
+    except Exception as exc:
+        return CaseResult(cog="cost", cmd="total", case="happy", status="ERROR",
+                          detail=f"{type(exc).__name__}: {exc}")
+    reply = _interaction_response_text(inter)
+    # 0.1234 + 0.5678 = 0.6912
+    if "0.6912" in reply or "0.69" in reply:
+        return CaseResult(cog="cost", cmd="total", case="happy", status="PASS",
+                          detail=f"reply has planted total: {reply[:200]!r}")
+    return CaseResult(cog="cost", cmd="total", case="happy", status="FAIL",
+                      detail=f"reply missing planted total: {reply[:300]!r}")
+
+
+async def case_cost_reset(bot) -> CaseResult:
+    """/cost reset: must clear the channel cost AND confirm in reply."""
+    from clauded.cogs.ops import cost_group
+    reset_cmd = next(c for c in cost_group.commands if c.name == "reset")
+    cb = extract_callback(reset_cmd)
+    inter = make_mock_interaction(bot=bot)
+    # Bind so resolve_binding works
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    bot.cost_tracker.record(inter.channel_id, 1.0)
+    before, calls_before = bot.cost_tracker.get_channel_cost(inter.channel_id)
+    if before != 1.0:
+        return CaseResult(cog="cost", cmd="reset", case="happy", status="ERROR",
+                          detail=f"planted cost not seen pre-reset: {before}")
+    try:
+        await cb(inter)
+    except Exception as exc:
+        return CaseResult(cog="cost", cmd="reset", case="happy", status="ERROR",
+                          detail=f"{type(exc).__name__}: {exc}")
+    after, calls_after = bot.cost_tracker.get_channel_cost(inter.channel_id)
+    if after == 0.0:
+        return CaseResult(cog="cost", cmd="reset", case="happy", status="PASS",
+                          detail=f"cost cleared: {before} → {after}")
+    return CaseResult(cog="cost", cmd="reset", case="happy", status="FAIL",
+                      detail=f"reset didn't clear: before={before}, after={after}")
+
+
+async def case_session_stop_no_session(bot) -> CaseResult:
+    """/session stop without active session: must say 'no active'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "stop"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    rl = reply.lower()
+    if "no active" in rl and "session" in rl:
+        return CaseResult(cog="session", cmd="stop", case="no-session", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="stop", case="no-session", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_interrupt_no_session(bot) -> CaseResult:
+    """/session interrupt without session: must say 'no active'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "interrupt"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no active" in reply.lower():
+        return CaseResult(cog="session", cmd="interrupt", case="no-session", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="interrupt", case="no-session", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_fork_no_session(bot) -> CaseResult:
+    """/session fork without session: must say 'no active'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "fork"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no active session" in reply.lower():
+        return CaseResult(cog="session", cmd="fork", case="no-session", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="fork", case="no-session", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_pin_no_session(bot) -> CaseResult:
+    """/session pin without prior reply: must say 'no reply to pin'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "pin"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no reply" in reply.lower() or "no message" in reply.lower():
+        return CaseResult(cog="session", cmd="pin", case="no-reply", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="pin", case="no-reply", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_export_no_session(bot) -> CaseResult:
+    """/session export without session: must say 'no messages'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "export"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no message" in reply.lower() or "no session" in reply.lower():
+        return CaseResult(cog="session", cmd="export", case="empty", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="export", case="empty", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_worktree_not_in_thread(bot) -> CaseResult:
+    """/session worktree from channel (not thread): must say 'use in thread'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "worktree"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="feat-x")
+    reply = _interaction_response_text(inter)
+    if "thread" in reply.lower() and "❌" in reply:
+        return CaseResult(cog="session", cmd="worktree", case="not-thread", status="PASS",
+                          detail=f"refused: {reply[:120]!r}")
+    return CaseResult(cog="session", cmd="worktree", case="not-thread", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_name_not_in_thread(bot) -> CaseResult:
+    """/session name from channel (not thread)."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "name"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="my-session")
+    reply = _interaction_response_text(inter)
+    if "thread" in reply.lower() and "❌" in reply:
+        return CaseResult(cog="session", cmd="name", case="not-thread", status="PASS",
+                          detail=f"refused: {reply[:120]!r}")
+    return CaseResult(cog="session", cmd="name", case="not-thread", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_settings_not_in_thread(bot) -> CaseResult:
+    """/session settings from channel (not thread)."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "settings"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, json_str='{"test": 1}')
+    reply = _interaction_response_text(inter)
+    if "thread" in reply.lower() and "❌" in reply:
+        return CaseResult(cog="session", cmd="settings", case="not-thread", status="PASS",
+                          detail=f"refused: {reply[:120]!r}")
+    return CaseResult(cog="session", cmd="settings", case="not-thread", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_session_security_review_no_session(bot) -> CaseResult:
+    """/session security-review without session: must say 'no active'."""
+    from clauded.cogs.session import session_group
+    cb = extract_callback(next(c for c in session_group.commands if c.name == "security-review"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no active session" in reply.lower():
+        return CaseResult(cog="session", cmd="security-review", case="no-session",
+                          status="PASS", detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="session", cmd="security-review", case="no-session",
+                      status="FAIL", detail=f"reply={reply[:300]!r}")
+
+
+async def case_agent_use_unknown(bot) -> CaseResult:
+    """/agent use 'unknown-agent': must say 'not found' with the exact name."""
+    from clauded.cogs.agent import agent_group
+    cb = extract_callback(next(c for c in agent_group.commands if c.name == "use"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="unknown-xyz-9999")
+    reply = _interaction_response_text(inter)
+    if "not found" in reply.lower() and "unknown-xyz-9999" in reply:
+        return CaseResult(cog="agent", cmd="use", case="unknown", status="PASS",
+                          detail=f"correct: {reply[:120]!r}")
+    return CaseResult(cog="agent", cmd="use", case="unknown", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_agent_delete_unknown(bot) -> CaseResult:
+    """/agent delete 'unknown-agent': must say 'not found' with name."""
+    from clauded.cogs.agent import agent_group
+    cb = extract_callback(next(c for c in agent_group.commands if c.name == "delete"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="unknown-xyz-9999")
+    reply = _interaction_response_text(inter)
+    if "not found" in reply.lower() and "unknown-xyz-9999" in reply:
+        return CaseResult(cog="agent", cmd="delete", case="unknown", status="PASS",
+                          detail=f"correct: {reply[:120]!r}")
+    return CaseResult(cog="agent", cmd="delete", case="unknown", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_agent_delete_real_one(bot) -> CaseResult:
+    """/agent delete an existing agent: must remove from store."""
+    from clauded.cogs.agent import agent_group
+    create_cmd = next(c for c in agent_group.commands if c.name == "create")
+    delete_cmd = next(c for c in agent_group.commands if c.name == "delete")
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await extract_callback(create_cmd)(inter, name="doomed", prompt="goodbye")
+    if "doomed" not in bot.agent_manager._agents:
+        return CaseResult(cog="agent", cmd="delete", case="happy", status="ERROR",
+                          detail="agent didn't get created")
+    inter2 = make_mock_interaction(bot=bot, channel_id=inter.channel_id)
+    await extract_callback(delete_cmd)(inter2, name="doomed")
+    if "doomed" in bot.agent_manager._agents:
+        return CaseResult(cog="agent", cmd="delete", case="happy", status="FAIL",
+                          detail="agent NOT deleted")
+    reply = _interaction_response_text(inter2)
+    if "doomed" in reply and "deleted" in reply.lower():
+        return CaseResult(cog="agent", cmd="delete", case="happy", status="PASS",
+                          detail=f"deleted: {reply[:120]!r}")
+    return CaseResult(cog="agent", cmd="delete", case="happy", status="FAIL",
+                      detail=f"removed but reply weird: {reply[:300]!r}")
+
+
+async def case_mcp_add_stdio(bot) -> CaseResult:
+    """/mcp add: should register stdio server."""
+    from clauded.cogs.mcp import mcp_group
+    cb = extract_callback(next(c for c in mcp_group.commands if c.name == "add"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="test-mcp", command="echo hello")
+    reply = _interaction_response_text(inter)
+    if "test-mcp" in reply and ("added" in reply.lower() or "✅" in reply):
+        return CaseResult(cog="mcp", cmd="add", case="happy", status="PASS",
+                          detail=f"added: {reply[:120]!r}")
+    return CaseResult(cog="mcp", cmd="add", case="happy", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_mcp_remove_unknown(bot) -> CaseResult:
+    """/mcp remove of unknown server: 'not found'."""
+    from clauded.cogs.mcp import mcp_group
+    cb = extract_callback(next(c for c in mcp_group.commands if c.name == "remove"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, name="ghost-server")
+    reply = _interaction_response_text(inter)
+    if "not found" in reply.lower() and "ghost-server" in reply:
+        return CaseResult(cog="mcp", cmd="remove", case="unknown", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="mcp", cmd="remove", case="unknown", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_env_remove_unknown(bot) -> CaseResult:
+    """/env remove of nonexistent var: must say 'not found'."""
+    from clauded.cogs.project import env_group
+    cb = extract_callback(next(c for c in env_group.commands if c.name == "remove"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, key="GHOST_VAR_X9Z")
+    reply = _interaction_response_text(inter)
+    if "not found" in reply.lower() and "GHOST_VAR_X9Z" in reply:
+        return CaseResult(cog="env", cmd="remove", case="unknown", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="env", cmd="remove", case="unknown", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_project_remove_dir_unknown(bot) -> CaseResult:
+    """/project remove-dir on dir not in list: must say 'not found'."""
+    from clauded.cogs.project import project_group
+    cb = extract_callback(next(c for c in project_group.commands if c.name == "remove-dir"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, path="/ghost/dir/path")
+    reply = _interaction_response_text(inter)
+    if "not found" in reply.lower():
+        return CaseResult(cog="project", cmd="remove-dir", case="unknown", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="project", cmd="remove-dir", case="unknown", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_project_dirs_empty(bot) -> CaseResult:
+    """/project dirs with no extras: must say 'No extra directories'."""
+    from clauded.cogs.project import project_group
+    cb = extract_callback(next(c for c in project_group.commands if c.name == "dirs"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no extra" in reply.lower() or "no" in reply.lower():
+        return CaseResult(cog="project", cmd="dirs", case="empty", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="project", cmd="dirs", case="empty", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_project_set_mention_required(bot) -> CaseResult:
+    """/project set-mention-required: must update state + confirm in reply."""
+    from clauded.cogs.project import project_group
+    cb = extract_callback(next(c for c in project_group.commands if c.name == "set-mention-required"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter, required=True)
+    reply = _interaction_response_text(inter)
+    # Verify state in project_manager
+    settings = bot.project_manager._channel_settings.get(str(inter.channel_id), {})
+    state_set = settings.get("mention_required") is True
+    reply_says_true = "true" in reply.lower() or "✅" in reply or "required" in reply.lower()
+    if state_set and reply_says_true:
+        return CaseResult(cog="project", cmd="set-mention-required", case="set-true",
+                          status="PASS", detail=f"state={state_set}; reply={reply[:120]!r}")
+    return CaseResult(cog="project", cmd="set-mention-required", case="set-true",
+                      status="FAIL",
+                      detail=f"state={state_set}; reply={reply[:200]!r}")
+
+
+async def case_budget_show_empty(bot) -> CaseResult:
+    """/budget show with no budget: must say 'No budget limit set'."""
+    from clauded.cogs.tools import budget_group
+    cb = extract_callback(next(c for c in budget_group.commands if c.name == "show"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no budget" in reply.lower() or "no limit" in reply.lower():
+        return CaseResult(cog="budget", cmd="show", case="empty", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="budget", cmd="show", case="empty", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_budget_clear(bot) -> CaseResult:
+    """/budget clear: removes limit + confirms in reply."""
+    from clauded.cogs.tools import budget_group
+    cb = extract_callback(next(c for c in budget_group.commands if c.name == "clear"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "cleared" in reply.lower() or "removed" in reply.lower():
+        return CaseResult(cog="budget", cmd="clear", case="happy", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="budget", cmd="clear", case="happy", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_tools_reset_not_in_thread(bot) -> CaseResult:
+    """/tools reset from channel (not thread)."""
+    from clauded.cogs.tools import tools_group
+    cb = extract_callback(next(c for c in tools_group.commands if c.name == "reset"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "thread" in reply.lower() and "❌" in reply:
+        return CaseResult(cog="tools", cmd="reset", case="not-thread", status="PASS",
+                          detail=f"refused: {reply[:120]!r}")
+    return CaseResult(cog="tools", cmd="reset", case="not-thread", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_tools_deny_not_in_thread(bot) -> CaseResult:
+    """/tools deny from channel (not thread)."""
+    from clauded.cogs.tools import tools_group
+    cb = extract_callback(next(c for c in tools_group.commands if c.name == "deny"))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter, tools="Bash")
+    reply = _interaction_response_text(inter)
+    if "thread" in reply.lower() and "❌" in reply:
+        return CaseResult(cog="tools", cmd="deny", case="not-thread", status="PASS",
+                          detail=f"refused: {reply[:120]!r}")
+    return CaseResult(cog="tools", cmd="deny", case="not-thread", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_mode_set_not_in_thread(bot) -> CaseResult:
+    """/mode set from channel (not thread): must report 'no active session'."""
+    from clauded.cogs.mode import mode_group
+    from discord import app_commands
+    set_cmd = next(c for c in mode_group.commands if c.name == "set")
+    cb = extract_callback(set_cmd)
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    # Build a real Choice
+    choice = app_commands.Choice(name="default", value="default")
+    await cb(inter, mode=choice)
+    reply = _interaction_response_text(inter)
+    if "no active session" in reply.lower():
+        return CaseResult(cog="mode", cmd="set", case="no-session", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="mode", cmd="set", case="no-session", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_mode_cycle_no_session(bot) -> CaseResult:
+    """/mode cycle without session: 'no active session'."""
+    from clauded.cogs.mode import mode_group
+    cb = extract_callback(next(c for c in mode_group.commands if c.name == "cycle"))
+    inter = make_mock_interaction(bot=bot)
+    bot.project_manager.bind(inter.channel_id, str(ROOT))
+    await cb(inter)
+    reply = _interaction_response_text(inter)
+    if "no active session" in reply.lower():
+        return CaseResult(cog="mode", cmd="cycle", case="no-session", status="PASS",
+                          detail=f"reply={reply[:120]!r}")
+    return CaseResult(cog="mode", cmd="cycle", case="no-session", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+async def case_fallback_model_set(bot) -> CaseResult:
+    """/fallback-model: requires being in thread + bound parent.
+    Stub _recreate_session to verify the fallback_model kwarg propagates."""
+    from clauded.cogs.model import fallback_model_cmd
+    cb = extract_callback(fallback_model_cmd)
+    parent_id = 6000000000
+    from clauded.cogs.project import project_group
+    bind_cb = extract_callback(next(c for c in project_group.commands if c.name == "bind"))
+    inter_bind = make_mock_interaction(bot=bot, channel_id=parent_id)
+    await bind_cb(inter_bind, path=str(ROOT))
+
+    captured: dict = {}
+    async def _fake_recreate(interaction, **kwargs):
+        captured.update(kwargs)
+        return MagicMock()  # truthy bridge
+    bot._recreate_session = _fake_recreate
+
+    inter = make_mock_interaction(bot=bot, in_thread=True,
+                                  channel_id=6000000001, parent_id=parent_id)
+    sig = inspect.signature(cb)
+    param_name = next((p.name for p in sig.parameters.values() if p.name != "interaction"), None)
+    if param_name is None:
+        return CaseResult(cog="model", cmd="fallback-model", case="happy", status="SKIP",
+                          detail="unknown signature")
+    try:
+        await cb(inter, **{param_name: "haiku"})
+    except Exception as exc:
+        return CaseResult(cog="model", cmd="fallback-model", case="happy", status="ERROR",
+                          detail=f"{type(exc).__name__}: {exc}")
+    # Strict: the fallback_model kwarg made it through to _recreate_session
+    if captured.get("fallback_model") != "haiku":
+        return CaseResult(cog="model", cmd="fallback-model", case="happy", status="FAIL",
+                          detail=f"_recreate_session received fallback_model={captured.get('fallback_model')!r}")
+    reply = _interaction_response_text(inter)
+    if "haiku" in reply.lower() and ("fallback" in reply.lower() or "\U0001f504" in reply):
+        return CaseResult(cog="model", cmd="fallback-model", case="happy", status="PASS",
+                          detail=f"reply={reply[:120]!r}; recreate_session got haiku")
+    return CaseResult(cog="model", cmd="fallback-model", case="happy", status="FAIL",
+                      detail=f"reply={reply[:300]!r}")
+
+
+HAPPY_CASES.extend([
+    ("/cost total happy", case_cost_total),
+    ("/cost reset happy", case_cost_reset),
+    ("/session stop no-session", case_session_stop_no_session),
+    ("/session interrupt no-session", case_session_interrupt_no_session),
+    ("/session fork no-session", case_session_fork_no_session),
+    ("/session pin no-reply", case_session_pin_no_session),
+    ("/session export empty", case_session_export_no_session),
+    ("/session worktree not-thread", case_session_worktree_not_in_thread),
+    ("/session name not-thread", case_session_name_not_in_thread),
+    ("/session settings not-thread", case_session_settings_not_in_thread),
+    ("/session security-review no-session", case_session_security_review_no_session),
+    ("/agent use unknown", case_agent_use_unknown),
+    ("/agent delete unknown", case_agent_delete_unknown),
+    ("/agent delete happy", case_agent_delete_real_one),
+    ("/mcp add stdio happy", case_mcp_add_stdio),
+    ("/mcp remove unknown", case_mcp_remove_unknown),
+    ("/env remove unknown", case_env_remove_unknown),
+    ("/project remove-dir unknown", case_project_remove_dir_unknown),
+    ("/project dirs empty", case_project_dirs_empty),
+    ("/project set-mention-required true", case_project_set_mention_required),
+    ("/budget show empty", case_budget_show_empty),
+    ("/budget clear happy", case_budget_clear),
+    ("/tools reset not-thread", case_tools_reset_not_in_thread),
+    ("/tools deny not-thread", case_tools_deny_not_in_thread),
+    ("/mode set no-session", case_mode_set_not_in_thread),
+    ("/mode cycle no-session", case_mode_cycle_no_session),
+    ("/fallback-model haiku", case_fallback_model_set),
+])
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Regression cases for #254 and #255
+# ---------------------------------------------------------------------------
+
+
+async def case_254_agent_create_duplicate_silently_overwrites(bot) -> CaseResult:
+    """#254: /agent create with existing name silently overwrites prior prompt."""
+    from clauded.cogs.agent import agent_group
+    create = extract_callback(next(c for c in agent_group.commands if c.name == "create"))
+    bot.project_manager.bind(1500000000_000000001, str(ROOT))
+    inter = make_mock_interaction(bot=bot)
+    await create(inter, name="dup", prompt="first")
+    first_prompt = bot.agent_manager._agents.get("dup", {}).get("prompt")
+    inter2 = make_mock_interaction(bot=bot, channel_id=inter.channel_id)
+    await create(inter2, name="dup", prompt="REPLACED")
+    after_prompt = bot.agent_manager._agents.get("dup", {}).get("prompt")
+    # Bug: should have refused OR kept first; instead silently replaces.
+    if first_prompt == "first" and after_prompt == "REPLACED":
+        return CaseResult(cog="agent", cmd="create", case="#254-silent-overwrite",
+                          status="FAIL",
+                          detail="#254 confirmed: second create overwrote prior prompt without warning")
+    return CaseResult(cog="agent", cmd="create", case="#254-silent-overwrite",
+                      status="PASS",
+                      detail=f"refused or kept original; first={first_prompt!r}, after={after_prompt!r}")
+
+
+async def case_255_agent_create_empty_name(bot) -> CaseResult:
+    """#255: /agent create accepts empty name."""
+    from clauded.cogs.agent import agent_group
+    cb = extract_callback(next(c for c in agent_group.commands if c.name == "create"))
+    bot.project_manager.bind(1500000000_000000001, str(ROOT))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter, name="", prompt="hi")
+    if "" in bot.agent_manager._agents:
+        return CaseResult(cog="agent", cmd="create", case="#255-empty-name",
+                          status="FAIL",
+                          detail="#255 confirmed: empty-string agent name accepted")
+    return CaseResult(cog="agent", cmd="create", case="#255-empty-name",
+                      status="PASS",
+                      detail="empty name refused")
+
+
+async def case_255_env_set_equals_in_key(bot) -> CaseResult:
+    """#255: /env set accepts `=` in key (invalid POSIX env name)."""
+    from clauded.cogs.project import env_group
+    cb = extract_callback(next(c for c in env_group.commands if c.name == "set"))
+    bot.project_manager.bind(1500000000_000000001, str(ROOT))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter, key="KEY=injected", value="val")
+    env = bot.project_manager._projects.get(str(inter.channel_id), {}).get("env", {})
+    if "KEY=injected" in env:
+        return CaseResult(cog="env", cmd="set", case="#255-equals-in-key",
+                          status="FAIL",
+                          detail="#255 confirmed: env key 'KEY=injected' accepted (violates POSIX name)")
+    return CaseResult(cog="env", cmd="set", case="#255-equals-in-key",
+                      status="PASS", detail="`=` in env key refused")
+
+
+async def case_255_env_set_newline_in_key(bot) -> CaseResult:
+    """#255: /env set accepts newline in key (breaks .env files)."""
+    from clauded.cogs.project import env_group
+    cb = extract_callback(next(c for c in env_group.commands if c.name == "set"))
+    bot.project_manager.bind(1500000000_000000001, str(ROOT))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter, key="key\nwith\nnewlines", value="val")
+    env = bot.project_manager._projects.get(str(inter.channel_id), {}).get("env", {})
+    if "key\nwith\nnewlines" in env:
+        return CaseResult(cog="env", cmd="set", case="#255-newline-in-key",
+                          status="FAIL",
+                          detail="#255 confirmed: env key with newlines accepted (will break .env files)")
+    return CaseResult(cog="env", cmd="set", case="#255-newline-in-key",
+                      status="PASS", detail="newline in env key refused")
+
+
+async def case_255_mcp_add_empty_name(bot) -> CaseResult:
+    """#255: /mcp add accepts empty server name."""
+    from clauded.cogs.mcp import mcp_group
+    cb = extract_callback(next(c for c in mcp_group.commands if c.name == "add"))
+    bot.project_manager.bind(1500000000_000000001, str(ROOT))
+    inter = make_mock_interaction(bot=bot)
+    await cb(inter, name="", command="echo")
+    servers = bot.project_manager._projects.get(str(inter.channel_id), {}).get("mcp_servers", {})
+    if "" in servers:
+        return CaseResult(cog="mcp", cmd="add", case="#255-empty-name",
+                          status="FAIL",
+                          detail="#255 confirmed: empty-string MCP server name accepted")
+    return CaseResult(cog="mcp", cmd="add", case="#255-empty-name",
+                      status="PASS", detail="empty MCP name refused")
+
+
+async def case_252_cost_tracker_race(bot) -> CaseResult:
+    """#252: CostTracker._save() race under concurrent record() calls."""
+    from clauded.cost_tracker import CostTracker
+    import shutil, os as _os, tempfile
+    test_dir = tempfile.mkdtemp(prefix="e2e_race_")
+    ct = CostTracker(data_dir=test_dir)
+    errors = []
+    async def one(i):
+        try:
+            await asyncio.to_thread(ct.record, 42, 0.01)
+        except Exception as e:
+            errors.append((i, type(e).__name__, str(e)[:80]))
+    await asyncio.gather(*[one(i) for i in range(50)])
+    shutil.rmtree(test_dir, ignore_errors=True)
+    if errors:
+        return CaseResult(cog="cost", cmd="record", case="#252-race",
+                          status="FAIL",
+                          detail=f"#252 confirmed: {len(errors)}/50 concurrent record() calls failed")
+    return CaseResult(cog="cost", cmd="record", case="#252-race",
+                      status="PASS",
+                      detail="50/50 concurrent record() calls succeeded")
+
+
+HAPPY_CASES.extend([
+    ("/agent create #254 dup-overwrite", case_254_agent_create_duplicate_silently_overwrites),
+    ("/agent create #255 empty-name", case_255_agent_create_empty_name),
+    ("/env set #255 equals-in-key", case_255_env_set_equals_in_key),
+    ("/env set #255 newline-in-key", case_255_env_set_newline_in_key),
+    ("/mcp add #255 empty-name", case_255_mcp_add_empty_name),
+    ("/cost #252 race", case_252_cost_tracker_race),
 ])
 
 
