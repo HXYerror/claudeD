@@ -1,6 +1,6 @@
-"""Unit tests for the v1.18 scheduler core (issue #241, Subtask 1).
+"""Unit tests for the v1.18 scheduler core (issue #241, Subtasks 1 + 2).
 
-Covers, per ``/tmp/subtask-1-prompt-v2.md`` test plan:
+Covers, per ``/tmp/subtask-1-prompt-v2.md`` and ``/tmp/subtask-2-prompt-v3.md``:
 
 1. ``parse_iso_utc``                (4 tests)
 2. ``parse_cron_to_next``           (5 tests)
@@ -12,17 +12,25 @@ Covers, per ``/tmp/subtask-1-prompt-v2.md`` test plan:
 8. ``SchedulerManager.create`` caps + max_lifetime (4 tests)
 9. ``SchedulerManager.delete``      (4 tests)
 10. ``SchedulerManager.toggle``     (2 tests)
+11. ``SchedulerManager.tick``       (5 tests)  ─┐
+12. ``SchedulerManager.catch_up``   (2 tests)   │ Subtask 2 — fire executor
+13. ``SchedulerManager._fire_one``  (8 tests)   │
+14. ``_check_max_lifetime``         (2 tests)  ─┘
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
+import discord
 import pytest
 
 from clauded.scheduler import (
     MAX_GLOBAL_ACTIVE,
+    MAX_GLOBAL_INFLIGHT,
     MAX_USER_ACTIVE,
     SchedulerManager,
     compute_next_fire,
@@ -642,3 +650,634 @@ class TestToggle:
             sid, False, requester="admin-user", is_admin=True
         )
         assert ok is True
+
+
+# =============================================================== Group 11+
+# Subtask 2 — fire executor + tick + catch_up + max_lifetime
+#
+# All these tests construct fully-shaped schedule dicts directly (rather
+# than going through ``mgr.create``) so they can pin ``next_fire_at`` /
+# ``first_fired_at`` to arbitrary past timestamps without fighting the
+# "future iso" guard in ``create``.
+
+
+def _due_sched_dict(
+    *,
+    schedule_id: str,
+    kind: str = "message",
+    target_thread_id: int | None = None,
+    target_channel_id: int | None = None,
+    next_fire_at: str | None = None,
+    enabled: bool = True,
+    recurring: bool = False,
+    cron: str | None = None,
+    iso: str | None = None,
+    created_by: str = "u1",
+    first_fired_at: str | None = None,
+    max_lifetime_seconds: int | None = None,
+) -> dict:
+    """Build a persisted-shape sched dict for Subtask-2 tests.
+
+    Direct construction bypasses ``mgr.create``'s future-only iso check
+    so tests can pin ``next_fire_at`` to the past for tick/catch_up.
+    """
+    trigger_kind = "cron" if cron else "once"
+    return {
+        "schedule_id": schedule_id,
+        "kind": kind,
+        "name": schedule_id[:8],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_by": created_by,
+        "guild_id": 1,
+        "channel_id": 100,
+        "target_thread_id": (
+            target_thread_id if kind == "message" else None
+        ),
+        "target_channel_id": (
+            target_channel_id if kind == "new_task" else None
+        ),
+        "thread_name": "t" if kind == "new_task" else None,
+        "trigger": {
+            "kind": trigger_kind,
+            "iso": iso,
+            "cron": cron,
+            "tz_when_created": "UTC",
+            "recurring": recurring,
+        },
+        "payload": {"what": "ping"},
+        "max_lifetime_seconds": max_lifetime_seconds,
+        "state": {
+            "enabled": enabled,
+            "next_fire_at": next_fire_at,
+            "first_fired_at": first_fired_at,
+            "last_fired_at": None,
+            "last_error": None,
+            "fire_count": 0,
+            "missed_count": 0,
+        },
+    }
+
+
+def _build_mgr(
+    store: SchedulerStore,
+    *,
+    fire_message=None,
+    fire_new_task=None,
+    expire_notify=None,
+    get_lock=None,
+) -> SchedulerManager:
+    """Build a manager with optional per-test callbacks (default: noop)."""
+    return SchedulerManager(
+        store,
+        fire_message_callback=fire_message or _noop_cb,
+        fire_new_task_callback=fire_new_task or _noop_cb,
+        expire_notify_callback=expire_notify or _noop_cb,
+        get_lock=get_lock,
+    )
+
+
+def _make_notfound() -> discord.NotFound:
+    return discord.NotFound(MagicMock(status=404, reason="Not Found"), "x")
+
+
+def _make_forbidden() -> discord.Forbidden:
+    return discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "x")
+
+
+# =============================================================== Group 11
+# SchedulerManager.tick
+
+
+class TestTick:
+    @pytest.mark.asyncio
+    async def test_tick_fires_due(self, store):
+        calls = []
+
+        async def cb(sched):
+            calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="due0001",
+                target_thread_id=1001,
+                next_fire_at=past,
+            )
+        )
+
+        await mgr.tick()
+        await asyncio.sleep(0.1)
+        assert calls == ["due0001"]
+
+    @pytest.mark.asyncio
+    async def test_tick_skips_future(self, store):
+        calls = []
+
+        async def cb(sched):
+            calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb)
+        future = (
+            datetime.now(timezone.utc) + timedelta(hours=1)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="fut00001",
+                target_thread_id=1002,
+                next_fire_at=future,
+            )
+        )
+
+        await mgr.tick()
+        await asyncio.sleep(0.1)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_tick_skips_disabled(self, store):
+        calls = []
+
+        async def cb(sched):
+            calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="off00001",
+                target_thread_id=1003,
+                next_fire_at=past,
+                enabled=False,
+            )
+        )
+
+        await mgr.tick()
+        await asyncio.sleep(0.1)
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_tick_dispatches_kind_message(self, store):
+        msg_calls = []
+        new_calls = []
+
+        async def msg_cb(sched):
+            msg_calls.append(sched["schedule_id"])
+
+        async def new_cb(sched):
+            new_calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=msg_cb, fire_new_task=new_cb)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="kind_msg",
+                kind="message",
+                target_thread_id=1010,
+                next_fire_at=past,
+            )
+        )
+
+        await mgr.tick()
+        await asyncio.sleep(0.1)
+        assert msg_calls == ["kind_msg"]
+        assert new_calls == []
+
+    @pytest.mark.asyncio
+    async def test_tick_dispatches_kind_new_task(self, store):
+        msg_calls = []
+        new_calls = []
+
+        async def msg_cb(sched):
+            msg_calls.append(sched["schedule_id"])
+
+        async def new_cb(sched):
+            new_calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=msg_cb, fire_new_task=new_cb)
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="kind_new",
+                kind="new_task",
+                target_channel_id=2020,
+                next_fire_at=past,
+            )
+        )
+
+        await mgr.tick()
+        await asyncio.sleep(0.1)
+        assert new_calls == ["kind_new"]
+        assert msg_calls == []
+
+
+# =============================================================== Group 12
+# SchedulerManager.catch_up
+
+
+class TestCatchUp:
+    @pytest.mark.asyncio
+    async def test_catch_up_within_grace_fires(self, store):
+        calls = []
+
+        async def cb(sched):
+            calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb)
+        # 30s late, well inside the 300s grace window
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="grace001",
+                target_thread_id=3001,
+                next_fire_at=past,
+            )
+        )
+
+        await mgr.catch_up()
+        await asyncio.sleep(0.1)
+        assert calls == ["grace001"]
+
+    @pytest.mark.asyncio
+    async def test_catch_up_past_grace_marks_missed(self, store):
+        calls = []
+
+        async def cb(sched):
+            calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb)
+        # 600s late on a daily cron — too stale to fire.
+        far_past = (
+            datetime.now(timezone.utc) - timedelta(seconds=600)
+        ).isoformat()
+        store.add(
+            _due_sched_dict(
+                schedule_id="miss0001",
+                target_thread_id=3002,
+                next_fire_at=far_past,
+                recurring=True,
+                cron="0 9 * * *",
+            )
+        )
+
+        await mgr.catch_up()
+        await asyncio.sleep(0.1)
+
+        assert calls == []  # NOT fired
+        persisted = store.get("miss0001")
+        assert persisted["state"]["missed_count"] == 1
+        new_next_str = persisted["state"]["next_fire_at"]
+        assert new_next_str is not None
+        new_next = datetime.fromisoformat(new_next_str)
+        # Rolled forward to a future fire time.
+        assert new_next > datetime.now(timezone.utc)
+
+
+# =============================================================== Group 13
+# SchedulerManager._fire_one (direct invocation)
+
+
+class TestFireOne:
+    @pytest.mark.asyncio
+    async def test_fire_one_success_oneshot_disables(self, store):
+        async def cb(_sched):
+            return None
+
+        mgr = _build_mgr(store, fire_message=cb)
+        sched = _due_sched_dict(
+            schedule_id="one0one1",
+            target_thread_id=4001,
+            recurring=False,
+            iso=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        persisted = store.get("one0one1")
+        assert persisted["state"]["enabled"] is False
+        assert persisted["state"]["fire_count"] == 1
+        assert persisted["state"]["last_fired_at"] is not None
+        assert persisted["state"]["first_fired_at"] is not None
+        assert persisted["state"]["next_fire_at"] is None
+
+    @pytest.mark.asyncio
+    async def test_fire_one_success_cron_recomputes(self, store):
+        async def cb(_sched):
+            return None
+
+        mgr = _build_mgr(store, fire_message=cb)
+        sched = _due_sched_dict(
+            schedule_id="cronfire",
+            target_thread_id=4002,
+            recurring=True,
+            cron="0 9 * * *",
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        persisted = store.get("cronfire")
+        assert persisted["state"]["enabled"] is True
+        assert persisted["state"]["fire_count"] == 1
+        new_next = datetime.fromisoformat(
+            persisted["state"]["next_fire_at"]
+        )
+        assert new_next > datetime.now(timezone.utc)
+
+    @pytest.mark.asyncio
+    async def test_fire_one_notfound_disables(self, store):
+        expire_calls = []
+
+        async def cb(_sched):
+            raise _make_notfound()
+
+        async def expire(sched):
+            expire_calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(
+            store,
+            fire_message=cb,
+            expire_notify=expire,
+        )
+        sched = _due_sched_dict(
+            schedule_id="gone0001",
+            target_thread_id=4003,
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+        await asyncio.sleep(0)  # let any spawned tasks settle
+
+        persisted = store.get("gone0001")
+        assert persisted["state"]["enabled"] is False
+        assert "NotFound" in (persisted["state"]["last_error"] or "")
+        assert expire_calls == []  # terminal != lifetime
+
+    @pytest.mark.asyncio
+    async def test_fire_one_forbidden_disables(self, store):
+        async def cb(_sched):
+            raise _make_forbidden()
+
+        mgr = _build_mgr(store, fire_message=cb)
+        sched = _due_sched_dict(
+            schedule_id="forbid01",
+            target_thread_id=4004,
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        persisted = store.get("forbid01")
+        assert persisted["state"]["enabled"] is False
+        assert "Forbidden" in (persisted["state"]["last_error"] or "")
+
+    @pytest.mark.asyncio
+    async def test_fire_one_transient_retries_three_times(
+        self, store, monkeypatch
+    ):
+        # Don't actually wait 1+4+16 seconds during backoff.
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr(asyncio, "sleep", sleep_mock)
+
+        call_count = {"n": 0}
+
+        async def cb(_sched):
+            call_count["n"] += 1
+            raise RuntimeError("boom")
+
+        mgr = _build_mgr(store, fire_message=cb)
+        sched = _due_sched_dict(
+            schedule_id="tx3retry",
+            target_thread_id=4005,
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        assert call_count["n"] == 3
+        persisted = store.get("tx3retry")
+        assert persisted["state"]["enabled"] is False
+        assert "boom" in (persisted["state"]["last_error"] or "")
+        # backoff sleeps were attempted between attempts 1→2 and 2→3
+        # (no sleep before terminal disable after attempt 3).
+        sleep_calls = [c.args for c in sleep_mock.await_args_list]
+        # Only assert that at least the two scheduler backoff sleeps fired.
+        assert (1,) in sleep_calls
+        assert (4,) in sleep_calls
+
+    @pytest.mark.asyncio
+    async def test_fire_one_transient_recovers_on_attempt_2(
+        self, store, monkeypatch
+    ):
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+        call_count = {"n": 0}
+
+        async def cb(_sched):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("transient")
+
+        mgr = _build_mgr(store, fire_message=cb)
+        sched = _due_sched_dict(
+            schedule_id="recover2",
+            target_thread_id=4006,
+            recurring=True,
+            cron="0 9 * * *",
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        assert call_count["n"] == 2
+        persisted = store.get("recover2")
+        assert persisted["state"]["fire_count"] == 1
+        assert persisted["state"]["enabled"] is True
+        assert persisted["state"]["last_error"] is None
+
+    @pytest.mark.asyncio
+    async def test_fire_one_acquires_lock(self, store):
+        events: list[str] = []
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+
+            async def __aenter__(self):
+                await self._lock.__aenter__()
+                events.append("lock_acquired")
+                return self
+
+            async def __aexit__(self, *args):
+                events.append("lock_released")
+                return await self._lock.__aexit__(*args)
+
+        tracking = TrackingLock()
+
+        def get_lock(_lock_id: int):
+            return tracking
+
+        async def cb(_sched):
+            events.append("fire_invoked")
+
+        mgr = _build_mgr(store, fire_message=cb, get_lock=get_lock)
+        sched = _due_sched_dict(
+            schedule_id="lockord1",
+            target_thread_id=4007,
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+
+        assert events == [
+            "lock_acquired",
+            "fire_invoked",
+            "lock_released",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_max_global_inflight_cap(self, store):
+        counter = {"current": 0, "peak": 0}
+
+        async def cb(_sched):
+            counter["current"] += 1
+            if counter["current"] > counter["peak"]:
+                counter["peak"] = counter["current"]
+            await asyncio.sleep(0.05)
+            counter["current"] -= 1
+
+        mgr = _build_mgr(store, fire_message=cb)
+
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=10)
+        ).isoformat()
+        n_sched = 15  # > MAX_GLOBAL_INFLIGHT (10)
+        for i in range(n_sched):
+            store.add(
+                _due_sched_dict(
+                    schedule_id=f"capN{i:04d}",
+                    # Distinct target_thread_id per schedule so the
+                    # per-target lock doesn't serialize them.
+                    target_thread_id=5000 + i,
+                    next_fire_at=past,
+                )
+            )
+
+        await mgr.tick()
+        # 15 schedules × 0.05s wait / 10 inflight = ~0.1s; sleep longer
+        # to be safe so all tasks finish before the test exits.
+        await asyncio.sleep(0.5)
+
+        assert counter["peak"] <= MAX_GLOBAL_INFLIGHT
+        assert counter["peak"] > 1  # Some concurrency really happened.
+
+
+# =============================================================== Group 14
+# _check_max_lifetime
+
+
+class TestMaxLifetime:
+    @pytest.mark.asyncio
+    async def test_max_lifetime_expires(self, store):
+        expire_calls = []
+
+        async def cb(_sched):
+            return None
+
+        async def expire(sched):
+            expire_calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb, expire_notify=expire)
+        # first_fired_at 5s in the past + max_lifetime 2s → expired.
+        first_fired = (
+            datetime.now(timezone.utc) - timedelta(seconds=5)
+        ).isoformat()
+        sched = _due_sched_dict(
+            schedule_id="lifeOver",
+            target_thread_id=6001,
+            recurring=True,
+            cron="0 9 * * *",
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+            first_fired_at=first_fired,
+            max_lifetime_seconds=2,
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+        # Give the spawned expire-notify task a chance to run.
+        await asyncio.sleep(0.05)
+
+        persisted = store.get("lifeOver")
+        assert persisted["state"]["enabled"] is False
+        assert persisted["state"]["last_error"] == "max_lifetime reached"
+        assert expire_calls == ["lifeOver"]
+
+    @pytest.mark.asyncio
+    async def test_max_lifetime_not_yet_reached(self, store):
+        expire_calls = []
+
+        async def cb(_sched):
+            return None
+
+        async def expire(sched):
+            expire_calls.append(sched["schedule_id"])
+
+        mgr = _build_mgr(store, fire_message=cb, expire_notify=expire)
+        # first_fired_at is now → 0s elapsed, well below 3600s cap.
+        first_fired = datetime.now(timezone.utc).isoformat()
+        sched = _due_sched_dict(
+            schedule_id="lifeOK01",
+            target_thread_id=6002,
+            recurring=True,
+            cron="0 9 * * *",
+            next_fire_at=(
+                datetime.now(timezone.utc) - timedelta(seconds=10)
+            ).isoformat(),
+            first_fired_at=first_fired,
+            max_lifetime_seconds=3600,
+        )
+        store.add(sched)
+
+        await mgr._fire_one(sched)
+        await asyncio.sleep(0.05)
+
+        persisted = store.get("lifeOK01")
+        # cron + within lifetime → still enabled, no expire callback.
+        assert persisted["state"]["enabled"] is True
+        assert persisted["state"]["last_error"] is None
+        assert expire_calls == []

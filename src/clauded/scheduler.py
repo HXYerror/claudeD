@@ -1,18 +1,22 @@
-"""Scheduler core — trigger parsing + SchedulerManager (no fire executor).
+"""Scheduler core — trigger parsing + SchedulerManager (with fire executor).
 
 This module is part of issue #241 / PRD v1.18 (``docs/prd/v1.18-scheduler.md``).
-Subtask 1 covers:
 
-* Module-level trigger parsing helpers
+* Subtask 1: module-level trigger parsing helpers
   (:func:`parse_iso_utc`, :func:`parse_cron_to_next`, :func:`compute_next_fire`,
-  :func:`parse_duration`).
-* :class:`SchedulerManager` — ``__init__``, ``create``, ``delete``, ``toggle``.
-
-Subtask 2 will extend this module with ``tick`` / ``catch_up`` / ``_fire_one``.
+  :func:`parse_duration`); :class:`SchedulerManager` ``__init__`` / ``create``
+  / ``delete`` / ``toggle``.
+* Subtask 2 (this revision): :meth:`SchedulerManager.tick`,
+  :meth:`~SchedulerManager.catch_up`, :meth:`~SchedulerManager._fire_one`,
+  ``_fire_with_retry``, ``_on_fire_success``, ``_on_fire_terminal``,
+  ``_check_max_lifetime``, ``_now_utc``.
 
 Intentional constraints:
-* No ``discord`` imports here — fire callbacks are injected by the bot wiring
-  layer so this module stays unit-testable in isolation.
+* All fire actions go through injected callbacks; this module never references
+  ``discord.Thread`` / ``discord.Client`` etc. ``discord`` is imported only
+  for its exception types (``NotFound`` / ``Forbidden``) so the retry/terminal
+  branches can distinguish "stop trying" from "transient retry" without
+  leaking discord objects into the manager's contract.
 * All times persisted as ISO-8601 UTC strings (``...+00:00``).
 """
 
@@ -26,6 +30,7 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import discord  # Subtask 2: catch discord.NotFound / discord.Forbidden as terminal
 from croniter import croniter
 
 from .scheduler_store import SchedulerStore
@@ -232,18 +237,27 @@ class SchedulerManager:
         self.expire_notify_callback = expire_notify_callback
 
         if get_lock is None:
-            # Lazy-instantiate to avoid creating a lock outside any loop
-            # before tests / wiring need one.
-            self._default_lock: asyncio.Lock | None = None
+            # Default: per-target (thread_id or channel_id) ``asyncio.Lock``s,
+            # lazily created the first time each id is seen. Caller-supplied
+            # ``get_lock`` (e.g. ``bot.session_manager.get_lock``) overrides
+            # this so production fire shares the same per-thread lock the
+            # rest of the bot already uses.
+            self._lock_map: dict[int, asyncio.Lock] = {}
 
-            def _shared_lock(_thread_id: int) -> asyncio.Lock:
-                if self._default_lock is None:
-                    self._default_lock = asyncio.Lock()
-                return self._default_lock
+            def _per_id_lock(target_id: int) -> asyncio.Lock:
+                lk = self._lock_map.get(target_id)
+                if lk is None:
+                    lk = asyncio.Lock()
+                    self._lock_map[target_id] = lk
+                return lk
 
-            self.get_lock = _shared_lock
+            self.get_lock = _per_id_lock
         else:
             self.get_lock = get_lock
+
+        # Bound concurrent in-flight fires across all schedules — PRD §3.8
+        # (``MAX_GLOBAL_INFLIGHT = 10``). Acquired inside ``_fire_one``.
+        self._inflight_sem = asyncio.Semaphore(MAX_GLOBAL_INFLIGHT)
 
     # ----------------------------------------------------- Permission
 
@@ -495,3 +509,272 @@ class SchedulerManager:
             sched_id, enabled, requester, is_admin,
         )
         return True, "ok"
+
+    # =================================================================
+    # Subtask 2 — fire executor + tick/catch_up + max_lifetime
+    # =================================================================
+
+    # ------------------------------------------------------- Time helper
+
+    def _now_utc(self) -> datetime:
+        """Return the current UTC datetime.
+
+        Thin wrapper around ``datetime.now(timezone.utc)`` so tests can
+        monkeypatch a deterministic clock without reaching into the
+        global ``datetime`` module.
+        """
+        return datetime.now(timezone.utc)
+
+    # ------------------------------------------------------------ Tick
+
+    @staticmethod
+    def _parse_next_fire(s: str | None) -> datetime | None:
+        """Parse a persisted ``next_fire_at`` ISO string to a UTC datetime.
+
+        Returns ``None`` for missing / malformed values. Naive datetimes
+        (no tzinfo) are normalized to UTC so the ``<= _now_utc()`` compare
+        in :meth:`tick` / :meth:`catch_up` is always tz-aware.
+        """
+        if not s:
+            return None
+        try:
+            dt = datetime.fromisoformat(s)
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    async def tick(self) -> None:
+        """Scan all enabled schedules and dispatch any whose due time has arrived.
+
+        Called on a periodic loop (PRD §3.8 ``TICK_INTERVAL_S = 15``). For
+        every enabled schedule whose ``state.next_fire_at`` is ``<=`` now,
+        an :meth:`_fire_one` task is scheduled via ``asyncio.create_task``
+        and this method returns immediately — the semaphore inside
+        ``_fire_one`` is the only thing that bounds in-flight concurrency.
+        """
+        now = self._now_utc()
+        for sched in self.store.list_all().values():
+            state = sched.get("state") or {}
+            if not state.get("enabled", False):
+                continue
+            next_fire = self._parse_next_fire(state.get("next_fire_at"))
+            if next_fire is None:
+                continue
+            if next_fire <= now:
+                asyncio.create_task(self._fire_one(sched))
+
+    async def catch_up(self) -> None:
+        """One-shot scan called on bot startup to handle missed fires.
+
+        Schedules whose ``next_fire_at`` is past but within
+        :data:`MISSED_FIRE_GRACE_S` (300s) get dispatched normally.
+        Anything older is marked missed and rolled forward without
+        firing (recurring) or disabled (one-shot deep past).
+        """
+        now = self._now_utc()
+        for sched in self.store.list_all().values():
+            state = sched.get("state") or {}
+            if not state.get("enabled", False):
+                continue
+            next_fire = self._parse_next_fire(state.get("next_fire_at"))
+            if next_fire is None:
+                continue
+            if next_fire > now:
+                continue
+
+            age = (now - next_fire).total_seconds()
+            if age <= MISSED_FIRE_GRACE_S:
+                asyncio.create_task(self._fire_one(sched))
+                continue
+
+            # Too stale to fire — mark missed and roll forward.
+            state["missed_count"] = int(state.get("missed_count", 0)) + 1
+            trigger = sched.get("trigger") or {}
+            new_next = compute_next_fire(trigger, after=now)
+            if new_next is None:
+                # one-shot in deep past or unrecoverable trigger
+                state["enabled"] = False
+                state["next_fire_at"] = None
+            else:
+                state["next_fire_at"] = new_next.isoformat()
+            sched["state"] = state
+            self.store.save(sched)
+            log.warning(
+                "#241 missed fire schedule=%s age=%.0fs",
+                sched.get("schedule_id"), age,
+            )
+
+    # ---------------------------------------------------- _fire_one core
+
+    async def _fire_one(self, sched: dict) -> None:
+        """Acquire concurrency budget + per-target lock, then run the fire.
+
+        The global semaphore caps simultaneous in-flight fires across all
+        schedules at :data:`MAX_GLOBAL_INFLIGHT` (10). The per-target lock
+        (thread_id for ``kind=message``, channel_id for ``kind=new_task``)
+        serializes fires aimed at the same destination so two due
+        schedules can't interleave their callbacks.
+        """
+        async with self._inflight_sem:
+            kind = sched.get("kind")
+            if kind == "message":
+                lock_id = sched.get("target_thread_id")
+            else:
+                lock_id = sched.get("target_channel_id")
+            if lock_id is None:
+                # Defensive — would already have failed validation in create().
+                log.warning(
+                    "#241 _fire_one missing lock id schedule=%s kind=%s",
+                    sched.get("schedule_id"), kind,
+                )
+                await self._fire_with_retry(sched)
+                return
+            async with self.get_lock(lock_id):
+                await self._fire_with_retry(sched)
+
+    async def _fire_with_retry(self, sched: dict) -> None:
+        """Execute the kind-appropriate callback with 3× retry + terminal disable.
+
+        ``discord.NotFound`` and ``discord.Forbidden`` are terminal — the
+        target is gone or we can't post to it, so retrying would only burn
+        rate-limit budget. Any other exception is treated as transient and
+        retried up to 3 attempts with 1s / 4s / 16s backoff per PRD §2.
+        """
+        attempts = 0
+        last_exc: BaseException | None = None
+        backoffs = [1, 4, 16]
+        kind = sched.get("kind")
+        while attempts < 3:
+            attempts += 1
+            try:
+                if kind == "message":
+                    await self.fire_message_callback(sched)
+                else:
+                    await self.fire_new_task_callback(sched)
+                await self._on_fire_success(sched)
+                return
+            except (discord.NotFound, discord.Forbidden) as exc:
+                await self._on_fire_terminal(sched, exc)
+                return
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "#241 transient fire failure schedule=%s attempt=%d: %s",
+                    sched.get("schedule_id"), attempts, exc,
+                )
+                if attempts < 3:
+                    await asyncio.sleep(backoffs[attempts - 1])
+                    continue
+        # Retries exhausted — disable with the last exception captured.
+        await self._on_fire_terminal(
+            sched,
+            last_exc if last_exc is not None else RuntimeError(
+                "fire failed without exception"
+            ),
+        )
+
+    # --------------------------------------------- success / terminal
+
+    async def _on_fire_success(self, sched: dict) -> None:
+        """Persist post-fire state and schedule the next run (or disable).
+
+        Bumps ``fire_count``, sets ``last_fired_at`` / ``first_fired_at``,
+        clears ``last_error``, then either rolls ``next_fire_at`` forward
+        (recurring cron) or disables the schedule (one-shot / final fire).
+        Calls :meth:`_check_max_lifetime` last so a schedule that just
+        hit its lifetime cap gets disabled after the per-fire bookkeeping
+        is on disk.
+        """
+        now = self._now_utc()
+        state = sched.setdefault("state", {})
+        state["fire_count"] = int(state.get("fire_count", 0)) + 1
+        state["last_fired_at"] = now.isoformat()
+        state["last_error"] = None
+        if state.get("first_fired_at") is None:
+            state["first_fired_at"] = now.isoformat()
+
+        trigger = sched.get("trigger") or {}
+        recurring = (
+            bool(trigger.get("recurring", False))
+            and trigger.get("kind") == "cron"
+        )
+        if not recurring:
+            state["enabled"] = False
+            state["next_fire_at"] = None
+        else:
+            new_next = compute_next_fire(trigger, after=now)
+            if new_next is None:
+                state["enabled"] = False
+                state["next_fire_at"] = None
+            else:
+                state["next_fire_at"] = new_next.isoformat()
+
+        self.store.save(sched)
+        log.info(
+            "#241 fire success schedule=%s fire_count=%d next=%s",
+            sched.get("schedule_id"),
+            state["fire_count"],
+            state.get("next_fire_at"),
+        )
+
+        # Check max_lifetime AFTER the success bookkeeping is persisted so
+        # ``first_fired_at`` is guaranteed populated for the comparison.
+        self._check_max_lifetime(sched)
+
+    async def _on_fire_terminal(
+        self, sched: dict, exc: BaseException
+    ) -> None:
+        """Disable a schedule that hit an unrecoverable fire failure.
+
+        Used for both terminal Discord exceptions (NotFound / Forbidden)
+        and for exhausted retry budgets. The error string lands in
+        ``state.last_error`` so ``/schedule list`` can surface it.
+        """
+        state = sched.setdefault("state", {})
+        state["enabled"] = False
+        state["last_error"] = f"{type(exc).__name__}: {exc}"
+        self.store.save(sched)
+        log.warning(
+            "#241 fire terminal disable schedule=%s exc=%s",
+            sched.get("schedule_id"),
+            state["last_error"],
+        )
+
+    # ---------------------------------------------------- max_lifetime
+
+    def _check_max_lifetime(self, sched: dict) -> bool:
+        """Disable + notify if ``max_lifetime_seconds`` has elapsed since first fire.
+
+        Returns ``True`` iff the schedule was just expired by this call.
+        Schedules without ``max_lifetime_seconds`` or without a
+        ``first_fired_at`` (haven't fired yet) are never expired here.
+        """
+        max_life = sched.get("max_lifetime_seconds")
+        state = sched.setdefault("state", {})
+        ff = state.get("first_fired_at")
+        if max_life is None or ff is None:
+            return False
+        try:
+            ff_dt = datetime.fromisoformat(ff)
+        except (TypeError, ValueError):
+            return False
+        if ff_dt.tzinfo is None:
+            ff_dt = ff_dt.replace(tzinfo=timezone.utc)
+        now = self._now_utc()
+        lived = (now - ff_dt).total_seconds()
+        if lived < max_life:
+            return False
+
+        state["enabled"] = False
+        state["last_error"] = "max_lifetime reached"
+        self.store.save(sched)
+        if self.expire_notify_callback is not None:
+            asyncio.create_task(self.expire_notify_callback(sched))
+        log.info(
+            "#241 max_lifetime expired schedule=%s lived=%.0fs",
+            sched.get("schedule_id"),
+            lived,
+        )
+        return True
