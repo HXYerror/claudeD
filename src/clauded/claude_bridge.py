@@ -245,6 +245,28 @@ class ClaudeBridge:
         """True iff the underlying client is currently connected."""
         return self._active
 
+    def _build_mcp_servers(self) -> dict:
+        """Merge user-configured MCP servers with the in-process scheduler server.
+
+        #241: always include the ``clauded-scheduler`` in-process MCP server
+        so claude can manage schedules in any session/turn (PRD §3.7 — the
+        tool surface is intentionally global, not hot-loaded per slash). The
+        scheduler server is best-effort: if its build raises (e.g. SDK
+        version skew), we log a warning and continue without it rather than
+        crashing every session start.
+        """
+        merged: dict = dict(self._mcp_servers or {})
+        try:
+            from .scheduler_mcp import build_scheduler_mcp_server
+            merged["clauded-scheduler"] = build_scheduler_mcp_server()
+        except Exception as exc:
+            log.warning(
+                "#241: failed to build scheduler MCP server; schedule_* "
+                "tools will not be available: %s",
+                exc,
+            )
+        return merged
+
     async def get_server_info(self) -> dict | None:
         """Return cached server init info, or ``None`` if not connected.
 
@@ -487,7 +509,7 @@ class ClaudeBridge:
             disallowed_tools=self._disallowed_tools,
             extra_args=extra_args,
             add_dirs=self._add_dirs,
-            mcp_servers=self._mcp_servers or {},
+            mcp_servers=self._build_mcp_servers(),
             max_turns=self._max_turns,
             # Feature #60: SDK hooks
             hooks=hooks,

@@ -252,6 +252,64 @@ cp .env.example .env
 
 ---
 
+## `/schedule` — Timer system
+
+Create timers that fire at a scheduled time and either inject a user message into an existing thread's session, or spawn a new thread + fresh claude session to run an independent task. Schedules persist across bot restarts.
+
+### Subcommands
+
+| Command | Purpose |
+|---|---|
+| `/schedule message <text>` | Inject reminder; claude parses → calls `schedule_message` MCP tool → schedule persisted |
+| `/schedule new_task <text>` | Spawn a new thread + session at fire time; claude calls `schedule_new_task` |
+| `/schedule list [scope]` | List schedules (scope = `thread` / `channel` / `all`) — directly reads store, no claude turn |
+| `/schedule delete <id>` | Delete by 16-char hex id or 8-char prefix (creator or admin) |
+| `/schedule toggle <id> <enabled>` | Enable / disable a schedule (creator or admin) |
+
+### Triggers
+
+Two forms (claude converts your natural language into one of these and passes via the MCP tool):
+- **One-shot**: `iso: 2026-05-20T09:00:00+08:00`
+- **Recurring cron**: `cron: 0 9 * * *` (5-field; interpreted in the channel's tz, default `Asia/Shanghai`)
+
+### `max_lifetime` (claude-only)
+
+When creating from natural language ("提醒我一个月"), claude can set `max_lifetime` as a duration string (`30d`, `7d`, `24h`, max **365d**). Counts from first fire. Only valid with `recurring=true`. Not exposed in the slash UI — set via prompt only.
+
+### Caps
+
+- **per-user active**: 20 schedules
+- **global active**: 100 schedules
+- **claude min interval (cron)**: 5 minutes
+- **global in-flight fires**: 10 concurrent
+
+### Permissions
+
+| Action | Allowed |
+|---|---|
+| Slash create (`message` / `new_task`) | Anyone in bound channel |
+| Slash list | Anyone |
+| Slash delete / toggle | Creator + admin |
+| Tool create | Claude (auto with `created_by="claude"`) |
+| Tool delete / toggle | Claude can only touch claude-created |
+
+### Storage
+
+`data/schedules.json` — atomic write (mirrors `data/sessions.json`). Corrupt JSON falls back to an empty store with a `WARNING` log.
+
+### Behavior
+
+- **Fire visibility**: When a schedule fires, the target thread receives a `-# ⏰ Scheduled fire: <name>` prefix line followed by the injected text shown as a Discord block quote (`> ...`) so users see exactly what was sent into the conversation.
+- **`new_task` fires**: parent channel gets a `📌 Scheduled-task thread created` embed announcing the new thread.
+- **Missed fires across restart**: ≤5 minutes late → fire on next tick; >5 minutes late → mark `missed`, log WARNING, roll `next_fire_at` forward, do NOT fire.
+- **Terminal errors** (`NotFound` / `Forbidden`): auto-disable + log.
+- **Transient errors**: 1s / 4s / 16s backoff, 3 attempts, then disable.
+- **`max_lifetime` expiry**: auto-disable + post an `⏰ Schedule expired` embed to the schedule's original created channel.
+
+Spec / PRD: `docs/prd/v1.18-scheduler.md`. Issue: #241.
+
+---
+
 ## Architecture
 
 ```
