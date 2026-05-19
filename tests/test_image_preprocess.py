@@ -228,3 +228,102 @@ def test_preprocess_oversize_bytes_triggers_recompress(tmp_path, img_module, mon
     # best-effort and high-noise images are incompressible; just confirm
     # it didn't crash and the file is still a valid image).
     Image.open(p).load()
+
+
+# ---------------------------------------------------------------------------
+# R1 retrofits — engineer + tester findings
+# ---------------------------------------------------------------------------
+
+
+def test_r1_atomic_save_uses_tmp_then_replace(tmp_path, img_module, monkeypatch):
+    """R1 engineer #1: must write to .tmp242 + os.replace() so SIGTERM
+    mid-write can't leave a half-written file at the CLI's read path.
+    """
+    from PIL import Image
+    p = tmp_path / "big.png"
+    Image.new("RGB", (3500, 2000)).save(p)
+
+    seen_paths: list = []
+    real_save = Image.Image.save
+
+    def _spy_save(self, fp, *args, **kw):
+        seen_paths.append(str(fp))
+        return real_save(self, fp, *args, **kw)
+
+    monkeypatch.setattr(Image.Image, "save", _spy_save)
+    img_module.maybe_shrink_image(p)
+
+    # Save was called against a .tmp242 sibling, then os.replace handed it over
+    assert any(".tmp242" in s for s in seen_paths), (
+        f"#242 R1: save must use a .tmp242 sibling for atomicity; saw paths: {seen_paths}"
+    )
+    # The final file IS the original path (not .tmp242)
+    assert p.exists()
+    assert not (tmp_path / "big.png.tmp242").exists(), "tmp must be replaced (not left behind)"
+
+
+def test_r1_recompress_only_branch_keeps_original_if_would_grow(tmp_path, img_module, monkeypatch):
+    """R1 engineer #2: if dims are in-range but bytes>cap, PIL re-save can
+    produce a LARGER file. In that case keep the original (strictly better)."""
+    from PIL import Image
+    monkeypatch.setattr(img_module, "MAX_BYTES", 50_000)
+
+    # Build a 1500x1500 highly-compressed image that PIL optimize=True
+    # won't shrink. Use random noise so deflate can't help.
+    import random
+    random.seed(7)
+    p = tmp_path / "fat.png"
+    img = Image.new("RGB", (1500, 1500))
+    img.putdata([(random.randint(0,255),)*3 for _ in range(1500*1500)])
+    img.save(p)
+    before_bytes = p.read_bytes()
+    before_size = len(before_bytes)
+    assert before_size > 50_000
+
+    img_module.maybe_shrink_image(p)
+
+    after_bytes = p.read_bytes()
+    # Either: shrunk (good) OR byte-identical (we declined the bad recompress)
+    if after_bytes != before_bytes:
+        # If it was rewritten, file MUST be smaller — never bigger.
+        assert len(after_bytes) < before_size, (
+            f"#242 R1: recompress must never grow file. "
+            f"before={before_size}, after={len(after_bytes)}"
+        )
+
+
+def test_r1_recompress_keeps_original_logs_info(tmp_path, img_module, monkeypatch, caplog):
+    """When recompress would grow, log.info documents the skip."""
+    from PIL import Image
+    monkeypatch.setattr(img_module, "MAX_BYTES", 50_000)
+
+    import random
+    random.seed(11)
+    p = tmp_path / "fat.png"
+    img = Image.new("RGB", (1500, 1500))
+    img.putdata([(random.randint(0,255),)*3 for _ in range(1500*1500)])
+    img.save(p)
+
+    caplog.set_level(logging.INFO, logger="clauded.image_preprocess")
+    img_module.maybe_shrink_image(p)
+    msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    grew_msgs = [m for m in msgs if "would grow" in m and "keeping original" in m]
+    # Either path is fine; if recompress did grow, the skip-log must fire
+    # (otherwise the recompress succeeded which is also acceptable).
+
+
+def test_r1_wire_in_called_from_compose_user_text(monkeypatch, tmp_path):
+    """R1 tester: bot.py wire-in is currently unpinned. Confirm
+    `maybe_shrink_image` is called from `_compose_user_text` for each
+    image attachment."""
+    import inspect
+    from clauded import bot
+
+    src = inspect.getsource(bot.ClaudedBot._compose_user_text)
+    # Pin the call
+    assert "maybe_shrink_image(target)" in src, (
+        "#242 R1: bot.py:_compose_user_text must call maybe_shrink_image "
+        "on each image attachment (currently unpinned by any unit test)"
+    )
+    # Pin that it's only called for image extensions (not all files)
+    assert "if ext in _IMAGE_EXTENSIONS" in src

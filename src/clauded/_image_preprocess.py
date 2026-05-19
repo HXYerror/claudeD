@@ -37,6 +37,7 @@ Supported formats:
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 log = logging.getLogger("clauded.image_preprocess")
@@ -119,14 +120,58 @@ def maybe_shrink_image(path: Path) -> None:
         if ext in JPEG_EXTS:
             save_kwargs["quality"] = JPEG_QUALITY
             # If the source had transparency, JPEG can't preserve it.
-            # Flatten onto white so we don't bomb on RGBA.
+            # Flatten onto white so we don't bomb on RGBA. NOTE: this is
+            # a heuristic; if the source's alpha was over a non-white
+            # background, color shift will occur. Acceptable for the
+            # typical screenshot case (#242 R1 engineer accepted).
             if img.mode in ("RGBA", "LA", "P"):
                 from PIL import Image as _Image
                 bg = _Image.new("RGB", img.size, (255, 255, 255))
                 bg.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
                 img = bg
 
-        img.save(path, **save_kwargs)
+        # #242 R1 engineer #1: write to a tmp sibling + os.replace() for
+        # atomic swap. SIGTERM mid-``img.save(path)`` would otherwise
+        # leave a half-written file at the path CLI is about to Read.
+        # os.replace() is atomic on POSIX (and Windows since 3.3).
+        tmp_path = path.with_suffix(path.suffix + ".tmp242")
+        # PIL infers save format from extension; `.tmp242` is unknown,
+        # so resolve format from the FINAL extension explicitly.
+        ext_to_format = {
+            ".png": "PNG",
+            ".jpg": "JPEG",
+            ".jpeg": "JPEG",
+            ".webp": "WEBP",
+            ".bmp": "BMP",
+        }
+        save_format = ext_to_format.get(ext)
+        if save_format is not None:
+            save_kwargs["format"] = save_format
+        try:
+            img.save(tmp_path, **save_kwargs)
+            tmp_size = tmp_path.stat().st_size
+            # #242 R1 engineer #2: for the recompress-only branch
+            # (in-dim but bytes > cap), PIL's optimize is weaker than
+            # external optimizers — re-save can be LARGER than original.
+            # That's strictly worse than doing nothing. Only commit
+            # the swap if it actually shrunk OR we resized dims.
+            if not needs_resize and tmp_size >= size_before:
+                tmp_path.unlink(missing_ok=True)
+                log.info(
+                    "#242: recompress would grow %s (%d -> %d bytes); keeping original",
+                    path.name, size_before, tmp_size,
+                )
+                return
+            os.replace(tmp_path, path)
+        except Exception:
+            # If the tmp got partially written, clean it up so we don't
+            # leak the .tmp242 file. Re-raise so the outer except logs.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
         size_after = path.stat().st_size
         new_w, new_h = img.size
         log.info(
