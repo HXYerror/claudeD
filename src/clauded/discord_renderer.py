@@ -720,11 +720,16 @@ class DiscordRenderer:
     async def render_response(
         self,
         bridge: "ClaudeBridge",
-        user_text: str,
+        user_text: str | list[dict],
         *,
         author_id: int | None = None,
     ) -> None:
         """Stream Claude's response for ``user_text`` to :attr:`target`.
+
+        ``user_text`` is either a plain ``str`` (text-only turn) or a
+        ``list[dict]`` of Anthropic Messages-API content blocks (text +
+        inline image blocks). Forwarded as-is to ``bridge.send_message``;
+        see #242 round 2 for the spike-verified rationale.
 
         ``author_id`` (optional) is the Discord user id that triggered the
         turn — used by :class:`ToolResultsView` to restrict ephemeral

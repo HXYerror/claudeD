@@ -55,6 +55,20 @@ log = logging.getLogger("clauded.bot")
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg"}
 
+# #242 (round 2): Anthropic vision API supports only these media types
+# as inline image content blocks. Other image-ish extensions (.bmp, .svg)
+# stay on the path-in-text fallback so claude can still try Read tool.
+_VISION_INLINE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# Map extension -> Anthropic media_type string.
+_VISION_MEDIA_TYPE = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
 
 # --------------------------------------------------------------------------
 # #227 helper: build the SessionConfig for the renderer-crash Retry button.
@@ -695,11 +709,25 @@ class ClaudedBot(commands.Bot):
                 log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
 
             user_text, tmp_dir = await self._compose_user_text(message)
-            # Use mention-stripped content instead of raw message content
+            # Use mention-stripped content instead of raw message content.
+            # #242 round 2: user_text may now be `list[dict]` (image content
+            # blocks) instead of `str`. Adapt the substitution accordingly.
             if tmp_dir is not None:
-                # Attachments present: replace raw content portion with stripped content
-                user_text = user_text.replace(message.content, content) if message.content else user_text
+                if isinstance(user_text, str):
+                    user_text = (
+                        user_text.replace(message.content, content)
+                        if message.content
+                        else user_text
+                    )
+                else:
+                    # Content-block list: find the text block (last entry)
+                    # and substitute mention-stripped content inside it.
+                    if message.content:
+                        for blk in user_text:
+                            if blk.get("type") == "text" and "text" in blk:
+                                blk["text"] = blk["text"].replace(message.content, content)
             else:
+                # No attachments — the compose result was a plain str.
                 user_text = content
             renderer = DiscordRenderer(thread, bot=self, project_path=Path(project_path) if project_path else None)
             cost_before = bridge.total_cost if bridge else 0.0
@@ -929,15 +957,29 @@ class ClaudedBot(commands.Bot):
 
     async def _compose_user_text(
         self, message: discord.Message
-    ) -> tuple[str, Path | None]:
-        """Build the text prompt sent to Claude, including any attachments.
+    ) -> tuple[str | list[dict], Path | None]:
+        """Build the message content sent to Claude.
 
-        For each attachment we download it to a per-message temp directory
-        and prepend a line announcing the filename and on-disk path so
-        Claude can choose to ``Read`` it. The temp directory is returned
-        alongside the prompt so the caller can clean it up after Claude
-        finishes processing the message. Discord caps attachment size at
-        25MB on free guilds, so the on-disk footprint is bounded.
+        Returns ``(content, tmp_dir)``:
+        - ``content`` is either:
+          * ``str`` — the legacy text-only path (no attachments, or only
+            non-image attachments); same shape `bridge.send_message` has
+            historically accepted.
+          * ``list[dict]`` — Anthropic Messages API "content blocks":
+            inline ``image`` blocks (one per image attachment) followed
+            by a single ``text`` block holding the user prose plus any
+            non-image attachment hint lines.
+        - ``tmp_dir`` is the per-message temp directory we wrote
+          attachments to (caller cleans up after Claude finishes).
+
+        #242 (round 2): images go INLINE as image content blocks rather
+        than "path in text + claude calls Read". Spike test proved the
+        path-in-text route triggers OCR-ish tool_result that hallucinates;
+        inline image block routes straight to vision API and reads the
+        image faithfully. The inline path also saves ~15-20% input_tokens.
+
+        Non-image attachments (PDF, zip, .py, etc.) still go through the
+        path-in-text route so Claude can choose to use Read.
         """
         text = message.content or ""
         attachments = list(message.attachments or [])
@@ -945,7 +987,8 @@ class ClaudedBot(commands.Bot):
             return text, None
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="clauded_att_"))
-        notes: list[str] = []
+        notes: list[str] = []                # path-in-text for non-images
+        image_blocks: list[dict] = []        # inline image content blocks
         for att in attachments:
             # Sanitize the filename: take the basename and drop anything that
             # looks like path traversal. Discord already restricts these but
@@ -960,28 +1003,71 @@ class ClaudedBot(commands.Bot):
                 log.exception("Failed to save attachment %s", safe_name)
                 continue
             ext = os.path.splitext(safe_name)[1].lower()
-            if ext in _IMAGE_EXTENSIONS:
-                # #242: pre-shrink before claude CLI sees it. CLI has a
-                # hard-coded `sharp.resize(2000, 2000)` + jpeg-quality-
-                # degrade pipeline that mangles 4K screenshots into
-                # ~4KB blurs in the worst case. Pre-shrinking to a
-                # 5%-safety-margin below the CLI thresholds prevents
-                # the internal mangler from ever triggering. Fail-soft:
-                # PIL failures leave the original file on disk + log WARN.
-                from ._image_preprocess import maybe_shrink_image
-                maybe_shrink_image(target)
-                notes.append(f"[User attached image: {safe_name}]\nImage file saved at: {target}")
+            if ext in _VISION_INLINE_EXTENSIONS:
+                # #242 (round 2): inline as image content block. Read
+                # the bytes, base64-encode, build the SDK content-block
+                # dict. Fail-soft: if reading fails, fall back to
+                # path-in-text so Claude has SOMETHING to work with.
+                try:
+                    import base64
+                    with open(target, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    image_blocks.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": _VISION_MEDIA_TYPE[ext],
+                            "data": b64,
+                        },
+                    })
+                    log.info(
+                        "#242: inline image attached %s (%d bytes b64)",
+                        safe_name, len(b64),
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "Failed to read %s for inline image: %s; "
+                        "falling back to path-in-text",
+                        safe_name, exc,
+                    )
+                    notes.append(
+                        f"[User attached image: {safe_name}]\n"
+                        f"Image file saved at: {target}"
+                    )
+            elif ext in _IMAGE_EXTENSIONS:
+                # Image extension but not vision-supported (.bmp / .svg)
+                # — path-in-text so Claude can decide to Read.
+                notes.append(
+                    f"[User attached image: {safe_name}]\n"
+                    f"Image file saved at: {target}"
+                )
             else:
-                notes.append(f"[User attached file: {safe_name}]\nFile saved at: {target}")
+                # Non-image attachment (PDF, zip, .py, etc.)
+                notes.append(
+                    f"[User attached file: {safe_name}]\n"
+                    f"File saved at: {target}"
+                )
 
-        if not notes:
-            # No attachments actually saved — drop the empty tmp dir now.
+        if not notes and not image_blocks:
+            # Nothing actually saved — drop the empty tmp dir now.
             _cleanup_tmp_dir(tmp_dir)
             return text, None
-        # Prepend so Claude sees the file references before the user's prose.
+
+        # Build the text portion (file paths + user prose).
         prefix = "\n".join(notes)
-        composed = f"{prefix}\n\n{text}" if text else prefix
-        return composed, tmp_dir
+        composed_text = f"{prefix}\n\n{text}" if (prefix and text) else (prefix or text)
+
+        if image_blocks:
+            # New path: return content-block list so claude_bridge can
+            # wire it into the SDK's structured-message protocol.
+            content_blocks: list[dict] = [*image_blocks]
+            if composed_text:
+                content_blocks.append({"type": "text", "text": composed_text})
+            return content_blocks, tmp_dir
+
+        # No images — keep legacy str path so we don't pay the structured-
+        # message overhead for plain text turns.
+        return composed_text, tmp_dir
 
     async def _recreate_session(
         self,
@@ -1081,7 +1167,7 @@ class ClaudedBot(commands.Bot):
         *,
         renderer: DiscordRenderer,
         bridge,  # ClaudeBridge — typed loosely to avoid an extra import
-        user_text: str,
+        user_text: str | list[dict],
         thread: discord.abc.Messageable,
         project_path: str,
         session_config: SessionConfig | None = None,

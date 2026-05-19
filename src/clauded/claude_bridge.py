@@ -532,8 +532,20 @@ class ClaudeBridge:
             self._user,
         )
 
-    async def send_message(self, text: str) -> AsyncIterator[object]:
+    async def send_message(self, content: str | list[dict]) -> AsyncIterator[object]:
         """Send a user message and stream back response messages.
+
+        Accepts two content shapes:
+
+        * ``str`` — legacy plain-text path. Forwarded straight to
+          ``client.query(text)`` so we keep working with all existing
+          text-only callers.
+        * ``list[dict]`` — Anthropic Messages-API content blocks (inline
+          images + text). Wrapped into an async-iterable raw user
+          message envelope so the SDK transmits it as user message
+          ``content`` directly, putting images in the primary vision
+          channel instead of via Read-tool tool_result (#242 round 2,
+          spike-verified).
 
         Yields the raw SDK message objects (``AssistantMessage``,
         ``ResultMessage``, ``StreamEvent``, etc.) so callers can decide how
@@ -549,7 +561,21 @@ class ClaudeBridge:
         self._last_activity = time.time()
 
         try:
-            await self._client.query(text)
+            if isinstance(content, str):
+                await self._client.query(content)
+            else:
+                # #242 round 2: structured-content path. SDK Python types
+                # don't formally declare image content blocks, but the
+                # wire protocol passes the raw dict through to the CLI
+                # binary which forwards verbatim to the Anthropic API.
+                # Spike-verified working end-to-end (see #242 comment
+                # "Spike 3").
+                async def _stream():
+                    yield {
+                        "type": "user",
+                        "message": {"role": "user", "content": content},
+                    }
+                await self._client.query(_stream())
 
             async for msg in self._client.receive_response():
                 if isinstance(msg, ResultMessage):
