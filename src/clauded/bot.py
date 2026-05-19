@@ -961,6 +961,15 @@ class ClaudedBot(commands.Bot):
                 continue
             ext = os.path.splitext(safe_name)[1].lower()
             if ext in _IMAGE_EXTENSIONS:
+                # #242: pre-shrink before claude CLI sees it. CLI has a
+                # hard-coded `sharp.resize(2000, 2000)` + jpeg-quality-
+                # degrade pipeline that mangles 4K screenshots into
+                # ~4KB blurs in the worst case. Pre-shrinking to a
+                # 5%-safety-margin below the CLI thresholds prevents
+                # the internal mangler from ever triggering. Fail-soft:
+                # PIL failures leave the original file on disk + log WARN.
+                from ._image_preprocess import maybe_shrink_image
+                maybe_shrink_image(target)
                 notes.append(f"[User attached image: {safe_name}]\nImage file saved at: {target}")
             else:
                 notes.append(f"[User attached file: {safe_name}]\nFile saved at: {target}")
