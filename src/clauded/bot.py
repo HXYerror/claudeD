@@ -29,6 +29,9 @@ from .project_manager import ProjectManager
 from .session_manager import SessionManager
 from .session_config import SessionConfig
 from .session_store import SessionStore
+from .scheduler_store import SchedulerStore
+from .scheduler import SchedulerManager
+from . import scheduler_mcp
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
 from . import stream_logger
@@ -262,6 +265,25 @@ async def _resolve_path_or_friendly_error(
     return None
 
 
+class _MagicResponse:
+    """Minimal ``aiohttp.ClientResponse`` stand-in for :class:`discord.NotFound`.
+
+    #241: when a scheduled fire targets a thread/channel that's no longer a
+    Thread/TextChannel (renamed, type-changed) we want to raise
+    ``discord.NotFound`` so :class:`SchedulerManager._fire_with_retry`
+    classifies it as terminal and disables the schedule. ``discord.NotFound``
+    requires a response object with a ``status`` attr to construct; this is
+    the cheapest stub that satisfies that constraint without depending on
+    aiohttp at the call site.
+    """
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+        # ``reason`` is occasionally formatted into discord.py's NotFound
+        # repr; provide a non-None default so logs stay readable.
+        self.reason = "scheduler-fire target invalid"
+
+
 class ClaudedBot(commands.Bot):
     """Discord bot for the claudeD bridge."""
 
@@ -293,6 +315,34 @@ class ClaudedBot(commands.Bot):
         # logged the ownership-skip for; cleared on bot restart.
         self._logged_third_party_thread: set[int] = set()
 
+        # ---------------------------------------------------------------- #241
+        # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
+        # store + manager wired with 3 callbacks (fire-message, fire-new-task,
+        # expire-notify). Per-target lock provider is the existing session
+        # manager's per-thread lock so fire executions serialize against
+        # human turns on the same thread.
+        # ----------------------------------------------------------------------
+        self.scheduler_store = SchedulerStore()  # default: data/schedules.json
+        self.scheduler = SchedulerManager(
+            self.scheduler_store,
+            fire_message_callback=self._fire_schedule_message,
+            fire_new_task_callback=self._fire_schedule_new_task,
+            expire_notify_callback=self._notify_schedule_expired,
+            get_lock=self.session_manager.get_lock,
+        )
+        # Per-turn context, set by `_register_scheduler_ctx` immediately
+        # before every claude turn so the MCP tool handlers can resolve
+        # "current thread" / "current channel" defaults.
+        self._scheduler_current_ctx: dict = {}
+        scheduler_mcp.set_scheduler_manager(
+            self.scheduler,
+            ctx_provider=self._scheduler_ctx_provider,
+        )
+        # `catch_up()` runs once on the first `_scheduler_tick` after the
+        # bot is ready so missed-fire bookkeeping happens with a live event
+        # loop (cannot be done from __init__).
+        self._scheduler_catch_up_done = False
+
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""
         # Cache claude version (#86)
@@ -308,6 +358,11 @@ class ClaudedBot(commands.Bot):
             self._claude_version = "unknown"
         self._cleanup_task.start()
         self._heartbeat_task.start()
+        # #241: scheduler tick loop. The first iteration also runs
+        # `catch_up()` (missed-fire bookkeeping); subsequent iterations
+        # just `tick()`. `_before_scheduler_tick` waits for the gateway
+        # so we don't try to resolve channels before the cache is warm.
+        self._scheduler_tick.start()
 
         # PRD R3.3 — register the persistent Copy-as-text button view so
         # the button keeps working after a bot restart.
@@ -341,6 +396,8 @@ class ClaudedBot(commands.Bot):
         )
         # #224 epic: /log dump diagnostic bundle (slash + auto-crash).
         from .cogs.log_dump import log_group
+        # #241: /schedule group (message/new_task/list/delete/toggle).
+        from .cogs.schedule import schedule_group
 
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
@@ -371,6 +428,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(diff_cmd)
         # #224: /log dump
         self.tree.add_command(log_group)
+        # #241: /schedule group (message/new_task/list/delete/toggle)
+        self.tree.add_command(schedule_group)
         # #185: do NOT sync globally here — historically claudeD synced
         # via both ``tree.sync()`` (global) AND PR-specific per-guild
         # PUT calls, so commands ended up registered in BOTH scopes and
@@ -1184,6 +1243,18 @@ class ClaudedBot(commands.Bot):
         to the original requester (#179 R1 security).
         """
         try:
+            # #241: register per-turn scheduler context BEFORE invoking the
+            # bridge so the in-process scheduler MCP tools can resolve
+            # "current thread / channel / guild" defaults when claude calls
+            # `schedule_message` / `schedule_new_task` / `schedule_list`.
+            self._register_scheduler_ctx(
+                thread_id=getattr(thread, "id", None) or 0,
+                channel_id=(
+                    getattr(thread, "parent_id", None)
+                    or getattr(thread, "id", None)
+                ),
+                guild_id=getattr(getattr(thread, "guild", None), "id", None),
+            )
             await renderer.render_response(bridge, user_text, author_id=author_id)
         except Exception as exc:
             if is_transient_discord_error(exc):
@@ -1285,6 +1356,304 @@ class ClaudedBot(commands.Bot):
                     )
 
             await renderer.send_error_with_retry(exc, _on_retry)
+
+    # ------------------------------------------------------------------
+    # #241 — scheduler ctx provider + tick loop + fire callbacks
+    # ------------------------------------------------------------------
+
+    def _scheduler_ctx_provider(self) -> dict:
+        """Return the most recently registered per-turn scheduler context.
+
+        Consumed by ``scheduler_mcp._GLOBAL_CTX`` so tool handlers running
+        inside a claude turn can default ``target_thread_id`` /
+        ``target_channel_id`` to the thread/channel the turn originated
+        from. Returns ``{}`` if no turn is active (tool would then need an
+        explicit arg or surface a ctx-missing error).
+        """
+        return getattr(self, "_scheduler_current_ctx", {}) or {}
+
+    def _register_scheduler_ctx(
+        self,
+        *,
+        thread_id: int | None,
+        channel_id: int | None,
+        guild_id: int | None,
+        tz_name: str = "Asia/Shanghai",
+    ) -> None:
+        """Set the per-turn scheduler context.
+
+        Called immediately BEFORE every claude turn (natural ``@bot``
+        conversations via :meth:`_render_with_retry`, slash-injected turns
+        via :mod:`clauded.cogs.schedule`, scheduled-fire turns via the
+        ``_fire_schedule_*`` methods). PRD §3.7 — the ctx is what makes
+        the in-process MCP tools "know" which thread they're acting on.
+        """
+        self._scheduler_current_ctx = {
+            "thread_id": thread_id,
+            "channel_id": channel_id,
+            "guild_id": guild_id,
+            "tz_name": tz_name,
+        }
+
+    @tasks.loop(seconds=15)
+    async def _scheduler_tick(self) -> None:
+        """Periodic scheduler tick. First iteration also runs ``catch_up()``.
+
+        Exceptions are swallowed + logged so a single bad schedule (e.g. a
+        corrupt next_fire_at) can't kill the whole tick loop. The next
+        iteration retries automatically — terminal failures are handled
+        inside ``SchedulerManager._fire_with_retry`` which disables the
+        bad schedule rather than bubbling out.
+        """
+        try:
+            if not self._scheduler_catch_up_done:
+                await self.scheduler.catch_up()
+                self._scheduler_catch_up_done = True
+            await self.scheduler.tick()
+        except Exception:
+            log.exception("#241 scheduler tick failed; will retry next interval")
+
+    @_scheduler_tick.before_loop
+    async def _before_scheduler_tick(self) -> None:
+        await self.wait_until_ready()
+
+    async def _fire_schedule_message(self, sched: dict) -> None:
+        """Kind=message fire: inject ``what`` as a user message into the
+        target thread's existing session.
+
+        Steps (per PRD §3.8):
+          1. Resolve the target thread; raise :class:`discord.NotFound`
+             if the channel is gone (the manager will mark the schedule
+             terminal-disabled).
+          2. Resolve the parent channel + binding; raise on unbind so
+             the schedule auto-disables.
+          3. Get-or-resurrect the session (using the stored
+             ``resume_session_id`` if the live bridge has died).
+          4. Send the fire prefix line + a Discord-quoted view of ``what``
+             so the injection is visible to humans (PRD §3.8 / AC13).
+          5. Register the per-turn scheduler ctx.
+          6. Hand off to :class:`DiscordRenderer.render_response`.
+        """
+        thread_id = sched.get("target_thread_id")
+        if not isinstance(thread_id, int):
+            raise ValueError(
+                f"#241 schedule missing target_thread_id: "
+                f"{sched.get('schedule_id')}"
+            )
+        thread = self.get_channel(thread_id)
+        if thread is None:
+            thread = await self.fetch_channel(thread_id)
+        if not isinstance(thread, discord.Thread):
+            raise discord.NotFound(
+                _MagicResponse(404),
+                f"target {thread_id} is not a Thread",
+            )
+
+        parent_id = thread.parent_id or sched.get("channel_id")
+        if not parent_id:
+            raise RuntimeError("can't resolve parent channel for schedule fire")
+        project_path = self.project_manager.get_path(parent_id)
+        if not project_path:
+            raise RuntimeError(f"channel {parent_id} not bound")
+
+        # Get-or-resurrect session: if the live bridge died (process
+        # restart, /session stop, etc.), use the persisted resume id so
+        # the injected message lands in the same conversation history.
+        bridge = self.session_manager.get_session(thread_id)
+        if bridge is None or not getattr(bridge, "is_active", False):
+            stored = self.session_manager.get_stored_session(thread_id)
+            resume_id = stored.get("session_id") if stored else None
+            sc = SessionConfig(
+                system_prompt=self.project_manager.get_system_prompt(parent_id),
+                resume_session_id=resume_id,
+                add_dirs=self.project_manager.get_extra_dirs(parent_id) or None,
+                mcp_servers=(
+                    self.project_manager.get_mcp_servers(parent_id) or None
+                ),
+                env=self.project_manager.get_env(parent_id) or None,
+                user="scheduled-fire",
+            )
+            bridge = await self.session_manager.create_session(
+                thread_id, project_path, self.config, sc,
+            )
+
+        self._register_scheduler_ctx(
+            thread_id=thread_id,
+            channel_id=parent_id,
+            guild_id=getattr(getattr(thread, "guild", None), "id", None),
+        )
+
+        fire_label = sched.get("name") or (sched.get("schedule_id", "") or "")[:8]
+        what = (sched.get("payload") or {}).get("what", "") or ""
+        # Prefix + Discord-quoted view of `what` so the injection is visible
+        # to humans (PRD AC13). 1900-char ceiling leaves headroom under
+        # Discord's hard 2000 limit for the quote prefix characters.
+        try:
+            await thread.send(content=f"-# ⏰ Scheduled fire: {fire_label}")
+            quoted = (
+                "\n".join(f"> {line}" for line in what.splitlines())
+                or f"> {what}"
+            )
+            await thread.send(content=quoted[:1900])
+        except Exception as exc:
+            log.warning(
+                "#241 prefix/quoted send failed for sched=%s: %s",
+                sched.get("schedule_id"), exc,
+            )
+
+        renderer = DiscordRenderer(
+            thread,
+            bot=self,
+            project_path=Path(project_path) if project_path else None,
+        )
+        await renderer.render_response(bridge, what)
+
+    async def _fire_schedule_new_task(self, sched: dict) -> None:
+        """Kind=new_task fire: spawn a fresh thread + fresh session, inject
+        ``what`` as that new session's first user prompt.
+
+        Steps (per PRD §3.8):
+          1. Resolve the target channel; raise NotFound on disappearance.
+          2. Check binding (unbound → raise → manager disables).
+          3. Create a public thread (auto_archive=1440min, name capped at
+             100 chars).
+          4. Announce the new thread in the parent channel.
+          5. Build a fresh ``SessionConfig`` (no ``resume_session_id``).
+          6. Send the fire prefix + Discord-quoted ``what`` into the new
+             thread (PRD AC13).
+          7. Register scheduler ctx + hand off to ``DiscordRenderer``.
+        """
+        channel_id = sched.get("target_channel_id")
+        if not isinstance(channel_id, int):
+            raise ValueError(
+                f"#241 schedule missing target_channel_id: "
+                f"{sched.get('schedule_id')}"
+            )
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            raise discord.NotFound(
+                _MagicResponse(404),
+                f"target {channel_id} not a text channel",
+            )
+
+        project_path = self.project_manager.get_path(channel_id)
+        if not project_path:
+            raise RuntimeError(f"channel {channel_id} not bound")
+
+        # Build the thread name: claude can override via the ``thread_name``
+        # tool arg (PRD §3.8); otherwise we synthesize "⏰ {schedule_name}
+        # {fire_ts:%m-%d %H:%M}" so the user sees when each fire happened.
+        from datetime import datetime as _dt
+        fire_label = sched.get("name") or (sched.get("schedule_id", "") or "")[:8]
+        thread_name_raw = (
+            sched.get("thread_name")
+            or f"⏰ {fire_label} {_dt.now().strftime('%m-%d %H:%M')}"
+        )
+        thread_name = thread_name_raw[:100]
+
+        thread = await channel.create_thread(
+            name=thread_name,
+            type=discord.ChannelType.public_thread,
+            auto_archive_duration=1440,
+        )
+
+        # Parent-channel announce — best-effort. PRD §3.8: lets channel
+        # members see that the bot just spun up a scheduled-task thread.
+        try:
+            embed = discord.Embed(
+                title="📌 Scheduled-task thread created",
+                description=(
+                    f"{thread.mention} (schedule "
+                    f"`{(sched.get('schedule_id','') or '')[:8]}`)"
+                ),
+                color=COLOR_INFO,
+            )
+            await channel.send(embed=embed)
+        except Exception as exc:
+            log.warning(
+                "#241 new_task announce failed for sched=%s: %s",
+                sched.get("schedule_id"), exc,
+            )
+
+        # Fresh session — explicitly no resume id so this thread starts
+        # with empty conversation context, matching PRD §3.1 Kind 2
+        # semantics ("inject `what` as that session's first user prompt").
+        sc = SessionConfig(
+            system_prompt=self.project_manager.get_system_prompt(channel_id),
+            resume_session_id=None,
+            add_dirs=self.project_manager.get_extra_dirs(channel_id) or None,
+            mcp_servers=(
+                self.project_manager.get_mcp_servers(channel_id) or None
+            ),
+            env=self.project_manager.get_env(channel_id) or None,
+            user="scheduled-fire-newtask",
+        )
+        bridge = await self.session_manager.create_session(
+            thread.id, project_path, self.config, sc,
+        )
+
+        self._register_scheduler_ctx(
+            thread_id=thread.id,
+            channel_id=channel_id,
+            guild_id=getattr(channel.guild, "id", None),
+        )
+
+        what = (sched.get("payload") or {}).get("what", "") or ""
+        try:
+            await thread.send(content=f"-# ⏰ Scheduled fire: {fire_label}")
+            quoted = (
+                "\n".join(f"> {line}" for line in what.splitlines())
+                or f"> {what}"
+            )
+            await thread.send(content=quoted[:1900])
+        except Exception as exc:
+            log.warning(
+                "#241 newtask prefix/quoted send failed: %s", exc
+            )
+
+        renderer = DiscordRenderer(
+            thread,
+            bot=self,
+            project_path=Path(project_path) if project_path else None,
+        )
+        await renderer.render_response(bridge, what)
+
+    async def _notify_schedule_expired(self, sched: dict) -> None:
+        """Notify the schedule's created channel that its max_lifetime fired.
+
+        Called by :meth:`SchedulerManager._check_max_lifetime` once the
+        cumulative lifetime since first fire has elapsed (PRD §3.8). Best-
+        effort: failures are logged but never bubble — the schedule is
+        already disabled by the time we get here.
+        """
+        channel_id = sched.get("channel_id")
+        if not channel_id:
+            log.info(
+                "#241 expire-notify but no channel_id on sched=%s",
+                sched.get("schedule_id"),
+            )
+            return
+        try:
+            channel = self.get_channel(channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(channel_id)
+            embed = discord.Embed(
+                title="⏰ Schedule expired",
+                description=(
+                    f"Schedule `{(sched.get('schedule_id','') or '')[:8]}` "
+                    f"(*{sched.get('name','')}*) reached its max_lifetime "
+                    f"and has been auto-disabled."
+                ),
+                color=COLOR_INFO,
+            )
+            await channel.send(embed=embed)
+        except Exception:
+            log.exception(
+                "#241 expire-notify failed for sched=%s",
+                sched.get("schedule_id"),
+            )
 
     # ------------------------------------------------------------------
     # #224 epic Subtask 4 — auto-crash bundle dispatch
