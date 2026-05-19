@@ -1370,31 +1370,6 @@ class DiscordRenderer:
                                     tool_msgs[tool_id] = tmsg
                                 continue
 
-                            # --- Special tool display: Cron (#73) ---
-                            if name == "CronCreate":
-                                schedule = block.input.get("schedule", "")[:100]
-                                cmd = block.input.get("command", "")[:200]
-                                tool_embed = discord.Embed(title="⏰ Cron Created", description=f"`{schedule}`\n```\n{cmd}\n```", color=COLOR_INFO)
-                                tmsg = await self._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
-                            if name == "CronDelete":
-                                tool_embed = discord.Embed(title="⏰ Cron Deleted", color=COLOR_TOOL_FAILURE)
-                                tmsg = await self._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
-                            if name == "CronList":
-                                tool_embed = discord.Embed(title="⏰ Listing Crons", color=COLOR_INFO)
-                                tmsg = await self._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
-
                             # --- Special tool display: NotebookEdit ---
                             if name == "NotebookEdit":
                                 cell_type = block.input.get("cell_type", "code")
@@ -1404,20 +1379,6 @@ class DiscordRenderer:
                                 tool_embed = discord.Embed(
                                     title=f"📓 Notebook Cell [{cell_idx}] ({cell_type})",
                                     description=f"```{lang}\n{content_preview.replace(chr(96)*3, chr(96)+' '+chr(96)+' '+chr(96))}\n```" if content_preview else "Empty cell",
-                                    color=COLOR_TOOL_RUNNING,
-                                )
-                                tmsg = await self._safe_send(embed=tool_embed)
-                                if tmsg is not None and tool_id:
-                                    tool_msgs[tool_id] = tmsg
-                                continue
-
-                            # --- Special tool display: ScheduleWakeup ---
-                            if name == "ScheduleWakeup":
-                                delay = block.input.get("delay_seconds", block.input.get("seconds", "?"))
-                                reason = block.input.get("message", block.input.get("reason", ""))[:200]
-                                tool_embed = discord.Embed(
-                                    title=f"⏰ Scheduled Wakeup: {delay}s",
-                                    description=reason or "Waiting...",
                                     color=COLOR_TOOL_RUNNING,
                                 )
                                 tmsg = await self._safe_send(embed=tool_embed)

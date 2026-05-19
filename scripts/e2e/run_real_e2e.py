@@ -567,6 +567,184 @@ async def case_3rd_party_thread_with_mention(driver: TestBotDriver) -> CaseResul
 
 
 # ---------------------------------------------------------------------------
+# /schedule (#241) e2e cases + assert helpers
+# ---------------------------------------------------------------------------
+
+
+def assert_schedule_message_fired() -> tuple[bool, str]:
+    """Verify a schedule_message fired:
+    1. data/schedules.json contains exactly 1 schedule with name=e2e_msg,
+       fire_count=1, enabled=False (one-shot completed), last_error=None
+    2. The target thread (the one testbot posted in) received both:
+       - a "-# ⏰ Scheduled fire: e2e_msg" line
+       - a quoted "> SCHED_MSG_E2E_FIRED" line
+       - a subsequent claude response
+    Returns (ok, reason).
+    """
+    p = Path("data/schedules.json")
+    if not p.exists():
+        return False, "data/schedules.json missing"
+    schedules = json.loads(p.read_text())
+    matches = [s for s in schedules.values() if s.get("name") == "e2e_msg"]
+    if len(matches) != 1:
+        return False, f"expected 1 schedule named e2e_msg, got {len(matches)}"
+    s = matches[0]
+    state = s.get("state", {})
+    if state.get("fire_count") != 1:
+        return False, f"fire_count={state.get('fire_count')} != 1"
+    if state.get("enabled") is not False:
+        return False, f"enabled={state.get('enabled')} != False"
+    if state.get("last_error"):
+        return False, f"last_error={state.get('last_error')!r}"
+    return True, "schedule_message fired and persisted correctly"
+
+
+def assert_schedule_new_task_fired() -> tuple[bool, str]:
+    """Verify schedule_new_task fired:
+    1. data/schedules.json contains 1 schedule named e2e_newtask, fire_count=1
+    2. A new thread was created in the test channel
+    """
+    p = Path("data/schedules.json")
+    if not p.exists():
+        return False, "data/schedules.json missing"
+    schedules = json.loads(p.read_text())
+    matches = [s for s in schedules.values() if s.get("name") == "e2e_newtask"]
+    if len(matches) != 1:
+        return False, f"expected 1 schedule named e2e_newtask, got {len(matches)}"
+    s = matches[0]
+    state = s.get("state", {})
+    if state.get("fire_count") != 1:
+        return False, f"fire_count={state.get('fire_count')} != 1"
+    if state.get("enabled") is not False:
+        return False, f"enabled={state.get('enabled')} != False"
+    if state.get("last_error"):
+        return False, f"last_error={state.get('last_error')!r}"
+    return True, "schedule_new_task fired and persisted correctly"
+
+
+# Registry mapping case "assert" name -> callable, mirrors the data-style
+# spec in PRD §8 Subtask 5. The case wrappers below call into this registry
+# so new asserts can be added by extending only this dict.
+SCHEDULE_ASSERT_REGISTRY = {
+    "schedule_message_fired": assert_schedule_message_fired,
+    "schedule_new_task_fired": assert_schedule_new_task_fired,
+}
+
+
+async def case_schedule_message_e2e(driver: TestBotDriver) -> CaseResult:
+    """#241 e2e: claude creates a one-shot schedule_message timer via natural
+    language; wait ~130s for the timer to fire; verify the schedule entry on
+    disk plus the marker text appears in the test thread.
+
+    Flow:
+    1. @bot post the create-schedule prompt
+    2. Wait for claude's "好" creation ACK (a thread also gets created)
+    3. Sleep wait_seconds (gives the 90s timer + render margin)
+    4. Verify the marker text "SCHED_MSG_E2E_FIRED" landed in the thread
+    5. Verify the schedules.json entry (fire_count=1, enabled=False, etc.)
+    """
+    marker = "SCHED_MSG_E2E_FIRED"
+    wait_seconds = 130
+    prompt = (
+        "请用 schedule_message 工具创建一个一次性定时任务。"
+        "when 设为 90 秒后的 ISO 时间 (使用 iso: 前缀，UTC tz)，"
+        f"what 设为 `{marker}`，name 设为 `e2e_msg`。"
+        "target_thread_id 不要传，用当前 thread。recurring 不要传。"
+        "max_lifetime 不要传。创建完只回\"好\"。"
+    )
+    msg = await driver.post(f"<@{BOT_USER_ID}> {prompt}")
+    # First wait: claude ACKs the creation (kicks off thread + posts "好")
+    ack_replies = await driver.wait_for_bot_reply(
+        msg, timeout=TIMEOUT_S, match="好"
+    )
+    if not ack_replies:
+        return CaseResult(
+            name="case_schedule_message_e2e",
+            status="FAIL",
+            detail="no creation ACK from claude within timeout",
+        )
+    # Now wait for the timer to fire and the marker to appear
+    fire_replies = await driver.wait_for_bot_reply(
+        msg, timeout=wait_seconds, match=marker
+    )
+    bot_texts = [driver._flatten(r) for r in fire_replies if driver._flatten(r).strip()]
+    saw_marker = any(marker in t for t in bot_texts)
+    saw_prefix = any("Scheduled fire" in t and "e2e_msg" in t for t in bot_texts)
+    ok, reason = SCHEDULE_ASSERT_REGISTRY["schedule_message_fired"]()
+    if saw_marker and saw_prefix and ok:
+        return CaseResult(
+            name="case_schedule_message_e2e",
+            status="PASS",
+            detail=f"marker+prefix visible in thread; {reason}",
+            bot_replies=bot_texts,
+        )
+    return CaseResult(
+        name="case_schedule_message_e2e",
+        status="FAIL",
+        detail=(
+            f"saw_marker={saw_marker} saw_prefix={saw_prefix} "
+            f"store_check_ok={ok} reason={reason!r}"
+        ),
+        bot_replies=bot_texts,
+    )
+
+
+async def case_schedule_new_task_e2e(driver: TestBotDriver) -> CaseResult:
+    """#241 e2e: claude creates a one-shot schedule_new_task timer; wait
+    ~130s; verify that on fire a NEW thread is created (announce embed in
+    parent channel mentions "Scheduled-task thread") and the marker text
+    lands in the new thread.
+    """
+    marker = "SCHED_NEWTASK_E2E_FIRED"
+    wait_seconds = 130
+    prompt = (
+        "请用 schedule_new_task 工具创建一个一次性定时任务。"
+        "when 设为 90 秒后的 ISO 时间 (使用 iso: 前缀，UTC tz)，"
+        f"what 设为 `{marker} 测试`，"
+        "thread_name 设为 `e2e-newtask-thread`，"
+        "name 设为 `e2e_newtask`。target_channel_id 不要传，"
+        "用当前 channel。recurring 不要传。max_lifetime 不要传。"
+        "创建完只回\"好\"。"
+    )
+    msg = await driver.post(f"<@{BOT_USER_ID}> {prompt}")
+    ack_replies = await driver.wait_for_bot_reply(
+        msg, timeout=TIMEOUT_S, match="好"
+    )
+    if not ack_replies:
+        return CaseResult(
+            name="case_schedule_new_task_e2e",
+            status="FAIL",
+            detail="no creation ACK from claude within timeout",
+        )
+    fire_replies = await driver.wait_for_bot_reply(
+        msg, timeout=wait_seconds, match=marker
+    )
+    bot_texts = [driver._flatten(r) for r in fire_replies if driver._flatten(r).strip()]
+    saw_marker = any(marker in t for t in bot_texts)
+    saw_announce = any(
+        "Scheduled-task thread" in t or "scheduled-task thread" in t
+        for t in bot_texts
+    )
+    ok, reason = SCHEDULE_ASSERT_REGISTRY["schedule_new_task_fired"]()
+    if saw_marker and saw_announce and ok:
+        return CaseResult(
+            name="case_schedule_new_task_e2e",
+            status="PASS",
+            detail=f"marker+announce visible; {reason}",
+            bot_replies=bot_texts,
+        )
+    return CaseResult(
+        name="case_schedule_new_task_e2e",
+        status="FAIL",
+        detail=(
+            f"saw_marker={saw_marker} saw_announce={saw_announce} "
+            f"store_check_ok={ok} reason={reason!r}"
+        ),
+        bot_replies=bot_texts,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 
@@ -647,6 +825,8 @@ async def main():
         ("M6b 3rd-party with mention", case_3rd_party_thread_with_mention),
         ("Log dump (slash needed)", case_log_dump_via_command_emoji),
         ("Unbound refuse hint", case_unbound_refuse),
+        ("#241 /schedule message e2e", case_schedule_message_e2e),
+        ("#241 /schedule new_task e2e", case_schedule_new_task_e2e),
     ]
 
     results: list[CaseResult] = []

@@ -221,6 +221,21 @@ PYTHONPATH=src .venv/bin/python scripts/e2e/run_real_e2e.py
 
 ---
 
+## `/schedule` (#241) 覆盖
+
+v1.18 `/schedule` timer system 在三层金字塔上的覆盖：
+
+| Layer | Coverage |
+|---|---|
+| Unit (`tests/test_scheduler.py`) | 68 tests: trigger parsing (iso/cron/duration), store CRUD + corrupt-recovery, manager create/delete/toggle + cap matrix + permission matrix, tick + catch_up grace logic, fire-success / fire-terminal / fire-retry, max_lifetime expiry, per-thread lock acquisition, global in-flight cap |
+| MCP unit (`tests/test_scheduler_mcp.py`) | 22 tests: each of 5 tools (`schedule_message` / `new_task` / `list` / `delete` / `toggle`) — happy + error paths, ctx-missing, validation forwarding, permission edges |
+| Cog unit (`tests/test_cogs_schedule.py`) | 16 tests: 5 slash subcommands — thread-only enforcement, unbound rejection, render call assertion (system reminder verbatim), list embed shape, delete prefix resolution + permission, toggle admin override |
+| Real-Discord e2e (`scripts/e2e/run_real_e2e.py`) | 2 cases: `case_schedule_message_e2e` (90s wait for fire, verify fire_count++, prefix + quoted what visible in thread, last_error=None); `case_schedule_new_task_e2e` (same + new thread created + announce embed in parent) |
+
+Total: ~106 unit / MCP / cog tests + 2 real-Discord e2e cases.
+
+---
+
 ## 4. 诊断 / Probe 脚本
 
 ad-hoc 验证脚本，用于：
