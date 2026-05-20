@@ -73,6 +73,12 @@ class CostTracker:
     def get_total_cost(self) -> float:
         return self._global_total
 
+    def get_total_stats(self) -> tuple[float, int, int]:
+        """Return (total_usd, total_billable, total_turns) across all channels."""
+        billable = sum(e.get("billable_calls", 0) for e in self._channels.values())
+        turns = sum(e.get("total_turns", 0) for e in self._channels.values())
+        return self._global_total, billable, turns
+
     def reset_channel(self, channel_id: int) -> None:
         key = str(channel_id)
         if key in self._channels:

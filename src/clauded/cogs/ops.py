@@ -56,10 +56,10 @@ async def cost_total(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    total = bot.cost_tracker.get_total_cost()
+    total, billable, turns = bot.cost_tracker.get_total_stats()
     embed = discord.Embed(
         title="💰 Total Cost",
-        description=f"**${total:.4f}**",
+        description=f"**${total:.4f}** │ 💬 {turns} turns │ 💰 {billable} billable",
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)

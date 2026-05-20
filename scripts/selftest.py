@@ -151,7 +151,7 @@ async def run_tests():
             # === TEST 8: Cost tracker ===
             try:
                 bot.cost_tracker.record(CHANNEL_ID, 0.01)
-                cost, calls = bot.cost_tracker.get_channel_cost(CHANNEL_ID)
+                cost, billable, turns = bot.cost_tracker.get_channel_cost(CHANNEL_ID)
                 assert cost > 0
                 assert calls > 0
                 ok(f'Cost tracker: ${cost:.4f}, {calls} calls')
