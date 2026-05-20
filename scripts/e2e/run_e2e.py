@@ -1326,7 +1326,7 @@ async def case_cost_reset(bot) -> CaseResult:
     # Bind so resolve_binding works
     bot.project_manager.bind(inter.channel_id, str(ROOT))
     bot.cost_tracker.record(inter.channel_id, 1.0)
-    before, calls_before = bot.cost_tracker.get_channel_cost(inter.channel_id)
+    before, billable_before, turns_before = bot.cost_tracker.get_channel_cost(inter.channel_id)
     if before != 1.0:
         return CaseResult(cog="cost", cmd="reset", case="happy", status="ERROR",
                           detail=f"planted cost not seen pre-reset: {before}")
@@ -1335,7 +1335,7 @@ async def case_cost_reset(bot) -> CaseResult:
     except Exception as exc:
         return CaseResult(cog="cost", cmd="reset", case="happy", status="ERROR",
                           detail=f"{type(exc).__name__}: {exc}")
-    after, calls_after = bot.cost_tracker.get_channel_cost(inter.channel_id)
+    after, billable_after, turns_after = bot.cost_tracker.get_channel_cost(inter.channel_id)
     if after == 0.0:
         return CaseResult(cog="cost", cmd="reset", case="happy", status="PASS",
                           detail=f"cost cleared: {before} → {after}")
@@ -2892,8 +2892,8 @@ async def case_cost_tracker_save_load_roundtrip(bot) -> CaseResult:
         ct1.record(42, 0.0002)
         ct1.record(99, 0.5)
         ct2 = CostTracker(data_dir=d)
-        ch42, calls42 = ct2.get_channel_cost(42)
-        ch99, calls99 = ct2.get_channel_cost(99)
+        ch42, billable42, turns42 = ct2.get_channel_cost(42)
+        ch99, billable99, turns99 = ct2.get_channel_cost(99)
         total = ct2.get_total_cost()
         if abs(ch42 - 0.0003) > 1e-9:
             return CaseResult(cog="cost", cmd="state", case="roundtrip",
@@ -2903,10 +2903,10 @@ async def case_cost_tracker_save_load_roundtrip(bot) -> CaseResult:
             return CaseResult(cog="cost", cmd="state", case="roundtrip",
                               status="FAIL",
                               detail=f"ch99={ch99!r}, expected 0.5")
-        if calls42 != 2:
+        if billable42 != 2:
             return CaseResult(cog="cost", cmd="state", case="roundtrip",
                               status="FAIL",
-                              detail=f"calls42={calls42}, expected 2")
+                              detail=f"billable42={billable42}, expected 2")
         return CaseResult(cog="cost", cmd="state", case="roundtrip",
                           status="PASS",
                           detail=f"ch42=$0.0003 (2 calls), ch99=$0.5 (1 call), total=${total:.4f}")

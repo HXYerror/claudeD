@@ -21,14 +21,14 @@ class TestCostTracker:
     def test_record_and_get(self, data_dir: str) -> None:
         tracker = CostTracker(data_dir=data_dir)
         tracker.record(123, 0.05)
-        total, calls = tracker.get_channel_cost(123)
+        total, billable, turns = tracker.get_channel_cost(123)
         assert total == pytest.approx(0.05)
-        assert calls == 1
+        assert billable == 1
 
         tracker.record(123, 0.03)
-        total, calls = tracker.get_channel_cost(123)
+        total, billable, turns = tracker.get_channel_cost(123)
         assert total == pytest.approx(0.08)
-        assert calls == 2
+        assert billable == 2
 
     def test_global_total(self, data_dir: str) -> None:
         tracker = CostTracker(data_dir=data_dir)
@@ -38,13 +38,13 @@ class TestCostTracker:
         assert tracker.get_total_cost() == pytest.approx(0.35)
 
         # Per-channel checks
-        total_100, calls_100 = tracker.get_channel_cost(100)
+        total_100, billable_100, turns_100 = tracker.get_channel_cost(100)
         assert total_100 == pytest.approx(0.15)
-        assert calls_100 == 2
+        assert billable_100 == 2
 
-        total_200, calls_200 = tracker.get_channel_cost(200)
+        total_200, billable_200, turns_200 = tracker.get_channel_cost(200)
         assert total_200 == pytest.approx(0.20)
-        assert calls_200 == 1
+        assert billable_200 == 1
 
     def test_reset_channel(self, data_dir: str) -> None:
         tracker = CostTracker(data_dir=data_dir)
@@ -53,9 +53,9 @@ class TestCostTracker:
         assert tracker.get_total_cost() == pytest.approx(0.30)
 
         tracker.reset_channel(100)
-        total, calls = tracker.get_channel_cost(100)
+        total, billable, turns = tracker.get_channel_cost(100)
         assert total == pytest.approx(0.0)
-        assert calls == 0
+        assert billable == 0
         assert tracker.get_total_cost() == pytest.approx(0.20)
 
         # Reset non-existent channel is a no-op
@@ -70,21 +70,21 @@ class TestCostTracker:
 
         # Reload from same directory
         tracker2 = CostTracker(data_dir=data_dir)
-        total_42, calls_42 = tracker2.get_channel_cost(42)
+        total_42, billable_42, turns_42 = tracker2.get_channel_cost(42)
         assert total_42 == pytest.approx(0.20)
-        assert calls_42 == 2
+        assert billable_42 == 2
 
-        total_99, calls_99 = tracker2.get_channel_cost(99)
+        total_99, billable_99, turns_99 = tracker2.get_channel_cost(99)
         assert total_99 == pytest.approx(0.05)
-        assert calls_99 == 1
+        assert billable_99 == 1
 
         assert tracker2.get_total_cost() == pytest.approx(0.25)
 
     def test_empty_channel(self, data_dir: str) -> None:
         tracker = CostTracker(data_dir=data_dir)
-        total, calls = tracker.get_channel_cost(999)
+        total, billable, turns = tracker.get_channel_cost(999)
         assert total == pytest.approx(0.0)
-        assert calls == 0
+        assert billable == 0
 
     def test_corrupted_file(self, data_dir: str) -> None:
         """Tracker recovers gracefully from a corrupted costs.json."""
