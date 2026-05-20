@@ -10,7 +10,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id, resolve_session_id
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -114,10 +114,16 @@ async def health_check(interaction: discord.Interaction) -> None:
     # in scope), in which case we silently skip the field. Centralized
     # ``_format_mode_display`` keeps the label format in sync with
     # ``/mode current`` + ``/session info``.
-    thread_id = getattr(interaction.channel, "id", None)
-    bridge = (
-        bot.session_manager.get_session(thread_id) if thread_id is not None else None
-    )
+    # #250: gate the session lookup behind resolve_session_id so a
+    # channel/DM invocation refuses with the unified "Use this command
+    # inside a thread." message instead of silently hiding the field.
+    thread_id = resolve_session_id(interaction)
+    if thread_id is None:
+        await interaction.response.send_message(
+            "Use this command inside a thread.", ephemeral=True
+        )
+        return
+    bridge = bot.session_manager.get_session(thread_id)
     if bridge is not None:
         from .mode import _mode_source_for_bridge, _format_mode_display
 
@@ -384,14 +390,20 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    tid = interaction.channel_id
-    if tid is not None:
-        current = bot._notify_enabled.get(tid, True)
-        bot._notify_enabled[tid] = not current
-        state = "ON" if not current else "OFF"
-    else:
-        bot._pre_tool_notifications = not bot._pre_tool_notifications
-        state = "ON" if bot._pre_tool_notifications else "OFF"
+    # #250: ``_notify_enabled`` is keyed by thread.id (bot.py reads it
+    # with thread.id when rendering messages). Writing to it from a
+    # channel/DM would land under channel.id and never be read back,
+    # producing a silent no-op. Gate behind resolve_session_id so the
+    # caller gets a clear refusal instead.
+    tid = resolve_session_id(interaction)
+    if tid is None:
+        await interaction.response.send_message(
+            "Use this command inside a thread.", ephemeral=True
+        )
+        return
+    current = bot._notify_enabled.get(tid, True)
+    bot._notify_enabled[tid] = not current
+    state = "ON" if not current else "OFF"
     await interaction.response.send_message(
         embed=discord.Embed(
             title=f"🔔 Pre-tool notifications: {state}",

@@ -563,6 +563,7 @@ async def test_session_resume_threads_permission_mode_override() -> None:
 async def test_mode_set_calls_bridge_and_persists() -> None:
     from clauded.cogs.mode import mode_set
     from clauded.bot import ClaudedBot
+    import discord
 
     bridge = _bridge(override=None, env_mode="default")
     bot = MagicMock(spec=ClaudedBot)
@@ -572,10 +573,12 @@ async def test_mode_set_calls_bridge_and_persists() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
+    interaction.user.guild_permissions = MagicMock(administrator=True)
     interaction.response.send_message = AsyncMock()
 
-    import discord
     choice = discord.app_commands.Choice(name="plan 🔒", value="plan")
     await mode_set.callback(interaction, choice)
 
@@ -593,6 +596,7 @@ async def test_mode_set_calls_bridge_and_persists() -> None:
 async def test_mode_set_no_session_replies_with_hint() -> None:
     from clauded.cogs.mode import mode_set
     from clauded.bot import ClaudedBot
+    import discord
 
     bot = MagicMock(spec=ClaudedBot)
     bot.session_manager = MagicMock()
@@ -600,10 +604,12 @@ async def test_mode_set_no_session_replies_with_hint() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
+    interaction.user.guild_permissions = MagicMock(administrator=True)
     interaction.response.send_message = AsyncMock()
 
-    import discord
     choice = discord.app_commands.Choice(name="plan", value="plan")
     await mode_set.callback(interaction, choice)
     args = interaction.response.send_message.await_args
@@ -638,7 +644,11 @@ async def test_mode_cycle_five_steps_returns_to_default() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    import discord as _discord
+    interaction.channel = MagicMock(spec=_discord.Thread)
     interaction.channel.id = 7
+    interaction.user.guild_permissions = MagicMock(administrator=True)
     interaction.response.send_message = AsyncMock()
 
     expected_sequence = [
@@ -658,6 +668,7 @@ async def test_mode_cycle_five_steps_returns_to_default() -> None:
 async def test_mode_current_displays_source_override() -> None:
     from clauded.cogs.mode import mode_current
     from clauded.bot import ClaudedBot
+    import discord
 
     bridge = _bridge(override="plan", env_mode="default")
     bot = MagicMock(spec=ClaudedBot)
@@ -666,6 +677,8 @@ async def test_mode_current_displays_source_override() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
     interaction.response.send_message = AsyncMock()
     await mode_current.callback(interaction)
@@ -679,6 +692,7 @@ async def test_mode_current_displays_source_override() -> None:
 async def test_mode_current_displays_source_env() -> None:
     from clauded.cogs.mode import mode_current
     from clauded.bot import ClaudedBot
+    import discord
 
     bridge = _bridge(override=None, env_mode="acceptEdits")
     bot = MagicMock(spec=ClaudedBot)
@@ -687,6 +701,7 @@ async def test_mode_current_displays_source_env() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
     interaction.response.send_message = AsyncMock()
     await mode_current.callback(interaction)
@@ -700,6 +715,7 @@ async def test_mode_current_displays_source_env() -> None:
 async def test_mode_current_displays_source_default() -> None:
     from clauded.cogs.mode import mode_current
     from clauded.bot import ClaudedBot
+    import discord
 
     bridge = _bridge(override=None, env_mode="default")
     bot = MagicMock(spec=ClaudedBot)
@@ -708,6 +724,7 @@ async def test_mode_current_displays_source_default() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
     interaction.response.send_message = AsyncMock()
     await mode_current.callback(interaction)
@@ -835,6 +852,7 @@ async def test_footer_omits_mode_line_when_default(
 async def test_health_displays_permission_mode_when_session_active() -> None:
     from clauded.cogs.ops import health_check
     from clauded.bot import ClaudedBot
+    import discord
 
     bridge = _bridge(override="plan", env_mode="default")
     bot = MagicMock(spec=ClaudedBot)
@@ -848,7 +866,8 @@ async def test_health_displays_permission_mode_when_session_active() -> None:
 
     interaction = MagicMock()
     interaction.client = bot
-    interaction.channel = MagicMock()
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 1
     interaction.response.send_message = AsyncMock()
     await health_check.callback(interaction)
@@ -1066,6 +1085,8 @@ async def test_mode_set_emits_security_audit_log(caplog):
 
     interaction = MagicMock()
     interaction.client = bot_spec
+    # #250: resolve_session_id requires isinstance(channel, discord.Thread)
+    interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 42
     interaction.guild_id = 99
     interaction.channel_id = 42

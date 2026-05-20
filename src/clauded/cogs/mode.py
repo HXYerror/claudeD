@@ -21,12 +21,20 @@ import logging
 import discord
 from discord import app_commands
 
+from ._unbound import resolve_session_id
 from ..discord_renderer import (
     COLOR_INFO,
     COLOR_TOOL_FAILURE,
     COLOR_TOOL_SUCCESS,
     MODE_EMOJI,
 )
+
+
+# #250: unified message for the 5 sibling sites where a per-thread
+# session lookup must reject channel/DM invocation rather than silently
+# returning "no active session". Mirrors the existing NO_CHANNEL_MESSAGE
+# in _unbound.py but is thread-specific.
+_USE_IN_THREAD_MESSAGE = "Use this command inside a thread."
 
 log = logging.getLogger("clauded.bot")
 
@@ -168,10 +176,13 @@ async def mode_set(
             ephemeral=True,
         )
         return
-    thread_id = getattr(interaction.channel, "id", None)
-    bridge = (
-        bot.session_manager.get_session(thread_id) if thread_id is not None else None
-    )
+    thread_id = resolve_session_id(interaction)
+    if thread_id is None:
+        await interaction.response.send_message(
+            _USE_IN_THREAD_MESSAGE, ephemeral=True
+        )
+        return
+    bridge = bot.session_manager.get_session(thread_id)
     if bridge is None or not bridge.is_active:
         await interaction.response.send_message(
             "ℹ️ No active session in this channel. Send a message to start one, "
@@ -248,10 +259,13 @@ async def mode_cycle(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    thread_id = getattr(interaction.channel, "id", None)
-    bridge = (
-        bot.session_manager.get_session(thread_id) if thread_id is not None else None
-    )
+    thread_id = resolve_session_id(interaction)
+    if thread_id is None:
+        await interaction.response.send_message(
+            _USE_IN_THREAD_MESSAGE, ephemeral=True
+        )
+        return
+    bridge = bot.session_manager.get_session(thread_id)
     if bridge is None or not bridge.is_active:
         await interaction.response.send_message(
             "ℹ️ No active session in this channel. Send a message to start one.",
@@ -315,10 +329,13 @@ async def mode_current(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = getattr(interaction.channel, "id", None)
-    bridge = (
-        bot.session_manager.get_session(thread_id) if thread_id is not None else None
-    )
+    thread_id = resolve_session_id(interaction)
+    if thread_id is None:
+        await interaction.response.send_message(
+            _USE_IN_THREAD_MESSAGE, ephemeral=True
+        )
+        return
+    bridge = bot.session_manager.get_session(thread_id)
     if bridge is None:
         await interaction.response.send_message(
             "ℹ️ No active session in this channel. Send a message to start one.",

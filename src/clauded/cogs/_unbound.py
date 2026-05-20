@@ -58,6 +58,29 @@ def resolve_channel_id(interaction: discord.Interaction) -> int | None:
     return ch.id
 
 
+def resolve_session_id(interaction: discord.Interaction) -> int | None:
+    """Resolve the session id (``thread.id``) for **per-thread live state** lookups.
+
+    Returns ``interaction.channel.id`` only when invoked from inside a
+    :class:`discord.Thread`. For any other surface (top-level
+    :class:`~discord.TextChannel`, :class:`~discord.DMChannel`, cache
+    miss, etc.) returns ``None`` so callers must surface a friendly
+    "use this command inside a thread" message rather than silently
+    falling through to ``session_manager.get_session(None)``.
+
+    Sibling of :func:`resolve_binding_id` (binding state is keyed by
+    parent; session state is keyed by thread). See #197 / #209 / #247
+    / #250 for the bug lineage that motivated this helper. Use this
+    helper anywhere live SDK ``ClaudeBridge`` / per-thread settings
+    (e.g. ``_notify_enabled``) are read or written — never pass raw
+    ``interaction.channel_id`` or ``getattr(interaction.channel, "id", None)``.
+    """
+    channel = interaction.channel
+    if isinstance(channel, discord.Thread):
+        return channel.id
+    return None
+
+
 def resolve_binding_id(interaction: discord.Interaction) -> int | None:
     """Resolve the channel id for **project-level state** lookups.
 
