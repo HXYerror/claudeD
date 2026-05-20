@@ -1408,7 +1408,7 @@ class ClaudedBot(commands.Bot):
         cv = _scheduler_get_ctx()
         if cv:
             return cv
-        return _scheduler_ctx_var.get() or {}
+        return getattr(self, "_scheduler_current_ctx", {}) or {}
 
     def _register_scheduler_ctx(
         self,
