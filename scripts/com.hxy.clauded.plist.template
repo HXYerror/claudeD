@@ -23,9 +23,11 @@
          at ~/Library/Logs/clauded/clauded.log is now the canonical log. -->
     <!-- #232 round 3: ProcessType removed entirely (default=Standard).
          Round 1 removed Background, Round 2 set Interactive — both still
-         triggered "because inefficient" kills. The fix is removing the
-         key + adding LowPriorityBackgroundIO=false to prevent I/O throttling.
-         Verified: 15+ min stable with 0 kills (was 15-30s between kills). -->
+         triggered "because inefficient" kills. Round 3 removes the key
+         entirely and adds LowPriorityBackgroundIO=false. Empirically
+         verified: 60+ min stable with 0 kills (was 15-30s between kills
+         with Interactive). The exact launchd-internal mechanism is not
+         fully documented; this combination works on macOS 15.x. -->
     <key>LowPriorityBackgroundIO</key><false/>
 </dict>
 </plist>
