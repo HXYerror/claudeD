@@ -31,6 +31,13 @@ UNBOUND_HINT_MESSAGE = (
 
 NO_CHANNEL_MESSAGE = "❌ This command must be run in a channel."
 
+# #250: unified refusal for the 5 sibling sites where a per-thread
+# session lookup must reject channel/DM invocation rather than silently
+# returning "no active session". Mirrors :data:`NO_CHANNEL_MESSAGE`
+# above but is thread-specific. Centralized here so cogs/mode.py and
+# cogs/ops.py share one source of truth (DRY — R1 reviewer finding).
+USE_IN_THREAD_MESSAGE = "Use this command inside a thread."
+
 
 def resolve_channel_id(interaction: discord.Interaction) -> int | None:
     """Resolve the channel id used for **session-level state** lookups.
@@ -56,6 +63,29 @@ def resolve_channel_id(interaction: discord.Interaction) -> int | None:
     if isinstance(ch, discord.Thread):
         return ch.parent_id or interaction.channel_id
     return ch.id
+
+
+def resolve_session_id(interaction: discord.Interaction) -> int | None:
+    """Resolve the session id (``thread.id``) for **per-thread live state** lookups.
+
+    Returns ``interaction.channel.id`` only when invoked from inside a
+    :class:`discord.Thread`. For any other surface (top-level
+    :class:`~discord.TextChannel`, :class:`~discord.DMChannel`, cache
+    miss, etc.) returns ``None`` so callers must surface a friendly
+    "use this command inside a thread" message rather than silently
+    falling through to ``session_manager.get_session(None)``.
+
+    Sibling of :func:`resolve_binding_id` (binding state is keyed by
+    parent; session state is keyed by thread). See #197 / #209 / #247
+    / #250 for the bug lineage that motivated this helper. Use this
+    helper anywhere live SDK ``ClaudeBridge`` / per-thread settings
+    (e.g. ``_notify_enabled``) are read or written — never pass raw
+    ``interaction.channel_id`` or ``getattr(interaction.channel, "id", None)``.
+    """
+    channel = interaction.channel
+    if isinstance(channel, discord.Thread):
+        return channel.id
+    return None
 
 
 def resolve_binding_id(interaction: discord.Interaction) -> int | None:
