@@ -176,3 +176,70 @@ class TestCostTrackerR2:
         assert abs(total - 1.5) < 1e-9
         assert billable == 2, f"expected 2 billable, got {billable}"
         assert turns == 3, f"expected 3 turns, got {turns}"
+
+
+# ---------- #252: concurrent _save() must not race ----------
+
+class TestCostTrackerConcurrency:
+    """#252 regression: ``_save`` used a fixed ``costs.tmp`` filename, so
+    concurrent ``record`` calls clobbered each other's tmp and the loser's
+    ``os.replace`` raised ``FileNotFoundError`` (~50% under 50-call stress).
+
+    Fix: ``atomic_write_json`` uses a unique tmp filename per call plus a
+    threading lock. These tests pin AC1–AC4 from the PRD.
+    """
+
+    def test_100_concurrent_records_no_errors(self, tmp_path):
+        """AC1 + AC4: 100 concurrent record() calls → 0 errors + correct total."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        tracker = CostTracker(data_dir=str(tmp_path))
+        errors: list[BaseException] = []
+
+        def one(i: int) -> None:
+            try:
+                # Mix billable and zero-cost turns so we also exercise the
+                # #248 branch and prove the read-modify-write under the lock
+                # is correct.
+                tracker.record(42, 0.01 if i % 2 == 0 else 0.0)
+            except BaseException as e:  # noqa: BLE001 — we want everything
+                errors.append(e)
+
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            list(pool.map(one, range(100)))
+
+        assert errors == [], f"expected 0 errors, got {len(errors)}: {errors[:3]!r}"
+        total, billable, turns = tracker.get_channel_cost(42)
+        assert turns == 100, f"expected 100 turns, got {turns}"
+        assert billable == 50, f"expected 50 billable (even indices), got {billable}"
+        # 50 calls × 0.01 = 0.50 exactly in float terms (no rounding loss
+        # at this magnitude).
+        assert total == pytest.approx(0.50)
+
+    def test_no_stale_tmp_after_stress(self, tmp_path):
+        """AC3: after a stress run no ``*.tmp`` files remain in the data dir."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        tracker = CostTracker(data_dir=str(tmp_path))
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda i: tracker.record(i, 0.001), range(50)))
+
+        leftover = list(Path(tmp_path).glob("*.tmp"))
+        assert leftover == [], f"unexpected stale tmp files: {leftover}"
+
+    def test_persisted_file_matches_in_memory(self, tmp_path):
+        """AC4: after the stress, reloading from disk shows the same totals."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        tracker = CostTracker(data_dir=str(tmp_path))
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            list(pool.map(lambda _: tracker.record(7, 0.01), range(100)))
+
+        # Fresh tracker → load from JSON file just produced.
+        reloaded = CostTracker(data_dir=str(tmp_path))
+        total_mem, billable_mem, turns_mem = tracker.get_channel_cost(7)
+        total_disk, billable_disk, turns_disk = reloaded.get_channel_cost(7)
+        assert turns_mem == 100
+        assert turns_disk == turns_mem
+        assert billable_disk == billable_mem
+        assert total_disk == pytest.approx(total_mem)

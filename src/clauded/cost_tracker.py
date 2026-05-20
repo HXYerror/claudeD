@@ -3,8 +3,10 @@
 from __future__ import annotations
 import json
 import logging
-import os
+import threading
 from pathlib import Path
+
+from ._json_store import atomic_write_json
 
 log = logging.getLogger("clauded.cost_tracker")
 
@@ -17,6 +19,13 @@ class CostTracker:
         self._path = self._dir / "costs.json"
         self._channels: dict[str, dict] = {}  # {channel_id_str: {"total_usd": float, "billable_calls": int, "total_turns": int}}
         self._global_total: float = 0.0
+        # #252: serialise concurrent _save() within process so two
+        # ResultMessage callbacks racing on the same channel don't tear
+        # the in-memory dict between dump and os.replace. RLock (not
+        # plain Lock) lets ``record`` hold the lock across its
+        # read-modify-write and still call ``_save`` (which reacquires
+        # it via ``atomic_write_json``) without deadlocking.
+        self._lock = threading.RLock()
         self._load()
 
     def _load(self) -> None:
@@ -36,27 +45,30 @@ class CostTracker:
             log.warning("Failed to load costs.json, starting fresh")
 
     def _save(self) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump({"channels": self._channels, "global_total_usd": self._global_total}, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._path)
+        atomic_write_json(
+            self._path,
+            {"channels": self._channels, "global_total_usd": self._global_total},
+            self._lock,
+        )
 
     def record(self, channel_id: int, cost_usd: float) -> None:
         """Record a turn. Always increments total_turns; only increments
         billable_calls when cost_usd > 0.  (#248)"""
         key = str(channel_id)
-        entry = self._channels.setdefault(
-            key, {"total_usd": 0.0, "billable_calls": 0, "total_turns": 0},
-        )
-        entry["total_usd"] += cost_usd
-        entry["total_turns"] += 1
-        if cost_usd > 0:
-            entry["billable_calls"] += 1
-        self._global_total += cost_usd
-        self._save()
+        # #252: hold lock across read-modify-write so two concurrent
+        # ``record`` calls can't both observe the same pre-increment
+        # state and lose one increment. ``_save`` reacquires the same
+        # RLock recursively.
+        with self._lock:
+            entry = self._channels.setdefault(
+                key, {"total_usd": 0.0, "billable_calls": 0, "total_turns": 0},
+            )
+            entry["total_usd"] += cost_usd
+            entry["total_turns"] += 1
+            if cost_usd > 0:
+                entry["billable_calls"] += 1
+            self._global_total += cost_usd
+            self._save()
 
     def get_channel_cost(self, channel_id: int) -> tuple[float, int, int]:
         """Return (total_usd, billable_calls, total_turns) for a channel."""
@@ -81,7 +93,8 @@ class CostTracker:
 
     def reset_channel(self, channel_id: int) -> None:
         key = str(channel_id)
-        if key in self._channels:
-            self._global_total -= self._channels[key]["total_usd"]
-            del self._channels[key]
-            self._save()
+        with self._lock:
+            if key in self._channels:
+                self._global_total -= self._channels[key]["total_usd"]
+                del self._channels[key]
+                self._save()
