@@ -9,8 +9,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+from ._json_store import atomic_write_json
 
 log = logging.getLogger("clauded.project_manager")
 
@@ -46,6 +49,12 @@ class ProjectManager:
         # unbound channel so silent-ignore doesn't become invisible-failure).
         # In-memory only — bot restart re-arms.
         self._refused_unbound_channels: set[int] = set()
+        # #252: single RLock guards both _projects and _channel_settings
+        # writes. RLock so any future helper that already holds the lock
+        # can call ``_save`` without deadlocking. One lock for both
+        # dicts is fine — they're written from the same callers and the
+        # writes are cheap.
+        self._lock = threading.RLock()
         self._load()
         self._load_guild_roots()
         self._load_channel_settings()
@@ -80,15 +89,13 @@ class ProjectManager:
         )
 
     def _save(self) -> None:
-        os.makedirs(self.data_dir, exist_ok=True)
-        # Atomic write: dump to a sibling .tmp file then rename, so a crash
-        # mid-write can't truncate the live projects.json.
-        tmp_path = self._path.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(self._projects, f, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self._path)
+        # Atomic write via shared helper (#252): unique tmp filename +
+        # RLock so concurrent writers don't clobber each other's tmp and
+        # the read-modify-write critical sections in the mutator methods
+        # don't tear under thread races.
+        atomic_write_json(
+            self._path, self._projects, self._lock, sort_keys=True,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -455,14 +462,12 @@ class ProjectManager:
             self._channel_settings = {}
 
     def _save_channel_settings(self) -> None:
-        os.makedirs(self.data_dir, exist_ok=True)
+        # #252: same shared atomic-write helper as ``_save``, distinct
+        # file path. Shares the instance RLock with ``_save`` — both
+        # dicts are protected by one lock; ``channel_settings.json`` is
+        # tiny so the shared lock is not a contention concern.
         p = Path(self.data_dir) / "channel_settings.json"
-        tmp_path = p.with_suffix(".tmp")
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(self._channel_settings, f, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, p)
+        atomic_write_json(p, self._channel_settings, self._lock, sort_keys=True)
 
     # ------------------------------------------------------------------
     # Per-guild project root — #91

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import logging
-import os
+import threading
 from pathlib import Path
+
+from ._json_store import atomic_write_json
 
 log = logging.getLogger("clauded.agent_manager")
 
@@ -16,6 +18,8 @@ class AgentManager:
         self._dir = Path(data_dir)
         self._path = self._dir / "agents.json"
         self._agents: dict[str, dict] = {}  # {name: {"description": str, "prompt": str}}
+        # #252: RLock so create/delete can hold across read-modify-write.
+        self._lock = threading.RLock()
         self._load()
 
     # ------------------------------------------------------------------
@@ -32,32 +36,28 @@ class AgentManager:
             self._agents = {}
 
     def _save(self) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._agents, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._path)
+        atomic_write_json(self._path, self._agents, self._lock)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
     def create(self, name: str, prompt: str, description: str = "") -> None:
         """Create or overwrite an agent definition."""
-        self._agents[name] = {
-            "prompt": prompt,
-            "description": description or f"Custom agent: {name}",
-        }
-        self._save()
+        with self._lock:
+            self._agents[name] = {
+                "prompt": prompt,
+                "description": description or f"Custom agent: {name}",
+            }
+            self._save()
 
     def delete(self, name: str) -> bool:
         """Delete an agent by name. Returns True if it existed."""
-        if name in self._agents:
-            del self._agents[name]
-            self._save()
-            return True
-        return False
+        with self._lock:
+            if name in self._agents:
+                del self._agents[name]
+                self._save()
+                return True
+            return False
 
     def get(self, name: str) -> dict | None:
         """Return the agent definition dict, or None."""
