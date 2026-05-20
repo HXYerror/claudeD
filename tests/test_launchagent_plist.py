@@ -32,9 +32,11 @@ def test_process_type_key_absent():
     explicitly opts out of the resource judgement.
     """
     data = _render_template()
-    assert data.get("ProcessType") == "Interactive", (
-        f"#232 round 2: plist must set ProcessType=Interactive to opt out "
-        f"of launchd resource throttling. Got: {data.get('ProcessType')!r}"
+    assert "ProcessType" not in data, (
+        f"#232 round 3: ProcessType should be absent. Got: {data.get('ProcessType')!r}"
+    )
+    assert data.get("LowPriorityBackgroundIO") is False, (
+        "#232 round 3: LowPriorityBackgroundIO must be false"
     )
 
 
@@ -59,15 +61,14 @@ def test_comment_explains_absence():
     """Pin the #232 explainer comment so it's not stripped by accident."""
     text = TEMPLATE.read_text()
     # Round-1 comment (removed Background) preserved as historical context
-    assert "#232 removed" in text, (
-        "#232: the historical Background-removal comment stays for "
-        "future-archaeology context"
+    assert "#232 round 3" in text, (
+        "#232: round 3 comment must be present"
     )
     assert "because inefficient" in text, (
         "Pin the launchd reason string in the comment for future grep-back"
     )
     # Round-2 comment explaining the actual fix
-    assert "#232 follow-up" in text, (
+    assert "#232 round 3" in text or "LowPriorityBackgroundIO" in text, (
         "#232 round 2: the why-Interactive comment must stay so a future "
         "plist-cleanup refactor doesn't swap back to the wrong value"
     )
