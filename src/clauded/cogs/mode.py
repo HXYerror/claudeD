@@ -21,7 +21,7 @@ import logging
 import discord
 from discord import app_commands
 
-from ._unbound import resolve_session_id
+from ._unbound import USE_IN_THREAD_MESSAGE, resolve_session_id
 from ..discord_renderer import (
     COLOR_INFO,
     COLOR_TOOL_FAILURE,
@@ -29,12 +29,6 @@ from ..discord_renderer import (
     MODE_EMOJI,
 )
 
-
-# #250: unified message for the 5 sibling sites where a per-thread
-# session lookup must reject channel/DM invocation rather than silently
-# returning "no active session". Mirrors the existing NO_CHANNEL_MESSAGE
-# in _unbound.py but is thread-specific.
-_USE_IN_THREAD_MESSAGE = "Use this command inside a thread."
 
 log = logging.getLogger("clauded.bot")
 
@@ -179,7 +173,7 @@ async def mode_set(
     thread_id = resolve_session_id(interaction)
     if thread_id is None:
         await interaction.response.send_message(
-            _USE_IN_THREAD_MESSAGE, ephemeral=True
+            USE_IN_THREAD_MESSAGE, ephemeral=True
         )
         return
     bridge = bot.session_manager.get_session(thread_id)
@@ -262,7 +256,7 @@ async def mode_cycle(interaction: discord.Interaction) -> None:
     thread_id = resolve_session_id(interaction)
     if thread_id is None:
         await interaction.response.send_message(
-            _USE_IN_THREAD_MESSAGE, ephemeral=True
+            USE_IN_THREAD_MESSAGE, ephemeral=True
         )
         return
     bridge = bot.session_manager.get_session(thread_id)
@@ -332,7 +326,7 @@ async def mode_current(interaction: discord.Interaction) -> None:
     thread_id = resolve_session_id(interaction)
     if thread_id is None:
         await interaction.response.send_message(
-            _USE_IN_THREAD_MESSAGE, ephemeral=True
+            USE_IN_THREAD_MESSAGE, ephemeral=True
         )
         return
     bridge = bot.session_manager.get_session(thread_id)

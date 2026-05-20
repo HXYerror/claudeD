@@ -31,6 +31,13 @@ UNBOUND_HINT_MESSAGE = (
 
 NO_CHANNEL_MESSAGE = "❌ This command must be run in a channel."
 
+# #250: unified refusal for the 5 sibling sites where a per-thread
+# session lookup must reject channel/DM invocation rather than silently
+# returning "no active session". Mirrors :data:`NO_CHANNEL_MESSAGE`
+# above but is thread-specific. Centralized here so cogs/mode.py and
+# cogs/ops.py share one source of truth (DRY — R1 reviewer finding).
+USE_IN_THREAD_MESSAGE = "Use this command inside a thread."
+
 
 def resolve_channel_id(interaction: discord.Interaction) -> int | None:
     """Resolve the channel id used for **session-level state** lookups.

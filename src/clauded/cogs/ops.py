@@ -10,7 +10,13 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id, resolve_session_id
+from ._unbound import (
+    NO_CHANNEL_MESSAGE,
+    USE_IN_THREAD_MESSAGE,
+    reject_if_unbound,
+    resolve_binding_id,
+    resolve_session_id,
+)
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -120,7 +126,7 @@ async def health_check(interaction: discord.Interaction) -> None:
     thread_id = resolve_session_id(interaction)
     if thread_id is None:
         await interaction.response.send_message(
-            "Use this command inside a thread.", ephemeral=True
+            USE_IN_THREAD_MESSAGE, ephemeral=True
         )
         return
     bridge = bot.session_manager.get_session(thread_id)
@@ -398,7 +404,7 @@ async def notify_toggle(interaction: discord.Interaction) -> None:
     tid = resolve_session_id(interaction)
     if tid is None:
         await interaction.response.send_message(
-            "Use this command inside a thread.", ephemeral=True
+            USE_IN_THREAD_MESSAGE, ephemeral=True
         )
         return
     current = bot._notify_enabled.get(tid, True)
