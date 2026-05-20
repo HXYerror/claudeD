@@ -112,6 +112,12 @@ async def test_footer_includes_context_segment_e2e():
         "maxTokens": 200000,
         "rawMaxTokens": 200000,
         "model": "claude-sonnet-4-5",
+        # #263: categories with Free space so the new supplement logic works
+        "categories": [
+            {"name": "Messages", "tokens": 136000},
+            {"name": "System", "tokens": 10000},
+            {"name": "Free space", "tokens": 54000},  # 200k - 146k = 54k
+        ],
     }
     bridge = FakeBridge(events, get_context_usage_returns=ctx_response)
     await renderer.render_response(bridge, "hello")
@@ -189,3 +195,97 @@ async def test_footer_omits_context_when_get_context_usage_returns_none():
     all_content = " ".join(m.content for m in target._sent if m.content)
     assert "🧠" not in all_content
     assert "🔥" not in all_content
+
+
+@pytest.mark.asyncio
+async def test_footer_context_uses_free_space_not_totalTokens():
+    """#263: when totalTokens diverges from real usage (cache hit scenario),
+    footer must show the real usage (from Free space supplement), not the
+    misleading totalTokens.
+
+    Scenario from the issue: totalTokens=408 (last-turn input), but real
+    buffer usage is ~449k (maxTokens=1M - Free space=551100).
+    Old code would show <1%; correct answer is ~44.9%.
+    """
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
+    from clauded.discord_renderer import DiscordRenderer
+
+    events = [
+        AssistantMessage(
+            content=[TextBlock(text="result")],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=50, duration_api_ms=30,
+            is_error=False, num_turns=1, session_id="sess-263",
+            total_cost_usd=0.01,
+            usage={"input_tokens": 50, "output_tokens": 20},
+        ),
+    ]
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    # Divergence fixture: totalTokens=408 (tiny, from cache hit)
+    # but real usage shown by categories is ~449k
+    ctx_response = {
+        "percentage": 0,          # SDK says 0% (misleading)
+        "totalTokens": 408,       # last-turn input only (misleading)
+        "maxTokens": 1_000_000,
+        "model": "claude-sonnet-4-5",
+        "categories": [
+            {"name": "Messages", "tokens": 409_000},
+            {"name": "Autocompact summary", "tokens": 33_000},
+            {"name": "System", "tokens": 6_100},
+            {"name": "Skills", "tokens": 858},
+            {"name": "Free space", "tokens": 551_100},
+        ],
+    }
+    bridge = FakeBridge(events, get_context_usage_returns=ctx_response)
+    await renderer.render_response(bridge, "hello")
+
+    all_content = " ".join(m.content for m in target._sent if m.content)
+    # Must show ~45% (from Free space supplement), NOT <1% or 0%
+    # 1M - 551100 = 448900 → 44.89%
+    assert "🧠 45%" in all_content or "🧠 44%" in all_content, (
+        f"Expected '🧠 44%' or '🧠 45%' in footer (Free space supplement); "
+        f"got: {all_content!r}"
+    )
+    # Must NOT show the misleading <1% or 0%
+    assert "🧠 <1%" not in all_content, "Should not show <1% with 45% real usage"
+    assert "🧠 0%" not in all_content, "Should not show 0% with 45% real usage"
+
+
+@pytest.mark.asyncio
+async def test_footer_context_fallback_when_no_free_space():
+    """#263 AC5: if categories don't contain Free space, fallback to
+    totalTokens (no crash)."""
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
+    from clauded.discord_renderer import DiscordRenderer
+
+    events = [
+        AssistantMessage(
+            content=[TextBlock(text="result")],
+            model="claude-sonnet-4-5", parent_tool_use_id=None,
+        ),
+        ResultMessage(
+            subtype="result", duration_ms=50, duration_api_ms=30,
+            is_error=False, num_turns=1, session_id="sess-263fb",
+            total_cost_usd=0.01,
+            usage={"input_tokens": 50, "output_tokens": 20},
+        ),
+    ]
+    target = FakeTarget()
+    renderer = DiscordRenderer(target)
+    # No categories at all — should fallback to totalTokens
+    ctx_response = {
+        "totalTokens": 50000,
+        "maxTokens": 200000,
+        "model": "claude-sonnet-4-5",
+    }
+    bridge = FakeBridge(events, get_context_usage_returns=ctx_response)
+    await renderer.render_response(bridge, "hello")
+
+    all_content = " ".join(m.content for m in target._sent if m.content)
+    # Fallback: 50000/200000 = 25%
+    assert "🧠 25%" in all_content, (
+        f"Expected '🧠 25%' in footer (fallback to totalTokens); got: {all_content!r}"
+    )
