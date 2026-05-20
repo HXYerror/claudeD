@@ -152,6 +152,7 @@ async def model_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
     current = _current_model_for_thread(bot, interaction.channel)
+    bridge = _resolve_session_bridge(bot, interaction.channel)
     # Build the rendered list
     lines = []
     for alias, info in KNOWN_MODELS.items():
@@ -160,12 +161,15 @@ async def model_list(interaction: discord.Interaction) -> None:
         model_id = info["id"]
         # Mark currently-active model (match alias OR id)
         marker = "🟢 " if current and (current == alias or current == model_id) else "• "
-        lines.append(f"{marker}**{alias}** (`{model_id}`) \u2014 {tier}, {ctx} context")
+        lines.append(f"{marker}**{alias}** (`{model_id}`) — {tier}, {ctx} context")
     desc = "\n".join(lines)
     if current:
         header = f"**Current**: `{current}`\n\n**Available models**:\n"
+    elif bridge is not None:
+        # Session exists but model not yet determined (pre-first-turn)
+        header = "**Current**: _(unset — will use CLI default)_\n\n**Available models**:\n"
     else:
-        header = "_No active session in this channel; current model unknown._\n\n**Available models**:\n"
+        header = "_No active session. Run inside a thread to see current model._\n\n**Available models**:\n"
     embed = discord.Embed(
         title="🤖 Model Selection",
         description=header + desc + "\n\nUse `/model switch <name>` to switch.\n-# Switching resets the conversation context.",
@@ -190,7 +194,7 @@ async def model_current(interaction: discord.Interaction) -> None:
     bridge = _resolve_session_bridge(bot, interaction.channel)
     if bridge is None:
         await interaction.response.send_message(
-            "ℹ️ No active session in this channel. Send a message to start one.",
+            "ℹ️ No active session. Run inside a thread to see current model.",
             ephemeral=True,
         )
         return
