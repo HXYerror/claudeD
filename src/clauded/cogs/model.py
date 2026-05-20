@@ -17,11 +17,15 @@ log = logging.getLogger("clauded.bot")
 # releases new SKUs. Order is intentional — user-facing list preserves
 # this ordering (most-common balanced first, then deep, then fast,
 # then context-window-extended variants).
+# #247: refresh to current SKUs (claude-sonnet-4-6, claude-opus-4-7,
+# claude-haiku-4-5, claude-sonnet-4-6-1m). Old table referenced
+# claude-sonnet-4-5 / claude-opus-4-1 / claude-haiku-3-5 — a full
+# generation behind what the SDK was returning on ResultMessage.
 KNOWN_MODELS: dict[str, dict[str, str | int]] = {
-    "sonnet":   {"id": "claude-sonnet-4-5",     "context": 200_000, "tier": "balanced"},
-    "opus":     {"id": "claude-opus-4-1",       "context": 200_000, "tier": "deep"},
-    "haiku":    {"id": "claude-haiku-3-5",      "context": 200_000, "tier": "fast"},
-    "sonnet-1m":{"id": "claude-sonnet-4-5-1m",  "context": 1_000_000, "tier": "balanced"},
+    "sonnet":   {"id": "claude-sonnet-4-6",     "context": 200_000, "tier": "balanced"},
+    "opus":     {"id": "claude-opus-4-7",       "context": 1_000_000, "tier": "deep"},
+    "haiku":    {"id": "claude-haiku-4-5",      "context": 200_000, "tier": "fast"},
+    "sonnet-1m":{"id": "claude-sonnet-4-6-1m",  "context": 1_000_000, "tier": "balanced"},
 }
 
 
@@ -38,18 +42,48 @@ def _fmt_context(n: int) -> str:
     return str(n)
 
 
-def _current_model_for_thread(bot, thread_id: int | None) -> str | None:
-    """Return the active model name for ``thread_id`` if a session exists,
-    else None. Resolves through ``bridge.model`` which already follows
+def _resolve_session_bridge(bot, channel):
+    """#247 Bug B/C: shared session lookup for /model list and /model current.
+
+    Look up the session by ``channel.id`` first. If no session is found
+    and ``channel`` is a :class:`discord.Thread`, fall back to the
+    parent channel id (handles the case where the user is inside a
+    thread but the session was keyed on the parent channel).
+
+    Returns the bridge or ``None``. ``channel`` may be ``None`` (e.g.
+    DM or cache miss) — caller-friendly.
+    """
+    if channel is None:
+        return None
+    channel_id = getattr(channel, "id", None)
+    if channel_id is None:
+        return None
+    bridge = bot.session_manager.get_session(channel_id)
+    if bridge is not None:
+        return bridge
+    # #247 Bug B: thread → parent fallback. ``isinstance`` check first
+    # so non-Thread channels (DMChannel / TextChannel / etc.) short-circuit.
+    if isinstance(channel, discord.Thread):
+        parent_id = getattr(channel, "parent_id", None)
+        if parent_id is not None:
+            return bot.session_manager.get_session(parent_id)
+    return None
+
+
+def _current_model_for_thread(bot, channel) -> str | None:
+    """Return the active model name for the session bound to ``channel``,
+    else ``None``. Resolves through ``bridge.model`` which already follows
     the override > sdk-reported > config-default chain.
 
     #198: ``bridge.model`` may legitimately return ``None`` now (no
     override, no env, no first turn yet). Callers should treat ``None``
     as a valid signal rather than 'no session'.
+
+    #247: now goes through :func:`_resolve_session_bridge` so this helper
+    shares thread→parent fallback semantics with ``/model current``
+    (eliminates the list/current inconsistency).
     """
-    if thread_id is None:
-        return None
-    bridge = bot.session_manager.get_session(thread_id)
+    bridge = _resolve_session_bridge(bot, channel)
     if bridge is None:
         return None
     return getattr(bridge, "model", None)
@@ -117,8 +151,8 @@ async def model_list(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = getattr(interaction.channel, "id", None)
-    current = _current_model_for_thread(bot, thread_id)
+    current = _current_model_for_thread(bot, interaction.channel)
+    bridge = _resolve_session_bridge(bot, interaction.channel)
     # Build the rendered list
     lines = []
     for alias, info in KNOWN_MODELS.items():
@@ -127,12 +161,15 @@ async def model_list(interaction: discord.Interaction) -> None:
         model_id = info["id"]
         # Mark currently-active model (match alias OR id)
         marker = "🟢 " if current and (current == alias or current == model_id) else "• "
-        lines.append(f"{marker}**{alias}** (`{model_id}`) \u2014 {tier}, {ctx} context")
+        lines.append(f"{marker}**{alias}** (`{model_id}`) — {tier}, {ctx} context")
     desc = "\n".join(lines)
     if current:
         header = f"**Current**: `{current}`\n\n**Available models**:\n"
+    elif bridge is not None:
+        # Session exists but model not yet determined (pre-first-turn)
+        header = "**Current**: _(unset — will use CLI default)_\n\n**Available models**:\n"
     else:
-        header = "_No active session in this channel; current model unknown._\n\n**Available models**:\n"
+        header = "_No active session. Run inside a thread to see current model._\n\n**Available models**:\n"
     embed = discord.Embed(
         title="🤖 Model Selection",
         description=header + desc + "\n\nUse `/model switch <name>` to switch.\n-# Switching resets the conversation context.",
@@ -148,16 +185,16 @@ async def model_current(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    thread_id = getattr(interaction.channel, "id", None)
     # #198: don't collapse via ``bridge.model`` — we need to know which
     # tier the value came from so we can label it correctly. Resolve the
     # bridge directly and dispatch on the 4 tier cases.
-    bridge = (
-        bot.session_manager.get_session(thread_id) if thread_id is not None else None
-    )
+    # #247 Bug C: share session-resolution logic with ``/model list`` via
+    # ``_resolve_session_bridge`` so the two commands cannot disagree on
+    # whether a session exists for the current channel/thread.
+    bridge = _resolve_session_bridge(bot, interaction.channel)
     if bridge is None:
         await interaction.response.send_message(
-            "ℹ️ No active session in this channel. Send a message to start one.",
+            "ℹ️ No active session. Run inside a thread to see current model.",
             ephemeral=True,
         )
         return
