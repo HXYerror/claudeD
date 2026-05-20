@@ -517,11 +517,5 @@ class ProjectManager:
             log.warning("Failed to load guild_roots.json: %s", exc)
 
     def _save_guild_roots(self) -> None:
-        os.makedirs(self.data_dir, exist_ok=True)
         p = Path(self.data_dir) / "guild_roots.json"
-        tmp = p.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self._guild_roots, f, indent=2, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, p)
+        atomic_write_json(p, self._guild_roots, self._lock, sort_keys=True)
