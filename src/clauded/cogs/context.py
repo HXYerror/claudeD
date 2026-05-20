@@ -94,20 +94,12 @@ def _build_context_embed(usage: dict, source_label: str) -> discord.Embed:
     max_tokens = int(usage.get("maxTokens", 0))
     model = str(usage.get("model", "unknown"))
 
-    # #263: compute global occupancy from Free space supplement instead
-    # of totalTokens (which is last-turn input footprint, not buffer usage).
-    categories = usage.get("categories") or []
-    free_space = next(
-        (c["tokens"] for c in categories
-         if isinstance(c, dict)
-         and c.get("name") in ("Free space", "Available", "Remaining")),
-        None,
-    )
-    if free_space is not None and max_tokens > 0:
-        total = max(0, max_tokens - int(free_space))
-        percentage = (total / max_tokens) * 100.0
+    # #263: compute global occupancy from Free space supplement.
+    from .._context_usage import compute_global_context_pct
+    result = compute_global_context_pct(usage)
+    if result is not None:
+        total, _, percentage = int(result[0]), result[1], result[2]
     else:
-        # Fallback to SDK fields (pre-#263 behavior)
         total = int(usage.get("totalTokens", 0))
         percentage = float(usage.get("percentage", 0))
 

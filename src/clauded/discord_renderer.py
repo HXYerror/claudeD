@@ -333,39 +333,9 @@ async def _fetch_context_pct_settled(
     def _compute(cu: dict[str, Any] | None) -> float | None:
         if cu is None:
             return None
-        max_t = cu.get("maxTokens")
-        if not isinstance(max_t, (int, float)) or max_t <= 0:
-            # Fallback to SDK-provided percentage (legacy / unfamiliar shape).
-            if "percentage" not in cu:
-                return None
-            try:
-                return float(cu["percentage"])
-            except (TypeError, ValueError):
-                return None
-        # #263: Use Free space supplement instead of totalTokens.
-        # totalTokens is last-turn input footprint, NOT current buffer
-        # occupancy. Free space = maxTokens - real_used - autocompact,
-        # so global_used = maxTokens - free_space is the true occupancy.
-        categories = cu.get("categories") or []
-        free_space = next(
-            (c["tokens"] for c in categories
-             if isinstance(c, dict)
-             and c.get("name") in ("Free space", "Available", "Remaining")),
-            None,
-        )
-        if free_space is not None and isinstance(free_space, (int, float)):
-            global_used = float(max_t) - float(free_space)
-            return max(0.0, (global_used / float(max_t)) * 100.0)
-        # Fallback: use totalTokens (pre-#263 behavior) if no Free space
-        total = cu.get("totalTokens")
-        if isinstance(total, (int, float)):
-            return (float(total) / float(max_t)) * 100.0
-        if "percentage" not in cu:
-            return None
-        try:
-            return float(cu["percentage"])
-        except (TypeError, ValueError):
-            return None
+        from ._context_usage import compute_global_context_pct
+        result = compute_global_context_pct(cu)
+        return result[2] if result is not None else None
 
     try:
         await asyncio.sleep(settle_delay)

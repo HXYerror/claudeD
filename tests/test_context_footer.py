@@ -245,7 +245,7 @@ async def test_footer_context_uses_free_space_not_totalTokens():
     all_content = " ".join(m.content for m in target._sent if m.content)
     # Must show ~45% (from Free space supplement), NOT <1% or 0%
     # 1M - 551100 = 448900 → 44.89%
-    assert "🧠 45%" in all_content or "🧠 44%" in all_content, (
+    assert "🧠 44%" in all_content, (
         f"Expected '🧠 44%' or '🧠 45%' in footer (Free space supplement); "
         f"got: {all_content!r}"
     )
