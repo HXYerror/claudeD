@@ -137,12 +137,16 @@ def _ok(text: str) -> dict:
     "Optional: target_thread_id, name (≤50), recurring (bool), "
     "max_lifetime (e.g. '30d', ≤365d, only valid with recurring=true).",
     {
-        "when": str,
-        "what": str,
-        "target_thread_id": str,
-        "name": str,
-        "recurring": bool,
-        "max_lifetime": str,
+        "type": "object",
+        "properties": {
+            "when": {"type": "string", "description": "Trigger: 'cron: 0 9 * * *' or 'iso: 2026-05-20T09:00:00+08:00'"},
+            "what": {"type": "string", "description": "User prompt text to inject when fire (≤500 chars)"},
+            "target_thread_id": {"type": "string", "description": "Target thread id (default: current thread)"},
+            "name": {"type": "string", "description": "Human-readable label (≤50 chars)"},
+            "recurring": {"type": "boolean", "description": "True for cron recurring; false for one-shot"},
+            "max_lifetime": {"type": "string", "description": "Duration string e.g. '30d' (≤365d, recurring only)"},
+        },
+        "required": ["when", "what"],
     },
 )
 async def schedule_message_tool(args: dict) -> dict:
@@ -210,13 +214,17 @@ async def schedule_message_tool(args: dict) -> dict:
     "(≤50, for the new thread), name (schedule label), recurring, "
     "max_lifetime.",
     {
-        "when": str,
-        "what": str,
-        "target_channel_id": str,
-        "thread_name": str,
-        "name": str,
-        "recurring": bool,
-        "max_lifetime": str,
+        "type": "object",
+        "properties": {
+            "when": {"type": "string", "description": "Trigger: 'cron: ...' or 'iso: ...'"},
+            "what": {"type": "string", "description": "First user prompt for the new session (≤500 chars)"},
+            "target_channel_id": {"type": "string", "description": "Channel for new thread (default: current)"},
+            "thread_name": {"type": "string", "description": "Name for the new thread (≤50 chars)"},
+            "name": {"type": "string", "description": "Schedule display label (≤50 chars)"},
+            "recurring": {"type": "boolean", "description": "True for cron recurring"},
+            "max_lifetime": {"type": "string", "description": "Duration e.g. '30d' (≤365d, recurring only)"},
+        },
+        "required": ["when", "what"],
     },
 )
 async def schedule_new_task_tool(args: dict) -> dict:
@@ -284,8 +292,12 @@ async def schedule_new_task_tool(args: dict) -> dict:
     "kind=message only) | 'channel' (current channel: message+new_task) "
     "| 'all' (everywhere). Optional include_disabled (default false).",
     {
-        "scope": str,
-        "include_disabled": bool,
+        "type": "object",
+        "properties": {
+            "scope": {"type": "string", "description": "thread | channel | all (default: thread)"},
+            "include_disabled": {"type": "boolean", "description": "Include disabled schedules (default: false)"},
+        },
+        "required": [],
     },
 )
 async def schedule_list_tool(args: dict) -> dict:
@@ -363,7 +375,13 @@ async def schedule_list_tool(args: dict) -> dict:
     "schedule_delete",
     "Delete a schedule by id (16-char hex). Claude can only delete "
     "claude-created schedules.",
-    {"schedule_id": str},
+    {
+        "type": "object",
+        "properties": {
+            "schedule_id": {"type": "string", "description": "16-char hex schedule id"},
+        },
+        "required": ["schedule_id"],
+    },
 )
 async def schedule_delete_tool(args: dict) -> dict:
     """Delete a schedule (claude scope only)."""
@@ -383,7 +401,14 @@ async def schedule_delete_tool(args: dict) -> dict:
     "schedule_toggle",
     "Enable or disable a schedule. Claude can only toggle "
     "claude-created schedules.",
-    {"schedule_id": str, "enabled": bool},
+    {
+        "type": "object",
+        "properties": {
+            "schedule_id": {"type": "string", "description": "16-char hex schedule id"},
+            "enabled": {"type": "boolean", "description": "True to enable, False to disable"},
+        },
+        "required": ["schedule_id", "enabled"],
+    },
 )
 async def schedule_toggle_tool(args: dict) -> dict:
     """Enable / disable a schedule (claude scope only)."""
