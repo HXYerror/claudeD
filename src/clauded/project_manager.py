@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._json_store import atomic_write_json
+from ._validation import validate_identifier, validate_env_key
 
 log = logging.getLogger("clauded.project_manager")
 
@@ -351,12 +352,22 @@ class ProjectManager:
         server config shapes, e.g.
         ``{"type": "stdio", "command": "npx", "args": [...]}`` or
         ``{"type": "http", "url": "https://..."}``
+
+        Raises:
+            ValueError: if ``name`` is empty, whitespace-only, or contains
+                newline/carriage-return characters (#255), or if a server
+                with that name already exists on this channel (#254).
+                Use :meth:`remove_mcp_server` followed by
+                :meth:`add_mcp_server` to replace an existing entry.
         """
+        validate_identifier(name, "MCP server name")
         with self._lock:
             self._assert_bound(channel_id)
             key = str(channel_id)
             entry = self._projects.get(key, {})
             mcps = entry.get("mcp_servers", {})
+            if name in mcps:
+                raise ValueError(f"MCP server {name!r} already exists.")
             mcps[name] = config
             entry["mcp_servers"] = mcps
             self._projects[key] = entry
@@ -384,7 +395,16 @@ class ProjectManager:
     # Environment variables
     # ------------------------------------------------------------------
     def set_env(self, channel_id: int, key: str, value: str) -> None:
-        """Store an environment variable for the given channel binding."""
+        """Store an environment variable for the given channel binding.
+
+        Raises:
+            ValueError: if ``key`` is empty, whitespace-only, contains
+                newline/carriage-return characters, or contains ``=``
+                (#255). POSIX env-name semantics — a key containing ``=``
+                or newlines would corrupt downstream ``.env`` files and
+                shell-style environment dumps.
+        """
+        validate_env_key(key)
         with self._lock:
             self._assert_bound(channel_id)
             k = str(channel_id)

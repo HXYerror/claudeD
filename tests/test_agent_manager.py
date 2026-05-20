@@ -41,12 +41,36 @@ def test_create_default_description(manager: AgentManager) -> None:
     assert agent["description"] == "Custom agent: helper"
 
 
-def test_create_overwrites(manager: AgentManager) -> None:
+def test_create_rejects_duplicate(manager: AgentManager) -> None:
+    """#254 — duplicate ``create`` raises instead of silently overwriting."""
     manager.create("a", "prompt1")
+    with pytest.raises(ValueError, match="already exists"):
+        manager.create("a", "prompt2", "updated")
+    # Original definition is preserved.
+    agent = manager.get("a")
+    assert agent["prompt"] == "prompt1"
+
+
+def test_create_after_delete_succeeds(manager: AgentManager) -> None:
+    """#254 — delete-then-create is the supported replace flow."""
+    manager.create("a", "prompt1")
+    assert manager.delete("a") is True
     manager.create("a", "prompt2", "updated")
     agent = manager.get("a")
     assert agent["prompt"] == "prompt2"
     assert agent["description"] == "updated"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["", "   ", "\t", "\n", "name\nwith\nnewline", "name\rwith\rcr"],
+)
+def test_create_rejects_invalid_name(manager: AgentManager, bad_name: str) -> None:
+    """#255 — empty/whitespace-only/newline-containing names are rejected."""
+    with pytest.raises(ValueError, match="empty|whitespace|newline"):
+        manager.create(bad_name, "prompt")
+    # And nothing was written.
+    assert bad_name not in manager.list_all()
 
 
 def test_get_nonexistent(manager: AgentManager) -> None:

@@ -369,17 +369,74 @@ def test_add_mcp_server_http(
     assert servers["web"]["url"] == "https://example.com/mcp"
 
 
-def test_add_mcp_server_overwrites(
+def test_add_mcp_server_rejects_duplicate(
     manager: ProjectManager, projects_root: Path
 ) -> None:
-    """Adding a server with the same name overwrites the previous config."""
+    """#254 — adding a server with an existing name raises instead of silently overwriting."""
     proj = projects_root / "p"
     proj.mkdir()
     manager.bind(72, str(proj))
 
     manager.add_mcp_server(72, "s", {"type": "stdio", "command": "old"})
-    manager.add_mcp_server(72, "s", {"type": "stdio", "command": "new"})
-    assert manager.get_mcp_servers(72)["s"]["command"] == "new"
+    with pytest.raises(ValueError, match="already exists"):
+        manager.add_mcp_server(72, "s", {"type": "stdio", "command": "new"})
+    # Original config preserved.
+    assert manager.get_mcp_servers(72)["s"]["command"] == "old"
+
+
+def test_add_mcp_server_after_remove_succeeds(
+    manager: ProjectManager, projects_root: Path
+) -> None:
+    """#254 — remove-then-add is the supported replace flow."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(720, str(proj))
+
+    manager.add_mcp_server(720, "s", {"type": "stdio", "command": "old"})
+    assert manager.remove_mcp_server(720, "s") is True
+    manager.add_mcp_server(720, "s", {"type": "stdio", "command": "new"})
+    assert manager.get_mcp_servers(720)["s"]["command"] == "new"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["", "   ", "\t", "\n", "name\nwith\nnewline", "name\rwith\rcr"],
+)
+def test_add_mcp_server_rejects_invalid_name(
+    manager: ProjectManager, projects_root: Path, bad_name: str
+) -> None:
+    """#255 — MCP server names must not be empty/whitespace/newline-containing."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(721, str(proj))
+    with pytest.raises(ValueError, match="empty|whitespace|newline"):
+        manager.add_mcp_server(721, bad_name, {"type": "stdio", "command": "x"})
+    assert manager.get_mcp_servers(721) == {}
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    [
+        "",
+        "   ",
+        "\t",
+        "\n",
+        "K\nWITH\nNEWLINE",
+        "K\rWITH\rCR",
+        "K=injected",
+        "=leading_equal",
+    ],
+)
+def test_set_env_rejects_invalid_key(
+    manager: ProjectManager, projects_root: Path, bad_key: str
+) -> None:
+    """#255 — env keys must not be empty/whitespace/newline/contain '='."""
+    proj = projects_root / "p"
+    proj.mkdir()
+    manager.bind(722, str(proj))
+    with pytest.raises(ValueError, match="empty|whitespace|newline|'='"):
+        manager.set_env(722, bad_key, "value")
+    assert manager.get_env(722) == {}
 
 
 def test_remove_mcp_server(

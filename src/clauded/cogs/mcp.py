@@ -39,7 +39,11 @@ async def mcp_add(
     config: dict = {"type": "stdio", "command": command}
     if args:
         config["args"] = args.split()
-    bot.project_manager.add_mcp_server(binding_id, name, config)
+    try:
+        bot.project_manager.add_mcp_server(binding_id, name, config)
+    except ValueError as exc:
+        await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
         description=f"Type: stdio\nCommand: `{command}`" + (f"\nArgs: `{args}`" if args else ""),
@@ -63,7 +67,11 @@ async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> 
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
     config: dict = {"type": "http", "url": url}
-    bot.project_manager.add_mcp_server(binding_id, name, config)
+    try:
+        bot.project_manager.add_mcp_server(binding_id, name, config)
+    except ValueError as exc:
+        await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
         description=f"Type: http\nURL: `{url}`",
@@ -78,6 +86,8 @@ async def mcp_list(interaction: discord.Interaction) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
