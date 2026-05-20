@@ -169,19 +169,17 @@ def test_pre_tool_notify_differentiates_http_vs_other_exceptions():
 # ---------------------------------------------------------------------------
 
 
-def test_hourglass_reaction_failure_now_logs_at_debug():
-    """#223 PR-B B1: per-message hot path; record DEBUG so gateway perm
-    issues are correlatable without flooding WARNINGs."""
+def test_hourglass_reaction_uses_safe_wrapper():
+    """#245: ⏳ reactions should use safe_add_reaction, not raw add_reaction."""
     from clauded import bot
     src = inspect.getsource(bot)
-    # Pin DEBUG log line for both ⏳ sites
-    assert src.count('add_reaction(⏳) failed') == 2, (
-        f"Expected exactly 2 sites with the new debug log; "
-        f"got {src.count('add_reaction(⏳) failed')}"
+    # Pin: safe_add_reaction is used (not raw)
+    assert src.count('safe_add_reaction(message, "⏳")') == 2, (
+        f"Expected exactly 2 safe_add_reaction(⏳) calls; "
+        f"got {src.count('safe_add_reaction(message, ')}"
     )
-    # Pin OLD silent swallow gone
-    bad_pattern = 'await message.add_reaction("⏳")\n            except discord.HTTPException:\n                pass'
-    assert bad_pattern not in src, "old silent ⏳ swallow still present"
+    # Pin: old raw pattern gone
+    assert 'await message.add_reaction("⏳")' not in src, "raw ⏳ add_reaction still present"
 
 
 # ---------------------------------------------------------------------------

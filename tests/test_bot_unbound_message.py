@@ -453,8 +453,9 @@ async def test_unbound_strict_first_message_replies_refuse_hint(
     channel = FakeChannel(channel_id=70000)
     msg = FakeMessage(channel=channel, content="<@42> hello", bot_user_id=42)
     await bot_strict._handle_channel_message(msg)
-    assert msg.replies == [UNBOUND_REFUSE_MESSAGE], (
-        f"Expected one reply == UNBOUND_REFUSE_MESSAGE, got: {msg.replies!r}"
+    refuse_sent = [s for s in msg.channel.sent if s.get("content") == UNBOUND_REFUSE_MESSAGE]
+    assert len(refuse_sent) == 1, (
+        f"Expected one UNBOUND_REFUSE_MESSAGE via safe_send_message, got: {msg.channel.sent!r}"
     )
     # And no thread was created (still refused — just no longer silent)
     assert msg._created_thread is None
@@ -472,9 +473,13 @@ async def test_unbound_strict_second_message_silent(
     msg2 = FakeMessage(channel=channel, content="<@42> second", bot_user_id=42)
     await bot_strict._handle_channel_message(msg1)
     await bot_strict._handle_channel_message(msg2)
-    assert msg1.replies == [UNBOUND_REFUSE_MESSAGE]
-    assert msg2.replies == [], (
-        f"Expected silent on 2nd message, got: {msg2.replies!r}"
+    refuse_sent_1 = [s for s in msg1.channel.sent if s.get("content") == UNBOUND_REFUSE_MESSAGE]
+    assert len(refuse_sent_1) == 1
+    # msg1 and msg2 share the same channel — total refuse count should be 1
+    # (the 2nd message was silenced by per-channel rate limit)
+    all_refuses = [s for s in channel.sent if s.get("content") == UNBOUND_REFUSE_MESSAGE]
+    assert len(all_refuses) == 1, (
+        f"Expected exactly 1 UNBOUND_REFUSE across both messages (2nd silent), got {len(all_refuses)}: {channel.sent!r}"
     )
 
 
@@ -490,5 +495,7 @@ async def test_unbound_strict_per_channel_independent(
     msg_b = FakeMessage(channel=ch_b, content="<@42> b", bot_user_id=42)
     await bot_strict._handle_channel_message(msg_a)
     await bot_strict._handle_channel_message(msg_b)
-    assert msg_a.replies == [UNBOUND_REFUSE_MESSAGE]
-    assert msg_b.replies == [UNBOUND_REFUSE_MESSAGE]
+    refuse_a = [s for s in msg_a.channel.sent if s.get("content") == UNBOUND_REFUSE_MESSAGE]
+    assert len(refuse_a) == 1
+    refuse_b = [s for s in msg_b.channel.sent if s.get("content") == UNBOUND_REFUSE_MESSAGE]
+    assert len(refuse_b) == 1

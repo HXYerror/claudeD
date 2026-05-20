@@ -610,10 +610,7 @@ class ClaudedBot(commands.Bot):
             and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(channel.id):
-                try:
-                    await message.reply(UNBOUND_REFUSE_MESSAGE)
-                except discord.HTTPException:
-                    log.debug("Could not surface unbound-refuse hint")
+                await safe_send_message(message.channel, content=UNBOUND_REFUSE_MESSAGE, reference=message)
             return
 
         resolved = await _resolve_path_or_friendly_error(
@@ -652,13 +649,11 @@ class ClaudedBot(commands.Bot):
                 thread = await message.create_thread(name=thread_name)
         except discord.Forbidden:
             log.exception("Missing permission to create threads in channel=%s", channel.id)
-            try:
-                if not is_forum:
-                    await channel.send(
-                        "❌ I don't have permission to create threads in this channel."
-                    )
-            except discord.HTTPException:
-                log.debug("Could not surface thread-permission error to channel")
+            if not is_forum:
+                await safe_send_message(
+                    channel,
+                    content="❌ I don't have permission to create threads in this channel.",
+                )
             return
         except discord.HTTPException as e:
             # Discord gateway can duplicate MESSAGE_CREATE → on_message runs
@@ -701,11 +696,8 @@ class ClaudedBot(commands.Bot):
                     return
             else:
                 log.exception("Failed to create thread for channel=%s", channel.id)
-                try:
-                    if not is_forum:
-                        await channel.send("❌ Failed to create a thread for this message.")
-                except discord.HTTPException:
-                    log.debug("Could not surface thread-creation error to channel")
+                if not is_forum:
+                    await safe_send_message(channel, content="❌ Failed to create a thread for this message.")
                 return
 
         # First-time unbound hint, posted before the bridge starts streaming.
@@ -785,14 +777,8 @@ class ClaudedBot(commands.Bot):
                 await safe_send_message(thread, embed=err_embed)
                 return
 
-            # Feature #66: Add hourglass reaction
-            try:
-                await message.add_reaction("⏳")
-            except discord.HTTPException as exc:
-                # #223 PR-B: per-message hot path; record at DEBUG so
-                # we can correlate "no ⏳ shown" gateway perm issues
-                # without flooding prod WARNINGs.
-                log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
+            # Feature #66: Add hourglass reaction (#245: safe wrapper)
+            await safe_add_reaction(message, "⏳")
 
             user_text, tmp_dir = await self._compose_user_text(message)
             # Use mention-stripped content instead of raw message content.
@@ -900,10 +886,9 @@ class ClaudedBot(commands.Bot):
             and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(parent_id):
-                try:
-                    await message.reply(UNBOUND_REFUSE_MESSAGE)
-                except discord.HTTPException:
-                    log.debug("Could not surface unbound-refuse hint in thread")
+                await safe_send_message(
+                    message.channel, content=UNBOUND_REFUSE_MESSAGE, reference=message,
+                )
             return
 
         resolved = await _resolve_path_or_friendly_error(
@@ -995,14 +980,8 @@ class ClaudedBot(commands.Bot):
                     await safe_send_message(message.channel, embed=err_embed)
                     return
 
-            # Feature #66: Add hourglass reaction
-            try:
-                await message.add_reaction("⏳")
-            except discord.HTTPException as exc:
-                # #223 PR-B: per-message hot path; record at DEBUG so
-                # we can correlate "no ⏳ shown" gateway perm issues
-                # without flooding prod WARNINGs.
-                log.debug("add_reaction(⏳) failed on message=%s: %s", getattr(message, "id", "?"), exc)
+            # Feature #66: Add hourglass reaction (#245: safe wrapper)
+            await safe_add_reaction(message, "⏳")
 
             user_text, tmp_dir = await self._compose_user_text(message)
             renderer = DiscordRenderer(message.channel, bot=self, project_path=Path(project_path) if project_path else None)
@@ -1770,7 +1749,7 @@ class ClaudedBot(commands.Bot):
                 ),
                 color=COLOR_INFO,
             )
-            await channel.send(embed=embed)
+            await safe_send_message(channel, embed=embed)
         except Exception as exc:
             log.warning(
                 "#241 new_task announce failed for sched=%s: %s",
@@ -1847,7 +1826,7 @@ class ClaudedBot(commands.Bot):
                 ),
                 color=COLOR_INFO,
             )
-            await channel.send(embed=embed)
+            await safe_send_message(channel, embed=embed)
         except Exception:
             log.exception(
                 "#241 expire-notify failed for sched=%s",
