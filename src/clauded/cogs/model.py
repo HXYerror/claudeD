@@ -43,31 +43,17 @@ def _fmt_context(n: int) -> str:
 
 
 def _resolve_session_bridge(bot, channel):
-    """#247 Bug B/C: shared session lookup for /model list and /model current.
+    """Shared session lookup for /model list and /model current.
 
-    Look up the session by ``channel.id`` first. If no session is found
-    and ``channel`` is a :class:`discord.Thread`, fall back to the
-    parent channel id (handles the case where the user is inside a
-    thread but the session was keyed on the parent channel).
-
-    Returns the bridge or ``None``. ``channel`` may be ``None`` (e.g.
-    DM or cache miss) — caller-friendly.
+    Look up the session by ``channel.id``. Returns the bridge or ``None``.
+    ``channel`` may be ``None`` (e.g. DM or cache miss).
     """
     if channel is None:
         return None
     channel_id = getattr(channel, "id", None)
     if channel_id is None:
         return None
-    bridge = bot.session_manager.get_session(channel_id)
-    if bridge is not None:
-        return bridge
-    # #247 Bug B: thread → parent fallback. ``isinstance`` check first
-    # so non-Thread channels (DMChannel / TextChannel / etc.) short-circuit.
-    if isinstance(channel, discord.Thread):
-        parent_id = getattr(channel, "parent_id", None)
-        if parent_id is not None:
-            return bot.session_manager.get_session(parent_id)
-    return None
+    return bot.session_manager.get_session(channel_id)
 
 
 def _current_model_for_thread(bot, channel) -> str | None:

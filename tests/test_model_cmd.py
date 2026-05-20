@@ -1,5 +1,6 @@
 """#186 — /model group: list, current, switch + metadata-rich autocomplete."""
 import pytest
+import discord
 from unittest.mock import AsyncMock, MagicMock
 
 
@@ -51,37 +52,16 @@ def test_current_model_for_thread_none_when_no_session():
     assert _current_model_for_thread(bot, None) is None
 
 
-def test_current_model_for_thread_falls_back_to_parent_for_thread():
-    """#247 Bug B: when channel is a discord.Thread and has no session of
-    its own, look up the session by ``parent_id``."""
-    import discord
-    from clauded.cogs.model import _current_model_for_thread
-    bot = MagicMock()
-    parent_bridge = MagicMock(model="claude-opus-4-7")
-
-    def _get(thread_id):
-        # Only the parent_id (777) has a session; the thread.id (42) does not.
-        return parent_bridge if thread_id == 777 else None
-
-    bot.session_manager.get_session = MagicMock(side_effect=_get)
-    thread = MagicMock(spec=discord.Thread)
-    thread.id = 42
-    thread.parent_id = 777
-    assert _current_model_for_thread(bot, thread) == "claude-opus-4-7"
-
-
-def test_resolve_session_bridge_no_fallback_for_non_thread():
-    """#247 Bug B: only Thread channels get parent fallback — TextChannel
-    short-circuits on first miss."""
+def test_resolve_session_bridge_returns_none_for_no_session():
+    """_resolve_session_bridge returns None when no session exists."""
     from clauded.cogs.model import _resolve_session_bridge
     bot = MagicMock()
     bot.session_manager.get_session = MagicMock(return_value=None)
-    channel = MagicMock(spec=[])  # not a Thread; isinstance check is False
+    channel = MagicMock()
     channel.id = 42
-    channel.parent_id = 999  # should be ignored
-    assert _resolve_session_bridge(bot, channel) is None
-    # session_manager called exactly once (no parent fallback)
-    bot.session_manager.get_session.assert_called_once_with(42)
+    result = _resolve_session_bridge(bot, channel)
+    assert result is None
+    bot.session_manager.get_session.assert_called_with(42)
 
 
 @pytest.mark.asyncio
@@ -224,3 +204,30 @@ def test_model_group_has_three_subcommands():
     from clauded.cogs.model import model_group
     names = {c.name for c in model_group.commands}
     assert names == {"switch", "list", "current"}, f"Unexpected subcommands: {names}"
+
+
+@pytest.mark.asyncio
+async def test_model_list_pre_first_turn_shows_unset():
+    """#247 AC5/AC6: bridge exists but model=None (pre-first-turn) →
+    /model list shows '(unset)' not 'No active session'."""
+    from clauded.cogs.model import model_list
+    from clauded.bot import ClaudedBot
+    bot_spec = MagicMock(spec=ClaudedBot)
+    # Bridge exists but model is None (pre-first-turn)
+    bridge = MagicMock()
+    bridge.model = None
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.id = 42
+    interaction.response.send_message = AsyncMock()
+    await model_list.callback(interaction)
+    embed = interaction.response.send_message.await_args.kwargs["embed"]
+    assert "unset" in embed.description.lower(), (
+        f"Pre-first-turn should show 'unset', got: {embed.description!r}"
+    )
+    assert "No active session" not in embed.description, (
+        f"Pre-first-turn should NOT say 'No active session': {embed.description!r}"
+    )
