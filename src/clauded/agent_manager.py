@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from ._validation import validate_identifier
 import threading
 from pathlib import Path
 

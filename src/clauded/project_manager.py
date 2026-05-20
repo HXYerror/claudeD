@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ._json_store import atomic_write_json
+from ._validation import validate_identifier, validate_env_key
 
 log = logging.getLogger("clauded.project_manager")
 
