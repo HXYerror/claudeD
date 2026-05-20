@@ -838,9 +838,8 @@ class ClaudedBot(commands.Bot):
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
-                response_cost = cost_after - cost_before
-                if response_cost > 0:
-                    self.cost_tracker.record(channel.id, response_cost)
+                response_cost = max(0.0, cost_after - cost_before)
+                self.cost_tracker.record(channel.id, response_cost)  # #248: always record
                 self.session_manager.save_session_state(thread.id)
                 if _render_ok:
                     await safe_remove_reaction(message, "⏳", self.user)
@@ -1029,9 +1028,8 @@ class ClaudedBot(commands.Bot):
             finally:
                 _cleanup_tmp_dir(tmp_dir)
                 cost_after = bridge.total_cost if bridge else 0.0
-                response_cost = cost_after - cost_before
-                if response_cost > 0:
-                    self.cost_tracker.record(parent_id, response_cost)
+                response_cost = max(0.0, cost_after - cost_before)
+                self.cost_tracker.record(parent_id, response_cost)  # #248: always record
                 self.session_manager.save_session_state(thread_id)
                 if _render_ok:
                     await safe_remove_reaction(message, "⏳", self.user)

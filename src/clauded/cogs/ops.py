@@ -40,10 +40,10 @@ async def cost_show(interaction: discord.Interaction) -> None:
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    total, calls = bot.cost_tracker.get_channel_cost(binding_id)
+    total, billable, turns = bot.cost_tracker.get_channel_cost(binding_id)
     embed = discord.Embed(
         title="💰 Channel Cost",
-        description=f"**${total:.4f}** across {calls} API call(s)",
+        description=f"**${total:.4f}** │ 💬 {turns} turns │ 💰 {billable} billable",
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
