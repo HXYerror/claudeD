@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 
 from ..discord_renderer import COLOR_INFO
-from ._unbound import NO_CHANNEL_MESSAGE, resolve_binding_id
+from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
 
 log = logging.getLogger("clauded.bot")
 
@@ -121,6 +121,8 @@ async def budget_show(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
@@ -147,6 +149,8 @@ async def budget_clear(interaction: discord.Interaction) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:

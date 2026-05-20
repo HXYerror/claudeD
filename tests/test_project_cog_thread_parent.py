@@ -155,8 +155,14 @@ async def test_set_mention_required_in_thread_writes_to_parent(
 async def test_set_mention_required_unbound_channel_friendly_error(
     pm: ProjectManager,
 ) -> None:
-    """Unbound channel → ValueError from _assert_bound → friendly ❌ reply.
-    Engineer R1 critical #1 regression pin (was catching wrong exception class)."""
+    """Unbound channel → friendly refusal reply (no crash).
+
+    #257: ``project_set_mention_required`` now calls ``reject_if_unbound``
+    up-front so the user sees ``UNBOUND_REFUSE_MESSAGE`` instead of the
+    raw ``_assert_bound`` ValueError fallback. The original
+    catch-ValueError path remains as defense-in-depth. Either way:
+    ephemeral ``❌`` reply, no state mutation.
+    """
     bot = MagicMock(spec=ClaudedBot)
     bot.project_manager = pm
 
@@ -167,16 +173,19 @@ async def test_set_mention_required_unbound_channel_friendly_error(
     interaction.guild_id = 8888
     interaction.client = bot
     interaction.response = MagicMock()
+    interaction.response.is_done = MagicMock(return_value=False)
     interaction.response.send_message = AsyncMock()
+    interaction.followup = MagicMock()
+    interaction.followup.send = AsyncMock()
 
     from clauded.cogs.project import project_set_mention_required
-    # Note: channel 60001 is NOT bound; _assert_bound raises ValueError;
-    # cog must catch it and reply ephemerally rather than propagate.
+    # Note: channel 60001 is NOT bound. ``reject_if_unbound`` short-circuits
+    # with the unified refusal before we ever reach the manager call.
     await project_set_mention_required.callback(interaction, False)
 
     interaction.response.send_message.assert_awaited_once()
-    call_kwargs = interaction.response.send_message.call_args
-    msg = call_kwargs[0][0] if call_kwargs[0] else call_kwargs[1].get("content", "")
+    call_args = interaction.response.send_message.call_args
+    msg = call_args[0][0] if call_args[0] else call_args[1].get("content", "")
     assert "❌" in msg
     # Channel state untouched
     assert pm.get_mention_required(60001) is True

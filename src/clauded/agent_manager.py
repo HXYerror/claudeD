@@ -42,8 +42,21 @@ class AgentManager:
     # Public API
     # ------------------------------------------------------------------
     def create(self, name: str, prompt: str, description: str = "") -> None:
-        """Create or overwrite an agent definition."""
+        """Create a new agent definition.
+
+        Raises:
+            ValueError: if ``name`` is empty, whitespace-only, or contains
+                newline/carriage-return characters (#255), or if an agent
+                with that name already exists (#254). Use :meth:`delete`
+                followed by :meth:`create` to replace an existing agent.
+        """
+        if not name or not name.strip() or "\n" in name or "\r" in name:
+            raise ValueError(
+                "Agent name must not be empty, whitespace-only, or contain newlines."
+            )
         with self._lock:
+            if name in self._agents:
+                raise ValueError(f"Agent {name!r} already exists.")
             self._agents[name] = {
                 "prompt": prompt,
                 "description": description or f"Custom agent: {name}",

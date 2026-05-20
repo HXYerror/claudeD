@@ -209,6 +209,8 @@ async def project_dirs(interaction: discord.Interaction) -> None:
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
+    if await reject_if_unbound(interaction, bot):
+        return
     dirs = bot.project_manager.get_extra_dirs(binding_id)
     if not dirs:
         await interaction.response.send_message("No extra directories configured.", ephemeral=True)
@@ -231,6 +233,8 @@ async def project_remove_dir(interaction: discord.Interaction, path: str) -> Non
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     removed = bot.project_manager.remove_extra_dir(binding_id, path)
     if removed:
@@ -257,6 +261,8 @@ async def project_set_mode(interaction: discord.Interaction, mode: app_commands.
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     bot.project_manager.set_channel_mode(binding_id, mode.value)
     await interaction.response.send_message(
@@ -290,6 +296,8 @@ async def project_set_mention_required(
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     try:
         bot.project_manager.set_mention_required(binding_id, required)
@@ -378,7 +386,11 @@ async def env_set(interaction: discord.Interaction, key: str, value: str) -> Non
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    bot.project_manager.set_env(binding_id, key, value)
+    try:
+        bot.project_manager.set_env(binding_id, key, value)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
     embed = discord.Embed(
         title="✅ Environment Variable Set",
         description=f"`{key}` = `{value[:100]}{'…' if len(value) > 100 else ''}`",
@@ -393,6 +405,8 @@ async def env_list(interaction: discord.Interaction) -> None:
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
         return
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:

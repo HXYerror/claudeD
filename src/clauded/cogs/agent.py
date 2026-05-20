@@ -31,7 +31,11 @@ async def agent_create(
         return
     if await reject_if_unbound(interaction, bot):
         return
-    bot.agent_manager.create(name, prompt, description)
+    try:
+        bot.agent_manager.create(name, prompt, description)
+    except ValueError as exc:
+        await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
     embed = discord.Embed(
         title=f"\u2705 Agent `{name}` created",
         description=f"Prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}",
