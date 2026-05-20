@@ -114,51 +114,53 @@ class ProjectManager:
             ValueError: if the path traverses out of the allowed root or
                 does not point to an existing directory.
         """
-        if not isinstance(path, str) or not path.strip():
-            raise ValueError("Path must be a non-empty string.")
+        with self._lock:
+            if not isinstance(path, str) or not path.strip():
+                raise ValueError("Path must be a non-empty string.")
 
-        # Reject raw `..` traversal in the input. We also resolve symlinks
-        # below; this is a belt-and-braces check that catches sneaky inputs
-        # before they ever touch the filesystem.
-        raw_parts = Path(path).expanduser().parts
-        if any(part == ".." for part in raw_parts):
-            raise ValueError("Path may not contain '..' segments.")
+            # Reject raw `..` traversal in the input. We also resolve symlinks
+            # below; this is a belt-and-braces check that catches sneaky inputs
+            # before they ever touch the filesystem.
+            raw_parts = Path(path).expanduser().parts
+            if any(part == ".." for part in raw_parts):
+                raise ValueError("Path may not contain '..' segments.")
 
-        try:
-            resolved = Path(path).expanduser().resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise ValueError(f"Path does not exist: {path}") from exc
-        except OSError as exc:
-            raise ValueError(f"Could not resolve path: {exc}") from exc
+            try:
+                resolved = Path(path).expanduser().resolve(strict=True)
+            except FileNotFoundError as exc:
+                raise ValueError(f"Path does not exist: {path}") from exc
+            except OSError as exc:
+                raise ValueError(f"Could not resolve path: {exc}") from exc
 
-        if not resolved.is_dir():
-            raise ValueError(f"Not a directory: {resolved}")
+            if not resolved.is_dir():
+                raise ValueError(f"Not a directory: {resolved}")
 
-        # Confirm the resolved (symlink-followed) path stays under the
-        # configured root. ``Path.is_relative_to`` is available in 3.9+.
-        effective_root = self.get_guild_root(guild_id)
-        try:
-            resolved.relative_to(effective_root)
-        except ValueError as exc:
-            raise ValueError(
-                f"Path {resolved} is outside the allowed projects root "
-                f"{effective_root}."
-            ) from exc
+            # Confirm the resolved (symlink-followed) path stays under the
+            # configured root. ``Path.is_relative_to`` is available in 3.9+.
+            effective_root = self.get_guild_root(guild_id)
+            try:
+                resolved.relative_to(effective_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Path {resolved} is outside the allowed projects root "
+                    f"{effective_root}."
+                ) from exc
 
-        expanded = str(resolved)
-        self._projects[str(channel_id)] = {
-            "path": expanded,
-            "bound_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self._save()
-        return expanded
+            expanded = str(resolved)
+            self._projects[str(channel_id)] = {
+                "path": expanded,
+                "bound_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._save()
+            return expanded
 
     def unbind(self, channel_id: int) -> bool:
         """Remove the binding for ``channel_id``. Returns True if removed."""
-        if self._projects.pop(str(channel_id), None) is None:
-            return False
-        self._save()
-        return True
+        with self._lock:
+            if self._projects.pop(str(channel_id), None) is None:
+                return False
+            self._save()
+            return True
 
     def get_project(self, channel_id: int) -> str | None:
         """Return the bound path for ``channel_id``, or None if unbound."""
@@ -231,14 +233,15 @@ class ProjectManager:
     # ------------------------------------------------------------------
     def set_system_prompt(self, channel_id: int, prompt: str) -> None:
         """Store a system prompt for the given channel binding."""
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.get(key)
-        if entry is None:
-            entry = {}
-            self._projects[key] = entry
-        entry["system_prompt"] = prompt
-        self._save()
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.get(key)
+            if entry is None:
+                entry = {}
+                self._projects[key] = entry
+            entry["system_prompt"] = prompt
+            self._save()
 
     def get_system_prompt(self, channel_id: int) -> str | None:
         """Return the system prompt for ``channel_id``, or None."""
@@ -249,25 +252,27 @@ class ProjectManager:
 
     def clear_system_prompt(self, channel_id: int) -> None:
         """Remove the system prompt for ``channel_id`` if present."""
-        key = str(channel_id)
-        entry = self._projects.get(key)
-        if entry is not None and "system_prompt" in entry:
-            del entry["system_prompt"]
-            self._save()
+        with self._lock:
+            key = str(channel_id)
+            entry = self._projects.get(key)
+            if entry is not None and "system_prompt" in entry:
+                del entry["system_prompt"]
+                self._save()
 
     # ------------------------------------------------------------------
     # Budget
     # ------------------------------------------------------------------
     def set_budget(self, channel_id: int, amount: float) -> None:
         """Store a max budget (USD) for the given channel binding."""
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.get(key)
-        if entry is None:
-            entry = {}
-            self._projects[key] = entry
-        entry["budget"] = amount
-        self._save()
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.get(key)
+            if entry is None:
+                entry = {}
+                self._projects[key] = entry
+            entry["budget"] = amount
+            self._save()
 
     def get_budget(self, channel_id: int) -> float | None:
         """Return the budget for ``channel_id``, or None."""
@@ -279,40 +284,42 @@ class ProjectManager:
 
     def clear_budget(self, channel_id: int) -> None:
         """Remove the budget for ``channel_id`` if present."""
-        key = str(channel_id)
-        entry = self._projects.get(key)
-        if entry is not None and "budget" in entry:
-            del entry["budget"]
-            self._save()
+        with self._lock:
+            key = str(channel_id)
+            entry = self._projects.get(key)
+            if entry is not None and "budget" in entry:
+                del entry["budget"]
+                self._save()
 
     # ------------------------------------------------------------------
     # Extra directories
     # ------------------------------------------------------------------
     def add_extra_dir(self, channel_id: int, path: str) -> str:
         """Add an extra directory. Validates and stores. Returns resolved path."""
-        self._assert_bound(channel_id)
-        raw_parts = Path(path).expanduser().parts
-        if any(part == ".." for part in raw_parts):
-            raise ValueError("Path may not contain '..' segments.")
-        resolved = Path(path).expanduser().resolve(strict=True)
-        if not resolved.is_dir():
-            raise ValueError(f"Not a directory: {path}")
-        try:
-            resolved.relative_to(self.projects_root)
-        except ValueError:
-            raise ValueError(
-                f"Path {resolved} is outside the allowed projects root {self.projects_root}."
-            ) from None
-        key = str(channel_id)
-        entry = self._projects.get(key, {})
-        dirs = entry.get("extra_dirs", [])
-        resolved_str = str(resolved)
-        if resolved_str not in dirs:
-            dirs.append(resolved_str)
-        entry["extra_dirs"] = dirs
-        self._projects[key] = entry
-        self._save()
-        return resolved_str
+        with self._lock:
+            self._assert_bound(channel_id)
+            raw_parts = Path(path).expanduser().parts
+            if any(part == ".." for part in raw_parts):
+                raise ValueError("Path may not contain '..' segments.")
+            resolved = Path(path).expanduser().resolve(strict=True)
+            if not resolved.is_dir():
+                raise ValueError(f"Not a directory: {path}")
+            try:
+                resolved.relative_to(self.projects_root)
+            except ValueError:
+                raise ValueError(
+                    f"Path {resolved} is outside the allowed projects root {self.projects_root}."
+                ) from None
+            key = str(channel_id)
+            entry = self._projects.get(key, {})
+            dirs = entry.get("extra_dirs", [])
+            resolved_str = str(resolved)
+            if resolved_str not in dirs:
+                dirs.append(resolved_str)
+            entry["extra_dirs"] = dirs
+            self._projects[key] = entry
+            self._save()
+            return resolved_str
 
     def get_extra_dirs(self, channel_id: int) -> list[str]:
         """Return extra directories for ``channel_id``."""
@@ -321,17 +328,18 @@ class ProjectManager:
 
     def remove_extra_dir(self, channel_id: int, path: str) -> bool:
         """Remove an extra directory. Returns True if removed."""
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.get(key, {})
-        dirs = entry.get("extra_dirs", [])
-        resolved = str(Path(path).expanduser().resolve())
-        if resolved in dirs:
-            dirs.remove(resolved)
-            entry["extra_dirs"] = dirs
-            self._save()
-            return True
-        return False
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.get(key, {})
+            dirs = entry.get("extra_dirs", [])
+            resolved = str(Path(path).expanduser().resolve())
+            if resolved in dirs:
+                dirs.remove(resolved)
+                entry["extra_dirs"] = dirs
+                self._save()
+                return True
+            return False
 
     # ------------------------------------------------------------------
     # MCP servers
@@ -344,14 +352,15 @@ class ProjectManager:
         ``{"type": "stdio", "command": "npx", "args": [...]}`` or
         ``{"type": "http", "url": "https://..."}``
         """
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.get(key, {})
-        mcps = entry.get("mcp_servers", {})
-        mcps[name] = config
-        entry["mcp_servers"] = mcps
-        self._projects[key] = entry
-        self._save()
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.get(key, {})
+            mcps = entry.get("mcp_servers", {})
+            mcps[name] = config
+            entry["mcp_servers"] = mcps
+            self._projects[key] = entry
+            self._save()
 
     def get_mcp_servers(self, channel_id: int) -> dict:
         """Return all MCP server configs for ``channel_id``."""
@@ -359,30 +368,32 @@ class ProjectManager:
 
     def remove_mcp_server(self, channel_id: int, name: str) -> bool:
         """Remove an MCP server by name. Returns True if it existed."""
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.get(key, {})
-        mcps = entry.get("mcp_servers", {})
-        if name in mcps:
-            del mcps[name]
-            entry["mcp_servers"] = mcps
-            self._save()
-            return True
-        return False
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.get(key, {})
+            mcps = entry.get("mcp_servers", {})
+            if name in mcps:
+                del mcps[name]
+                entry["mcp_servers"] = mcps
+                self._save()
+                return True
+            return False
 
     # ------------------------------------------------------------------
     # Environment variables
     # ------------------------------------------------------------------
     def set_env(self, channel_id: int, key: str, value: str) -> None:
         """Store an environment variable for the given channel binding."""
-        self._assert_bound(channel_id)
-        k = str(channel_id)
-        entry = self._projects.get(k, {})
-        env = entry.get("env", {})
-        env[key] = value
-        entry["env"] = env
-        self._projects[k] = entry
-        self._save()
+        with self._lock:
+            self._assert_bound(channel_id)
+            k = str(channel_id)
+            entry = self._projects.get(k, {})
+            env = entry.get("env", {})
+            env[key] = value
+            entry["env"] = env
+            self._projects[k] = entry
+            self._save()
 
     def get_env(self, channel_id: int) -> dict[str, str]:
         """Return all environment variables for ``channel_id``."""
@@ -391,29 +402,31 @@ class ProjectManager:
 
     def remove_env(self, channel_id: int, key: str) -> bool:
         """Remove an environment variable. Returns True if removed."""
-        self._assert_bound(channel_id)
-        k = str(channel_id)
-        entry = self._projects.get(k, {})
-        env = entry.get("env", {})
-        if key in env:
-            del env[key]
-            entry["env"] = env
-            self._save()
-            return True
-        return False
+        with self._lock:
+            self._assert_bound(channel_id)
+            k = str(channel_id)
+            entry = self._projects.get(k, {})
+            env = entry.get("env", {})
+            if key in env:
+                del env[key]
+                entry["env"] = env
+                self._save()
+                return True
+            return False
 
     # ------------------------------------------------------------------
     # Channel mode (thread vs forum) — #87
     # ------------------------------------------------------------------
     def set_channel_mode(self, channel_id: int, mode: str) -> None:
         """Set channel mode: 'thread' (default) or 'forum'."""
-        if mode not in ("thread", "forum"):
-            raise ValueError(f"Invalid mode: {mode!r}. Must be 'thread' or 'forum'.")
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        entry = self._projects.setdefault(key, {})
-        entry["channel_mode"] = mode
-        self._save()
+        with self._lock:
+            if mode not in ("thread", "forum"):
+                raise ValueError(f"Invalid mode: {mode!r}. Must be 'thread' or 'forum'.")
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            entry = self._projects.setdefault(key, {})
+            entry["channel_mode"] = mode
+            self._save()
 
     def get_channel_mode(self, channel_id: int) -> str:
         """Return the channel mode ('thread' or 'forum') for ``channel_id``."""
@@ -431,11 +444,12 @@ class ProjectManager:
         existing ``unbind``-wipes-all semantics — only this single
         setting is intentionally sticky.
         """
-        self._assert_bound(channel_id)
-        key = str(channel_id)
-        settings = self._channel_settings.setdefault(key, {})
-        settings["mention_required"] = bool(required)
-        self._save_channel_settings()
+        with self._lock:
+            self._assert_bound(channel_id)
+            key = str(channel_id)
+            settings = self._channel_settings.setdefault(key, {})
+            settings["mention_required"] = bool(required)
+            self._save_channel_settings()
 
     def get_mention_required(self, channel_id: int) -> bool:
         """Return mention-required setting; defaults to True for unset channels.
@@ -482,12 +496,13 @@ class ProjectManager:
         Raises:
             ValueError: if ``path`` is not an existing directory.
         """
-        resolved = Path(path).expanduser().resolve()
-        if not resolved.is_dir():
-            raise ValueError(f"Not a directory: {path}")
-        self._guild_roots[str(guild_id)] = str(resolved)
-        self._save_guild_roots()
-        return str(resolved)
+        with self._lock:
+            resolved = Path(path).expanduser().resolve()
+            if not resolved.is_dir():
+                raise ValueError(f"Not a directory: {path}")
+            self._guild_roots[str(guild_id)] = str(resolved)
+            self._save_guild_roots()
+            return str(resolved)
 
     def get_guild_root(self, guild_id: int | None) -> Path:
         """Return the projects root for a guild, falling back to the default."""
@@ -499,10 +514,11 @@ class ProjectManager:
 
     def clear_guild_root(self, guild_id: int) -> bool:
         """Remove a per-guild root override. Returns True if one existed."""
-        if self._guild_roots.pop(str(guild_id), None) is not None:
-            self._save_guild_roots()
-            return True
-        return False
+        with self._lock:
+            if self._guild_roots.pop(str(guild_id), None) is not None:
+                self._save_guild_roots()
+                return True
+            return False
 
     def _load_guild_roots(self) -> None:
         p = os.path.join(self.data_dir, "guild_roots.json")
