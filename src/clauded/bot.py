@@ -610,10 +610,7 @@ class ClaudedBot(commands.Bot):
             and not self.allow_unbound_fallback
         ):
             if self.project_manager.should_refuse_unbound(channel.id):
-                try:
-                    await safe_send_message(message.channel, content=UNBOUND_REFUSE_MESSAGE, reference=message)
-                except discord.HTTPException:
-                    log.debug("Could not surface unbound-refuse hint")
+                await safe_send_message(message.channel, content=UNBOUND_REFUSE_MESSAGE, reference=message)
             return
 
         resolved = await _resolve_path_or_friendly_error(
@@ -700,7 +697,7 @@ class ClaudedBot(commands.Bot):
             else:
                 log.exception("Failed to create thread for channel=%s", channel.id)
                 if not is_forum:
-                        await safe_send_message(channel, content="❌ Failed to create a thread for this message.")
+                    await safe_send_message(channel, content="❌ Failed to create a thread for this message.")
                 return
 
         # First-time unbound hint, posted before the bridge starts streaming.
