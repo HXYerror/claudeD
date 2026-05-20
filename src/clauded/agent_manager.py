@@ -52,10 +52,7 @@ class AgentManager:
                 with that name already exists (#254). Use :meth:`delete`
                 followed by :meth:`create` to replace an existing agent.
         """
-        if not name or not name.strip() or "\n" in name or "\r" in name:
-            raise ValueError(
-                "Agent name must not be empty, whitespace-only, or contain newlines."
-            )
+        validate_identifier(name, "Agent name")
         with self._lock:
             if name in self._agents:
                 raise ValueError(f"Agent {name!r} already exists.")

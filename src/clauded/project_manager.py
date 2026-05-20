@@ -360,10 +360,7 @@ class ProjectManager:
                 Use :meth:`remove_mcp_server` followed by
                 :meth:`add_mcp_server` to replace an existing entry.
         """
-        if not name or not name.strip() or "\n" in name or "\r" in name:
-            raise ValueError(
-                "MCP server name must not be empty, whitespace-only, or contain newlines."
-            )
+        validate_identifier(name, "MCP server name")
         with self._lock:
             self._assert_bound(channel_id)
             key = str(channel_id)
@@ -407,16 +404,7 @@ class ProjectManager:
                 or newlines would corrupt downstream ``.env`` files and
                 shell-style environment dumps.
         """
-        if (
-            not key
-            or not key.strip()
-            or "\n" in key
-            or "\r" in key
-            or "=" in key
-        ):
-            raise ValueError(
-                "Env key must not be empty, whitespace-only, contain newlines, or contain '='."
-            )
+        validate_env_key(key)
         with self._lock:
             self._assert_bound(channel_id)
             k = str(channel_id)
