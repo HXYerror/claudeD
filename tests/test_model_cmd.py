@@ -29,18 +29,59 @@ def test_fmt_context_renders_k_and_m():
 def test_current_model_for_thread_returns_bridge_model():
     from clauded.cogs.model import _current_model_for_thread
     bot = MagicMock()
-    bridge = MagicMock(model="claude-sonnet-4-5")
+    bridge = MagicMock(model="claude-sonnet-4-6")
     bot.session_manager.get_session = MagicMock(return_value=bridge)
-    assert _current_model_for_thread(bot, 42) == "claude-sonnet-4-5"
+    # #247: helper now takes a channel-like object (not a bare int) so it
+    # can introspect for thread→parent fallback. Use a plain MagicMock with
+    # ``.id`` set; ``isinstance(channel, discord.Thread)`` is False so
+    # no fallback path is exercised here.
+    channel = MagicMock(spec=[])
+    channel.id = 42
+    assert _current_model_for_thread(bot, channel) == "claude-sonnet-4-6"
 
 
 def test_current_model_for_thread_none_when_no_session():
     from clauded.cogs.model import _current_model_for_thread
     bot = MagicMock()
     bot.session_manager.get_session = MagicMock(return_value=None)
-    assert _current_model_for_thread(bot, 42) is None
-    # thread_id None -> short-circuit
+    channel = MagicMock(spec=[])
+    channel.id = 42
+    assert _current_model_for_thread(bot, channel) is None
+    # channel None -> short-circuit
     assert _current_model_for_thread(bot, None) is None
+
+
+def test_current_model_for_thread_falls_back_to_parent_for_thread():
+    """#247 Bug B: when channel is a discord.Thread and has no session of
+    its own, look up the session by ``parent_id``."""
+    import discord
+    from clauded.cogs.model import _current_model_for_thread
+    bot = MagicMock()
+    parent_bridge = MagicMock(model="claude-opus-4-7")
+
+    def _get(thread_id):
+        # Only the parent_id (777) has a session; the thread.id (42) does not.
+        return parent_bridge if thread_id == 777 else None
+
+    bot.session_manager.get_session = MagicMock(side_effect=_get)
+    thread = MagicMock(spec=discord.Thread)
+    thread.id = 42
+    thread.parent_id = 777
+    assert _current_model_for_thread(bot, thread) == "claude-opus-4-7"
+
+
+def test_resolve_session_bridge_no_fallback_for_non_thread():
+    """#247 Bug B: only Thread channels get parent fallback — TextChannel
+    short-circuits on first miss."""
+    from clauded.cogs.model import _resolve_session_bridge
+    bot = MagicMock()
+    bot.session_manager.get_session = MagicMock(return_value=None)
+    channel = MagicMock(spec=[])  # not a Thread; isinstance check is False
+    channel.id = 42
+    channel.parent_id = 999  # should be ignored
+    assert _resolve_session_bridge(bot, channel) is None
+    # session_manager called exactly once (no parent fallback)
+    bot.session_manager.get_session.assert_called_once_with(42)
 
 
 @pytest.mark.asyncio
