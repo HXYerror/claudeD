@@ -3269,9 +3269,13 @@ class DiscordRenderer:
     def _smart_split(text: str, *, limit: int = DISCORD_MAX_LEN) -> list[str]:
         """Split ``text`` into chunks that fit within ``limit``.
 
-        Break preference: paragraph (``\\n\\n``) → line (``\\n``) → space →
-        hard cut. Code fences are closed at the cut and re-opened in the
-        next chunk to keep every chunk self-contained.
+        Markdown-aware (#274): prefer split points that do not cut through
+        code fences, blockquote (``> ``) runs, or table (``| ``) runs. If
+        no such block-aware boundary exists in range (e.g. a single block
+        exceeds the limit), fall back to: paragraph (``\\n\\n``) → line
+        (``\\n``) → space → hard cut. Code fences are still closed at the
+        cut and re-opened in the next chunk so every chunk is self-
+        contained even when the oversized-block fallback fires.
         """
         if not text:
             return []
@@ -3294,23 +3298,34 @@ class DiscordRenderer:
             # Look for a good break point in the back half of the chunk.
             half = cut // 2
 
-            # 1) Paragraph boundary (\n\n)
-            idx = remaining.rfind("\n\n", half, cut)
-            if idx >= 0:
-                idx += 2  # include the double newline in the first chunk
-            else:
-                # 2) Line boundary (\n)
-                idx = remaining.rfind("\n", half, cut)
+            # 0) Block-aware boundary (#274): prefer a line break that is
+            #    NOT inside a ``` fence and NOT between two consecutive
+            #    blockquote (``> ``) or table (``| ``) lines. Falls back
+            #    to the older paragraph/line/space heuristic when no such
+            #    boundary exists in [half, cut] (i.e. the current block
+            #    is itself oversized — handled by the close/reopen logic
+            #    below and ultimately by the long-reply .md fallback).
+            idx = DiscordRenderer._find_block_aware_split(
+                remaining, half, cut
+            )
+            if idx < 0:
+                # 1) Paragraph boundary (\n\n)
+                idx = remaining.rfind("\n\n", half, cut)
                 if idx >= 0:
-                    idx += 1
+                    idx += 2  # include the double newline in the first chunk
                 else:
-                    # 3) Space
-                    idx = remaining.rfind(" ", half, cut)
+                    # 2) Line boundary (\n)
+                    idx = remaining.rfind("\n", half, cut)
                     if idx >= 0:
                         idx += 1
                     else:
-                        # 4) Hard cut
-                        idx = cut
+                        # 3) Space
+                        idx = remaining.rfind(" ", half, cut)
+                        if idx >= 0:
+                            idx += 1
+                        else:
+                            # 4) Hard cut
+                            idx = cut
 
             chunk = remaining[:idx]
             remaining = remaining[idx:]
@@ -3328,6 +3343,67 @@ class DiscordRenderer:
             chunks.append(chunk)
 
         return chunks
+
+    @staticmethod
+    def _find_block_aware_split(text: str, lo: int, hi: int) -> int:
+        """Find a line-boundary split position in ``[lo, hi]`` that does
+        not cut through a markdown code fence, blockquote run, or table
+        run (#274).
+
+        Walks *text* line by line, tracking whether we're currently inside
+        a ``\u0060\u0060\u0060`` fence. For each line that has a trailing
+        ``\\n``, the position **after** that newline is a candidate split
+        point iff:
+
+        * we are not currently inside a fence, AND
+        * we are not between two consecutive blockquote lines (both
+          ``> ...``), AND
+        * we are not between two consecutive table lines (both
+          ``| ...``).
+
+        Returns the **latest** such candidate position in ``[lo, hi]``,
+        or ``-1`` if none exists (caller then falls back to the legacy
+        paragraph/line/space heuristic).
+        """
+        if hi <= 0 or lo >= len(text):
+            return -1
+        if lo < 0:
+            lo = 0
+        lines = text.split("\n")
+        pos = 0
+        in_fence = False
+        best = -1
+        for i, line in enumerate(lines):
+            stripped = line.lstrip()
+            # A line that *opens* or *closes* a fence toggles the state
+            # before we evaluate the candidate at its trailing newline,
+            # so the candidate sits *outside* the fence in both cases.
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+            line_end = pos + len(line)
+            # All but the last entry of split("\n") are followed by a \n.
+            if i < len(lines) - 1:
+                after_nl = line_end + 1
+                if after_nl > hi:
+                    break
+                if after_nl >= lo and not in_fence:
+                    next_stripped = lines[i + 1].lstrip()
+                    # Block-pair guards: keep consecutive blockquote and
+                    # table rows together.
+                    blockquote_pair = (
+                        stripped.startswith(">")
+                        and next_stripped.startswith(">")
+                    )
+                    table_pair = (
+                        stripped.startswith("|")
+                        and next_stripped.startswith("|")
+                    )
+                    if not blockquote_pair and not table_pair:
+                        best = after_nl
+                pos = after_nl
+            else:
+                pos = line_end
+        return best
 
     @staticmethod
     def _detect_open_fence_lang(chunk: str) -> str:
