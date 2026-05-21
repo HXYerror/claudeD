@@ -275,3 +275,15 @@ def test_format_tables_normal():
     result = DiscordRenderer._format_tables(text)
     assert "```" in result  # table wrapped
     assert "| Alice | 30 |" in result
+
+
+@pytest.mark.xfail(reason="#274 AC4: oversized block → .md fallback not yet wired")
+def test_oversized_code_block_degrades_gracefully():
+    """A single fenced code block > 2000 chars should not produce a
+    chunk that exceeds Discord's 2000 limit without the fence being
+    properly closed/reopened."""
+    code = "x = 1\n" * 400  # ~2400 chars
+    text = f"```python\n{code}```\nAfter the block."
+    chunks = _smart_split(text, 2000)
+    for c in chunks:
+        assert len(c) <= 2000, f"Chunk exceeds 2000: {len(c)} chars"
