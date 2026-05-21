@@ -115,13 +115,36 @@ async def model_switch(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    # #273: prefer SDK runtime ``set_model`` on an active bridge so we
+    # don't tear down the session (which would lose context). Symmetric
+    # with how ``/mode set`` uses ``bridge.set_permission_mode``. Fall
+    # back to ``_recreate_session`` only when there's no active session
+    # bound to this thread.
+    thread_id = getattr(interaction.channel, "id", None)
+    bridge = bot.session_manager.get_session(thread_id) if thread_id is not None else None
+    if bridge is not None and getattr(bridge, "is_active", False):
+        await interaction.response.defer()
+        await bridge.set_model(name)
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"🔄 Switched to `{name}`",
+                description=(
+                    "✅ Model switched. Context preserved.\n\n"
+                    "-# ⏱️ **Per-session** — bot restart returns to your CLI "
+                    "default. (Contrast with `/mode set` which persists.)"
+                ),
+                color=COLOR_INFO,
+            )
+        )
+        return
+
     bridge = await bot._recreate_session(interaction, model_override=name)
     if bridge:
         await interaction.followup.send(
             embed=discord.Embed(
                 title=f"🔄 Switched to `{name}`",
                 description=(
-                    "⚠️ Previous conversation context was reset.\n\n"
+                    "✅ Model switched. Context preserved.\n\n"
                     "-# ⏱️ **Per-session** — bot restart returns to your CLI "
                     "default. (Contrast with `/mode set` which persists.)"
                 ),

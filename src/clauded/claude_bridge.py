@@ -240,6 +240,24 @@ class ClaudeBridge:
         await self._client.set_permission_mode(mode)
         self._permission_mode_override = mode
 
+    async def set_model(self, model: str) -> None:
+        """Runtime model switch via the SDK's control-plane.
+
+        #273: surfaces ``ClaudeSDKClient.set_model`` so user-facing
+        ``/model switch`` can flip the model mid-session without
+        recreating the bridge (which would lose context). Symmetric
+        with :meth:`set_permission_mode`.
+
+        Persists the new value to ``_model_override`` so :attr:`model`
+        and downstream consumers reflect the change. The SDK call
+        happens FIRST so a rejection from the underlying CLI leaves
+        our override unchanged (no lying display).
+        """
+        if self._client is None or not self._active:
+            raise RuntimeError("bridge not active")
+        await self._client.set_model(model)
+        self._model_override = model
+
     @property
     def is_active(self) -> bool:
         """True iff the underlying client is currently connected."""
