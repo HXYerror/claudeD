@@ -166,6 +166,98 @@ def test_detect_open_fence_lang_picks_last_open_fence() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Markdown block-awareness (#274): don't cut through code blocks,
+# blockquote runs, or table runs when the block fits in a single chunk.
+# ---------------------------------------------------------------------------
+
+
+def test_smart_split_keeps_code_block_intact_across_2000_boundary(
+    renderer: DiscordRenderer,
+) -> None:
+    """A ` ```bash ` block straddling the 2000-char cut stays whole (#274).
+
+    Without block-awareness the line-boundary rfind would land on a ``\\n``
+    inside the code body, splitting the fence in half. With block-awareness
+    the cut moves *before* the opening fence so the block survives intact.
+    """
+    # 158 filler lines × 12 chars = 1896 chars; then a ~300-char code block.
+    # Total ~2200 > limit so a split is forced. The code block sits across
+    # the 1996 cut window.
+    prefix = "filler line\n" * 158  # 1896 chars
+    code = "```bash\n" + ("echo 'hello world'\n" * 15) + "```"
+    text = prefix + code + "\n\ntail"
+    chunks = renderer._smart_split(text, limit=2000)
+
+    # The entire code block must live inside a single chunk — never split.
+    assert any(code in c for c in chunks), (
+        "Expected the ```bash``` block to be kept intact in one chunk; "
+        f"got chunks={[len(c) for c in chunks]}"
+    )
+    # Every chunk must still be self-contained (balanced fences).
+    for c in chunks:
+        assert c.count("```") % 2 == 0, c
+
+
+def test_smart_split_keeps_blockquote_run_intact(
+    renderer: DiscordRenderer,
+) -> None:
+    """Consecutive ``> `` lines aren't cut mid-run (#274).
+
+    The legacy line-boundary heuristic would happily split between two
+    ``> ...`` lines, breaking the quote across messages. Block-awareness
+    pushes the cut to *before* the quote begins.
+    """
+    prefix = "filler line\n" * 158  # 1896 chars
+    quote = "\n".join(f"> quote line {i}" for i in range(10))  # 149 chars
+    text = prefix + quote
+    chunks = renderer._smart_split(text, limit=2000)
+
+    assert any(quote in c for c in chunks), (
+        "Expected the blockquote run to live entirely in one chunk; "
+        f"got chunks={[len(c) for c in chunks]}"
+    )
+    # A real mid-blockquote split would leave one chunk ending in ``> ...``
+    # and the next starting in ``> ...``. Verify no such adjacency.
+    for prev, curr in zip(chunks, chunks[1:]):
+        prev_last = prev.rstrip("\n").splitlines()[-1] if prev.strip() else ""
+        curr_first = curr.lstrip("\n").splitlines()[0] if curr.strip() else ""
+        assert not (
+            prev_last.lstrip().startswith(">")
+            and curr_first.lstrip().startswith(">")
+        ), f"Blockquote split across chunks: {prev_last!r} | {curr_first!r}"
+
+
+def test_smart_split_keeps_table_intact(renderer: DiscordRenderer) -> None:
+    """Markdown table header + separator + body stay together (#274).
+
+    Without block-awareness, the rfind("\\n", ...) lands on a row delim-
+    iter inside the table body and splits header/separator away from
+    the trailing rows — Discord then renders the orphaned rows as plain
+    text. The block-aware check refuses to split between two ``| ...``
+    lines and pushes the cut to *before* the table.
+    """
+    prefix = "filler line\n" * 158  # 1896 chars
+    rows = "\n".join(f"| a{i}   | b{i}   |" for i in range(10))
+    table = "| col1 | col2 |\n|------|------|\n" + rows
+    text = prefix + table
+    chunks = renderer._smart_split(text, limit=2000)
+
+    assert any(table in c for c in chunks), (
+        "Expected the markdown table to live entirely in one chunk; "
+        f"got chunks={[len(c) for c in chunks]}"
+    )
+    # A real mid-table split would leave one chunk ending in ``| ...`` and
+    # the next starting in ``| ...``. Verify no such adjacency.
+    for prev, curr in zip(chunks, chunks[1:]):
+        prev_last = prev.rstrip("\n").splitlines()[-1] if prev.strip() else ""
+        curr_first = curr.lstrip("\n").splitlines()[0] if curr.strip() else ""
+        assert not (
+            prev_last.lstrip().startswith("|")
+            and curr_first.lstrip().startswith("|")
+        ), f"Table split across chunks: {prev_last!r} | {curr_first!r}"
+
+
+# ---------------------------------------------------------------------------
 # _format_tables – code-fence awareness
 # ---------------------------------------------------------------------------
 
