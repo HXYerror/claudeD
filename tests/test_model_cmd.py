@@ -207,6 +207,76 @@ def test_model_group_has_three_subcommands():
 
 
 @pytest.mark.asyncio
+async def test_model_switch_active_session_preserves_context():
+    """#273: /model switch on an active bridge uses set_model (SDK runtime
+    switch) and does NOT call _recreate_session — context preserved."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bridge = MagicMock()
+    bridge.is_active = True
+    bridge.set_model = AsyncMock()
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    bot_spec._recreate_session = AsyncMock()
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "opus")
+    bridge.set_model.assert_awaited_once_with("opus")
+    bot_spec._recreate_session.assert_not_called()
+    interaction.followup.send.assert_awaited_once()
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "Context preserved" in embed.description
+    assert "context was reset" not in embed.description.lower()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_no_session_falls_back_to_recreate():
+    """#273: when no active session exists, /model switch falls back to
+    _recreate_session (legacy create path)."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock(return_value=None)
+    recreated_bridge = MagicMock()
+    bot_spec._recreate_session = AsyncMock(return_value=recreated_bridge)
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "haiku")
+    bot_spec._recreate_session.assert_awaited_once()
+    interaction.followup.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_model_switch_inactive_bridge_falls_back_to_recreate():
+    """#273: when bridge exists but is_active is False, fall back to recreate."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot_spec = MagicMock(spec=ClaudedBot)
+    bridge = MagicMock()
+    bridge.is_active = False
+    bridge.set_model = AsyncMock()
+    bot_spec.session_manager = MagicMock()
+    bot_spec.session_manager.get_session = MagicMock(return_value=bridge)
+    bot_spec._recreate_session = AsyncMock(return_value=MagicMock())
+    interaction = MagicMock()
+    interaction.client = bot_spec
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "sonnet")
+    bridge.set_model.assert_not_called()
+    bot_spec._recreate_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_model_list_pre_first_turn_shows_unset():
     """#247 AC5/AC6: bridge exists but model=None (pre-first-turn) →
     /model list shows '(unset)' not 'No active session'."""
@@ -230,4 +300,48 @@ async def test_model_list_pre_first_turn_shows_unset():
     )
     assert "No active session" not in embed.description, (
         f"Pre-first-turn should NOT say 'No active session': {embed.description!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_switch_sdk_rejection_shows_error():
+    """#273 R2: if bridge.set_model raises, show error embed."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot = MagicMock(spec=ClaudedBot)
+    bot.session_manager = MagicMock()
+    bridge = MagicMock()
+    bridge.is_active = True
+    bridge.set_model = AsyncMock(side_effect=RuntimeError("Unknown model 'fake'"))
+    bot.session_manager.get_session = MagicMock(return_value=bridge)
+    interaction = MagicMock()
+    interaction.client = bot
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "fake")
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "failed" in embed.title.lower() or "❌" in embed.title
+
+
+@pytest.mark.asyncio
+async def test_model_switch_fallback_embed_does_not_claim_preserved():
+    """#273 R2: fallback path (no active session) must NOT say 'Context preserved'."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot = MagicMock(spec=ClaudedBot)
+    bot.session_manager = MagicMock()
+    bot.session_manager.get_session = MagicMock(return_value=None)
+    bot._recreate_session = AsyncMock(return_value=MagicMock())
+    interaction = MagicMock()
+    interaction.client = bot
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "opus")
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "Context preserved" not in embed.description, (
+        f"Fallback path should not claim context preserved: {embed.description!r}"
     )

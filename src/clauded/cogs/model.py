@@ -7,19 +7,19 @@ import logging
 import discord
 from discord import app_commands
 
-from ..discord_renderer import COLOR_INFO, COLOR_TOOL_SUCCESS
+from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE, COLOR_TOOL_SUCCESS
 
 log = logging.getLogger("clauded.bot")
 
 
 # #186: hybrid hardcoded table of known model aliases + metadata.
 # Maintained here; reviewer is responsible for refreshing when Anthropic
-# releases new SKUs. Order is intentional — user-facing list preserves
+# releases new SKUs. Order is intentional - user-facing list preserves
 # this ordering (most-common balanced first, then deep, then fast,
 # then context-window-extended variants).
 # #247: refresh to current SKUs (claude-sonnet-4-6, claude-opus-4-7,
 # claude-haiku-4-5, claude-sonnet-4-6-1m). Old table referenced
-# claude-sonnet-4-5 / claude-opus-4-1 / claude-haiku-3-5 — a full
+# claude-sonnet-4-5 / claude-opus-4-1 / claude-haiku-3-5 - a full
 # generation behind what the SDK was returning on ResultMessage.
 KNOWN_MODELS: dict[str, dict[str, str | int]] = {
     "sonnet":   {"id": "claude-sonnet-4-6",     "context": 200_000, "tier": "balanced"},
@@ -83,10 +83,10 @@ def _model_source_for_bridge(bridge) -> tuple[str, str | None]:
     rather than the collapsed ``bridge.model`` property.
 
     Returns one of:
-    - ``("override", "<name>")``  — user ran ``/model switch``
-    - ``("env", "<value>")``      — ``CLAUDE_MODEL`` env var was set
-    - ``("sdk", "<value>")``      — SDK reported it on a ``ResultMessage``
-    - ``("unset", None)``         — pre-first-turn, no override, no env
+    - ``("override", "<name>")``  - user ran ``/model switch``
+    - ``("env", "<value>")``      - ``CLAUDE_MODEL`` env var was set
+    - ``("sdk", "<value>")``      - SDK reported it on a ``ResultMessage``
+    - ``("unset", None)``         - pre-first-turn, no override, no env
     """
     override = getattr(bridge, "_model_override", None)
     if override:
@@ -115,15 +115,43 @@ async def model_switch(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
+    thread_id = getattr(interaction.channel, "id", None)
+    bridge = bot.session_manager.get_session(thread_id) if thread_id is not None else None
+    if bridge is not None and getattr(bridge, "is_active", False):
+        await interaction.response.defer()
+        try:
+            await bridge.set_model(name)
+        except Exception as exc:
+            await interaction.followup.send(
+                embed=discord.Embed(
+                    title="❌ Model switch failed",
+                    description=f"```\n{exc}\n```",
+                    color=COLOR_TOOL_FAILURE,
+                ),
+            )
+            return
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title=f"🔄 Switched to `{name}`",
+                description=(
+                    "✅ Model switched. Context preserved.\n\n"
+                    "-# ⏱️ **Per-session** — bot restart returns to CLI default."
+                ),
+                color=COLOR_INFO,
+            )
+        )
+        return
+
+    # No active session — fall back to recreate (context starts fresh)
     bridge = await bot._recreate_session(interaction, model_override=name)
     if bridge:
         await interaction.followup.send(
             embed=discord.Embed(
                 title=f"🔄 Switched to `{name}`",
                 description=(
-                    "⚠️ Previous conversation context was reset.\n\n"
-                    "-# ⏱️ **Per-session** — bot restart returns to your CLI "
-                    "default. (Contrast with `/mode set` which persists.)"
+                    "✅ Model set for new session.\n"
+                    "⚠️ No prior context (session was not active).\n\n"
+                    "-# ⏱️ **Per-session** — bot restart returns to CLI default."
                 ),
                 color=COLOR_INFO,
             )
@@ -147,13 +175,13 @@ async def model_list(interaction: discord.Interaction) -> None:
         model_id = info["id"]
         # Mark currently-active model (match alias OR id)
         marker = "🟢 " if current and (current == alias or current == model_id) else "• "
-        lines.append(f"{marker}**{alias}** (`{model_id}`) — {tier}, {ctx} context")
+        lines.append(f"{marker}**{alias}** (`{model_id}`) - {tier}, {ctx} context")
     desc = "\n".join(lines)
     if current:
         header = f"**Current**: `{current}`\n\n**Available models**:\n"
     elif bridge is not None:
         # Session exists but model not yet determined (pre-first-turn)
-        header = "**Current**: _(unset — will use CLI default)_\n\n**Available models**:\n"
+        header = "**Current**: _(unset - will use CLI default)_\n\n**Available models**:\n"
     else:
         header = "_No active session. Run inside a thread to see current model._\n\n**Available models**:\n"
     embed = discord.Embed(
@@ -171,7 +199,7 @@ async def model_current(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    # #198: don't collapse via ``bridge.model`` — we need to know which
+    # #198: don't collapse via ``bridge.model`` - we need to know which
     # tier the value came from so we can label it correctly. Resolve the
     # bridge directly and dispatch on the 4 tier cases.
     # #247 Bug C: share session-resolution logic with ``/model list`` via
@@ -180,20 +208,20 @@ async def model_current(interaction: discord.Interaction) -> None:
     bridge = _resolve_session_bridge(bot, interaction.channel)
     if bridge is None:
         await interaction.response.send_message(
-            "ℹ️ No active session. Run inside a thread to see current model.",
+            "i️ No active session. Run inside a thread to see current model.",
             ephemeral=True,
         )
         return
 
     source, value = _model_source_for_bridge(bridge)
 
-    # Case 4: nothing pinned anywhere AND no SDK turn yet — let the user
+    # Case 4: nothing pinned anywhere AND no SDK turn yet - let the user
     # know the SDK/CLI will resolve the default on the first turn.
     if source == "unset":
         embed = discord.Embed(
             title="🤖 Current Model",
             description=(
-                "_(unset — will use CLI default; ask Claude something to "
+                "_(unset - will use CLI default; ask Claude something to "
                 "discover the actual model)_"
             ),
             color=COLOR_TOOL_SUCCESS,
@@ -211,7 +239,7 @@ async def model_current(interaction: discord.Interaction) -> None:
             break
 
     if source == "override":
-        # User ran /model switch — full metadata, no suffix on the title
+        # User ran /model switch - full metadata, no suffix on the title
         # (matches existing UX from before this PR).
         if matched:
             alias, info = matched
@@ -228,7 +256,7 @@ async def model_current(interaction: discord.Interaction) -> None:
         # Admin-pinned via CLAUDE_MODEL env var.
         desc = f"`{value}` (CLAUDE_MODEL env)"
     else:
-        # source == "sdk" — observed from a ResultMessage post-first-turn.
+        # source == "sdk" - observed from a ResultMessage post-first-turn.
         # #210 R1 security: ``value`` originates in attacker-influenceable
         # ``ResultMessage.model``; strip backticks + cap length before
         # embedding in inline code fence (defense-in-depth).
