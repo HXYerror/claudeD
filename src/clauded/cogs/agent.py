@@ -80,13 +80,16 @@ async def agent_use(interaction: discord.Interaction, name: str) -> None:
         await interaction.response.send_message(f"\u274c Agent `{name}` not found.", ephemeral=True)
         return
     agents_json = {name: {"description": agent["description"], "prompt": agent["prompt"]}}
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(
-        interaction, agent_name=name, custom_agents=agents_json,
+        interaction, agent_name=name, custom_agents=agents_json, resume_session_id=sid,
     )
     if bridge:
         embed = discord.Embed(
             title=f"\U0001f916 Agent `{name}` activated",
-            description=f"{agent['description']}\n⚠️ Previous conversation context was reset.",
+            description=f"{agent['description']}\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)

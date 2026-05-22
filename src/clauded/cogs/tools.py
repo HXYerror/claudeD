@@ -31,11 +31,14 @@ async def tools_allow(interaction: discord.Interaction, tools: str) -> None:
     if not tool_list:
         await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, allowed_tools=tool_list)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, allowed_tools=tool_list, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔧 Allowed Tools Set",
-            description=f"Only these tools are allowed: `{' '.join(tool_list)}`\n⚠️ Previous conversation context was reset.",
+            description=f"Only these tools are allowed: `{' '.join(tool_list)}`\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -53,11 +56,14 @@ async def tools_deny(interaction: discord.Interaction, tools: str) -> None:
     if not tool_list:
         await interaction.response.send_message("Provide at least one tool name.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, disallowed_tools=tool_list)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, disallowed_tools=tool_list, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🚫 Denied Tools Set",
-            description=f"These tools are denied: `{' '.join(tool_list)}`\n⚠️ Previous conversation context was reset.",
+            description=f"These tools are denied: `{' '.join(tool_list)}`\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -70,11 +76,14 @@ async def tools_reset(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔧 Tools Reset",
-            description="All tools restored to defaults.\n⚠️ Previous conversation context was reset.",
+            description="All tools restored to defaults.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -104,11 +113,14 @@ async def budget_set(interaction: discord.Interaction, amount: float) -> None:
     binding_id = resolve_binding_id(interaction)
     if binding_id is not None:
         bot.project_manager.set_budget(binding_id, amount)
-    bridge = await bot._recreate_session(interaction, max_budget_usd=amount)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, max_budget_usd=amount, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="💵 Budget Set",
-            description=f"Max session budget: **${amount:.2f}**.\n⚠️ Previous conversation context was reset.",
+            description=f"Max session budget: **${amount:.2f}**.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)

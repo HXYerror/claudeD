@@ -330,7 +330,7 @@ async def session_fork(interaction: discord.Interaction) -> None:
     if new_bridge:
         embed = discord.Embed(
             title="🍴 Session Forked",
-            description=f"New session branched from `{old_session_id[:12]}…`\n⚠️ Previous conversation context was reset.",
+            description=f"New session branched from `{old_session_id[:12]}…`\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -346,11 +346,14 @@ async def session_worktree(interaction: discord.Interaction, name: str) -> None:
         return
     if await reject_if_unbound(interaction, bot):
         return
-    bridge = await bot._recreate_session(interaction, worktree=name)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, worktree=name, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🌲 Worktree Created",
-            description=f"Session started with worktree **{name}**.\n⚠️ Previous conversation context was reset.",
+            description=f"Session started with worktree **{name}**.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -378,11 +381,14 @@ async def session_name(interaction: discord.Interaction, name: str) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, session_name=name)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, session_name=name, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title=f"📛 Session named: {name}",
-            description="⚠️ Conversation context was reset.",
+            description="✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -430,11 +436,14 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
         return
     if await reject_if_unbound(interaction, bot):
         return
-    bridge = await bot._recreate_session(interaction, settings=json_str)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, settings=json_str, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="⚙️ Settings Applied",
-            description="Custom settings applied.\n⚠️ Previous conversation context was reset.",
+            description="Custom settings applied.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)

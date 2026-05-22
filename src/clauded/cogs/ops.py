@@ -276,11 +276,14 @@ async def plugin_add(interaction: discord.Interaction, path: str) -> None:
         )
         return
 
-    bridge = await bot._recreate_session(interaction, plugin_dirs=[path])
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, plugin_dirs=[path], resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔌 Plugin Added",
-            description=f"Plugin directory `{path}` added.\n⚠️ Previous conversation context was reset.",
+            description=f"Plugin directory `{path}` added.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)

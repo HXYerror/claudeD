@@ -304,11 +304,14 @@ async def set_effort(interaction: discord.Interaction, level: app_commands.Choic
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, effort=level.value)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, effort=level.value, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🧠 Effort Level Set",
-            description=f"Thinking effort set to **{level.value}**.\n⚠️ Previous conversation context was reset.",
+            description=f"Thinking effort set to **{level.value}**.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -325,11 +328,14 @@ async def max_turns_cmd(interaction: discord.Interaction, number: int) -> None:
     if number < 1:
         await interaction.response.send_message("Number must be at least 1.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, max_turns=number)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, max_turns=number, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔄 Max Turns Set",
-            description=f"Max turns set to **{number}**.\n⚠️ Previous conversation context was reset.",
+            description=f"Max turns set to **{number}**.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -343,11 +349,14 @@ async def fallback_model_cmd(interaction: discord.Interaction, model: str) -> No
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, fallback_model=model)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, fallback_model=model, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔄 Fallback Model Set",
-            description=f"Fallback model set to **{model}**.\n⚠️ Previous conversation context was reset.",
+            description=f"Fallback model set to **{model}**.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
@@ -360,11 +369,14 @@ async def toggle_bare(interaction: discord.Interaction) -> None:
     if not isinstance(bot, ClaudedBot):
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
-    bridge = await bot._recreate_session(interaction, bare=True)
+    # #277: preserve context across the recreate by passing resume_session_id
+    thread_id = getattr(interaction.channel, "id", None)
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(interaction, bare=True, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
             title="🔧 Bare Mode Enabled",
-            description="Session restarted in bare/minimal mode.\n⚠️ Conversation context was reset.",
+            description="Session restarted in bare/minimal mode.\n✅ Context preserved.",
             color=COLOR_INFO,
         )
         await interaction.followup.send(embed=embed)
