@@ -1132,6 +1132,25 @@ class ClaudedBot(commands.Bot):
         # message overhead for plain text turns.
         return composed_text, tmp_dir
 
+    def _get_resume_session_id(self, thread_id: int | None) -> str | None:
+        """Get the best available session_id for resume.
+
+        Checks in-memory bridge first (active session), then falls back
+        to stored session on disk (survives bot restart). Returns None
+        if no session history exists for this thread.
+        """
+        if thread_id is None:
+            return None
+        bridge = self.session_manager.get_session(thread_id)
+        if bridge is not None and getattr(bridge, "is_active", False):
+            sid = getattr(bridge, "session_id", None)
+            if sid:
+                return sid
+        stored = self.session_manager.get_stored_session(thread_id)
+        if stored:
+            return stored.get("session_id")
+        return None
+
     async def _recreate_session(
         self,
         interaction: discord.Interaction,

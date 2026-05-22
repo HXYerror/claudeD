@@ -306,8 +306,7 @@ async def set_effort(interaction: discord.Interaction, level: app_commands.Choic
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, effort=level.value, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -331,8 +330,7 @@ async def max_turns_cmd(interaction: discord.Interaction, number: int) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, max_turns=number, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -353,8 +351,7 @@ async def fallback_model_cmd(interaction: discord.Interaction, model: str) -> No
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, fallback_model=model, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -374,8 +371,7 @@ async def toggle_bare(interaction: discord.Interaction) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, bare=True, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(

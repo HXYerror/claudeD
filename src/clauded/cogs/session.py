@@ -348,8 +348,7 @@ async def session_worktree(interaction: discord.Interaction, name: str) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, worktree=name, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -384,8 +383,7 @@ async def session_name(interaction: discord.Interaction, name: str) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, session_name=name, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -440,8 +438,7 @@ async def session_settings(interaction: discord.Interaction, json_str: str) -> N
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, settings=json_str, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(

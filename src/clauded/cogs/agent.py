@@ -82,8 +82,7 @@ async def agent_use(interaction: discord.Interaction, name: str) -> None:
     agents_json = {name: {"description": agent["description"], "prompt": agent["prompt"]}}
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(
         interaction, agent_name=name, custom_agents=agents_json, resume_session_id=sid,
     )

@@ -278,8 +278,7 @@ async def plugin_add(interaction: discord.Interaction, path: str) -> None:
 
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, plugin_dirs=[path], resume_session_id=sid)
     if bridge:
         embed = discord.Embed(

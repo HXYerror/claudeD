@@ -33,8 +33,7 @@ async def tools_allow(interaction: discord.Interaction, tools: str) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, allowed_tools=tool_list, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -59,8 +58,7 @@ async def tools_deny(interaction: discord.Interaction, tools: str) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, disallowed_tools=tool_list, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -80,8 +78,7 @@ async def tools_reset(interaction: discord.Interaction) -> None:
         return
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
@@ -118,8 +115,7 @@ async def budget_set(interaction: discord.Interaction, amount: float) -> None:
         bot.project_manager.set_budget(binding_id, amount)
     # #277: preserve context across the recreate by passing resume_session_id
     thread_id = getattr(interaction.channel, "id", None)
-    current = bot.session_manager.get_session(thread_id) if thread_id else None
-    sid = getattr(current, "session_id", None) if current and getattr(current, "is_active", False) else None
+    sid = bot._get_resume_session_id(thread_id)
     bridge = await bot._recreate_session(interaction, max_budget_usd=amount, resume_session_id=sid)
     if bridge:
         embed = discord.Embed(
