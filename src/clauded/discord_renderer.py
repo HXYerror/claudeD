@@ -1893,10 +1893,39 @@ class DiscordRenderer:
                                     error_text = _extract_block_content_text(block.content)[:500] or "Failed"
                                     result_embed.description = f"```\n{error_text}\n```"
                                 else:
+                                    # #281: preserve URL/query from the launch
+                                    # embed so the completion embed still tells
+                                    # the user *what* was fetched/searched
+                                    # (otherwise 5 ``✅ WebFetch`` rows are
+                                    # indistinguishable). WebFetch keeps the
+                                    # URL in description; WebSearch encodes
+                                    # the query in the title (``🔍 Searching:
+                                    # {query}``), so we lift it into the
+                                    # completion title as ``✅ WebSearch:
+                                    # {query}``.
+                                    completion_title = f"✅ {name}"
+                                    preserved_desc = None
+                                    if name in ("WebFetch", "WebSearch"):
+                                        try:
+                                            orig_embed = orig_msg.embeds[0]
+                                            orig_title = orig_embed.title or ""
+                                            orig_desc = orig_embed.description
+                                        except (AttributeError, IndexError):
+                                            orig_title = ""
+                                            orig_desc = None
+                                        if name == "WebFetch":
+                                            preserved_desc = orig_desc
+                                        else:  # WebSearch
+                                            prefix = "🔍 Searching: "
+                                            if orig_title.startswith(prefix):
+                                                query = orig_title[len(prefix):]
+                                                completion_title = f"✅ WebSearch: {query}"
                                     result_embed = discord.Embed(
-                                        title=f"✅ {name}",
+                                        title=completion_title,
                                         color=COLOR_TOOL_SUCCESS,
                                     )
+                                    if preserved_desc:
+                                        result_embed.description = preserved_desc
                                 await self._safe_edit(orig_msg, embed=result_embed)
         except Exception as exc:
             if is_transient_discord_error(exc):
