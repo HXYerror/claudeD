@@ -131,6 +131,15 @@ class ClaudeBridge:
         self.total_cost: float = 0.0
         self.num_turns: int = 0
         self._sdk_model: str | None = None
+        # #280: cached context window for the active model. After a
+        # runtime ``/model switch`` the SDK's ``get_context_usage()``
+        # keeps returning the *old* model's ``maxTokens`` until the
+        # next turn refreshes its metadata. We populate this in
+        # :meth:`set_model` so ``/context`` and the footer 🧠 segment
+        # can display the correct denominator immediately. ``None``
+        # means "trust the SDK's value as-is" (no switch has happened
+        # yet, or we couldn't resolve the model in KNOWN_MODELS).
+        self._context_window_override: int | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -252,11 +261,38 @@ class ClaudeBridge:
         and downstream consumers reflect the change. The SDK call
         happens FIRST so a rejection from the underlying CLI leaves
         our override unchanged (no lying display).
+
+        #280: also caches the new model's context window from
+        ``KNOWN_MODELS`` into ``_context_window_override``. The SDK's
+        ``get_context_usage()`` does NOT refresh its ``maxTokens`` /
+        ``rawMaxTokens`` until the next turn round-trips, so without
+        this cache ``/context`` and the footer 🧠 segment would
+        display the *previous* model's window (e.g. sonnet's 200k
+        instead of opus's 1M) until the user sends another message.
+        Unknown models leave the override unset so we fall back to
+        whatever the SDK eventually reports.
         """
         if self._client is None or not self._active:
             raise RuntimeError("bridge not active")
         await self._client.set_model(model)
         self._model_override = model
+        # #280: cache the new model's context window for /context display.
+        # Local import avoids a hard cog→bridge dependency cycle at import
+        # time; ``cogs.model`` already imports from this module's siblings.
+        from .cogs.model import KNOWN_MODELS
+        self._context_window_override = None
+        # Exact id match first, then alias match. No startswith — it
+        # causes prefix collisions (e.g. sonnet-4-6 swallows sonnet-4-6-1m).
+        best = None
+        for alias, info in KNOWN_MODELS.items():
+            model_id = info["id"]
+            if model == model_id or model == alias:
+                best = info
+                break
+        if best is not None:
+            ctx = best.get("context")
+            if isinstance(ctx, int) and ctx > 0:
+                self._context_window_override = ctx
 
     @property
     def is_active(self) -> bool:

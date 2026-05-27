@@ -334,7 +334,11 @@ async def _fetch_context_pct_settled(
         if cu is None:
             return None
         from ._context_usage import compute_global_context_pct
-        result = compute_global_context_pct(cu)
+        # #280: pass the bridge's cached context window so a just-switched
+        # model (e.g. /model switch opus) renders against the *new*
+        # denominator instead of the SDK's stale ``maxTokens``.
+        override = getattr(bridge, "_context_window_override", None)
+        result = compute_global_context_pct(cu, max_tokens_override=override)
         return result[2] if result is not None else None
 
     try:
