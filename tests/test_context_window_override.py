@@ -295,3 +295,27 @@ async def test_footer_uses_context_window_override_after_switch():
     assert ("🧠 18%" in all_content) or ("🧠 19%" in all_content), (
         f"expected ~19% (189.4k / 1M), got: {all_content!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_set_model_sonnet_1m_caches_1M_not_200k():
+    """#280 R2: 'claude-sonnet-4-6-1m' must cache 1M, not 200k.
+    
+    Regression test for the startswith prefix collision bug where
+    sonnet-4-6 matched before sonnet-4-6-1m."""
+    from clauded.claude_bridge import ClaudeBridge
+    from clauded.config import Config
+    cfg = Config(
+        discord_bot_token="tok",
+        claude_model="sonnet",
+        claude_permission_mode="default",
+        projects_root="/tmp",
+    )
+    bridge = ClaudeBridge(project_path="/tmp", config=cfg)
+    bridge._active = True
+    bridge._client = AsyncMock()
+    bridge._model_override = None
+    await bridge.set_model("claude-sonnet-4-6-1m")
+    assert bridge._context_window_override == 1_000_000, (
+        f"Expected 1M for sonnet-1m, got {bridge._context_window_override}"
+    )

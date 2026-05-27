@@ -281,20 +281,18 @@ class ClaudeBridge:
         # time; ``cogs.model`` already imports from this module's siblings.
         from .cogs.model import KNOWN_MODELS
         self._context_window_override = None
-        for info in KNOWN_MODELS.values():
+        # Exact id match first, then alias match. No startswith — it
+        # causes prefix collisions (e.g. sonnet-4-6 swallows sonnet-4-6-1m).
+        best = None
+        for alias, info in KNOWN_MODELS.items():
             model_id = info["id"]
-            if model == model_id or model.startswith(model_id):
-                ctx = info.get("context")
-                if isinstance(ctx, int) and ctx > 0:
-                    self._context_window_override = ctx
+            if model == model_id or model == alias:
+                best = info
                 break
-        else:
-            # Alias-keyed lookup (e.g. user passed "opus" / "sonnet")
-            alias_info = KNOWN_MODELS.get(model)
-            if alias_info is not None:
-                ctx = alias_info.get("context")
-                if isinstance(ctx, int) and ctx > 0:
-                    self._context_window_override = ctx
+        if best is not None:
+            ctx = best.get("context")
+            if isinstance(ctx, int) and ctx > 0:
+                self._context_window_override = ctx
 
     @property
     def is_active(self) -> bool:
