@@ -163,6 +163,7 @@ async def session_info(interaction: discord.Interaction) -> None:
         mode_line = _format_mode_display(mode_value, mode_source)
         lines = [
             f"📡 **Session active** — cwd `{bridge.project_path}`",
+            f"• Session ID: `{bridge.session_id or '(pending — send a message first)'}`",
             f"• Model: {model_display}",
             f"• Mode: {mode_line}",
             f"• Turns: `{bridge.num_turns}`",
