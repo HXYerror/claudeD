@@ -174,6 +174,9 @@ COLOR_CLAUDE = 0x7C3AED        # Purple — Claude replies
 COLOR_TOOL_RUNNING = 0xF59E0B  # Yellow — tool executing
 COLOR_TOOL_SUCCESS = 0x10B981  # Green — tool completed
 COLOR_TOOL_FAILURE = 0xEF4444  # Red — tool failed / error
+
+# WebSearch title prefix (shared between launch + completion embeds)
+_WEBSEARCH_TITLE_PREFIX = "🔍 Searching: "
 COLOR_INFO = 0x3B82F6          # Blue — info / commands
 COLOR_THINKING = 0x6B7280      # Gray — thinking
 
@@ -1311,7 +1314,7 @@ class DiscordRenderer:
                             # --- Special tool display: WebSearch (#67) ---
                             if name == "WebSearch":
                                 query = block.input.get("query", "")[:200]
-                                tool_embed = discord.Embed(title=f"🔍 Searching: {query}", color=COLOR_TOOL_RUNNING)
+                                tool_embed = discord.Embed(title=f"{_WEBSEARCH_TITLE_PREFIX}{query}", color=COLOR_TOOL_RUNNING)
                                 tmsg = await self._safe_send(embed=tool_embed)
                                 if tmsg is not None and tool_id:
                                     tool_msgs[tool_id] = tmsg
@@ -1916,7 +1919,7 @@ class DiscordRenderer:
                                         if name == "WebFetch":
                                             preserved_desc = orig_desc
                                         else:  # WebSearch
-                                            prefix = "🔍 Searching: "
+                                            prefix = _WEBSEARCH_TITLE_PREFIX
                                             if orig_title.startswith(prefix):
                                                 query = orig_title[len(prefix):]
                                                 completion_title = f"✅ WebSearch: {query}"
