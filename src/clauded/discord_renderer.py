@@ -174,6 +174,9 @@ COLOR_CLAUDE = 0x7C3AED        # Purple — Claude replies
 COLOR_TOOL_RUNNING = 0xF59E0B  # Yellow — tool executing
 COLOR_TOOL_SUCCESS = 0x10B981  # Green — tool completed
 COLOR_TOOL_FAILURE = 0xEF4444  # Red — tool failed / error
+
+# WebSearch title prefix (shared between launch + completion embeds)
+_WEBSEARCH_TITLE_PREFIX = "🔍 Searching: "
 COLOR_INFO = 0x3B82F6          # Blue — info / commands
 COLOR_THINKING = 0x6B7280      # Gray — thinking
 
@@ -1311,7 +1314,7 @@ class DiscordRenderer:
                             # --- Special tool display: WebSearch (#67) ---
                             if name == "WebSearch":
                                 query = block.input.get("query", "")[:200]
-                                tool_embed = discord.Embed(title=f"🔍 Searching: {query}", color=COLOR_TOOL_RUNNING)
+                                tool_embed = discord.Embed(title=f"{_WEBSEARCH_TITLE_PREFIX}{query}", color=COLOR_TOOL_RUNNING)
                                 tmsg = await self._safe_send(embed=tool_embed)
                                 if tmsg is not None and tool_id:
                                     tool_msgs[tool_id] = tmsg
@@ -1893,10 +1896,39 @@ class DiscordRenderer:
                                     error_text = _extract_block_content_text(block.content)[:500] or "Failed"
                                     result_embed.description = f"```\n{error_text}\n```"
                                 else:
+                                    # #281: preserve URL/query from the launch
+                                    # embed so the completion embed still tells
+                                    # the user *what* was fetched/searched
+                                    # (otherwise 5 ``✅ WebFetch`` rows are
+                                    # indistinguishable). WebFetch keeps the
+                                    # URL in description; WebSearch encodes
+                                    # the query in the title (``🔍 Searching:
+                                    # {query}``), so we lift it into the
+                                    # completion title as ``✅ WebSearch:
+                                    # {query}``.
+                                    completion_title = f"✅ {name}"
+                                    preserved_desc = None
+                                    if name in ("WebFetch", "WebSearch"):
+                                        try:
+                                            orig_embed = orig_msg.embeds[0]
+                                            orig_title = orig_embed.title or ""
+                                            orig_desc = orig_embed.description
+                                        except (AttributeError, IndexError):
+                                            orig_title = ""
+                                            orig_desc = None
+                                        if name == "WebFetch":
+                                            preserved_desc = orig_desc
+                                        else:  # WebSearch
+                                            prefix = _WEBSEARCH_TITLE_PREFIX
+                                            if orig_title.startswith(prefix):
+                                                query = orig_title[len(prefix):]
+                                                completion_title = f"✅ WebSearch: {query}"
                                     result_embed = discord.Embed(
-                                        title=f"✅ {name}",
+                                        title=completion_title,
                                         color=COLOR_TOOL_SUCCESS,
                                     )
+                                    if preserved_desc:
+                                        result_embed.description = preserved_desc
                                 await self._safe_edit(orig_msg, embed=result_embed)
         except Exception as exc:
             if is_transient_discord_error(exc):
