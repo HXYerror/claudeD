@@ -82,23 +82,37 @@ def _format_tokens(n: int) -> str:
     return str(n)
 
 
-def _build_context_embed(usage: dict, source_label: str) -> discord.Embed:
+def _build_context_embed(
+    usage: dict,
+    source_label: str,
+    max_tokens_override: int | None = None,
+) -> discord.Embed:
     """Render a ContextUsageResponse dict into a Discord embed.
 
     ``source_label`` indicates which path generated the data ("active session"
     vs "fresh session"). Surface this so users understand whether the
     numbers reflect their actual conversation state or just the model's
     baseline budget.
+
+    ``max_tokens_override`` (#280): when set, overrides the SDK's
+    ``maxTokens`` for the denominator + display so a just-switched model
+    (``/model switch opus``) shows its true context window (e.g. 1M)
+    even before the SDK refreshes its metadata.
     """
     total = int(usage.get("totalTokens", 0))
     max_tokens = int(usage.get("maxTokens", 0))
     model = str(usage.get("model", "unknown"))
 
     # #263: compute global occupancy from Free space supplement.
+    # #280: pass through any context-window override the caller knows
+    # about (cached on the bridge after /model switch).
     from .._context_usage import compute_global_context_pct
-    result = compute_global_context_pct(usage)
+    result = compute_global_context_pct(usage, max_tokens_override=max_tokens_override)
     if result is not None:
-        total, _, percentage = int(result[0]), result[1], result[2]
+        total, effective_max, percentage = int(result[0]), result[1], result[2]
+        # #280: surface the overridden value in the embed text too so
+        # the displayed "X / Y tokens" line matches the percentage.
+        max_tokens = int(effective_max)
     else:
         total = int(usage.get("totalTokens", 0))
         percentage = float(usage.get("percentage", 0))
@@ -251,7 +265,15 @@ async def context_cmd(interaction: discord.Interaction) -> None:
         )
         return
 
-    embed = _build_context_embed(usage, source_label=source_label)
+    embed = _build_context_embed(
+        usage,
+        source_label=source_label,
+        # #280: forward bridge's cached window so a just-switched model
+        # (e.g. /model switch opus) renders against 1M, not the SDK's
+        # stale 200k. ``getattr`` keeps Path B (no bridge) safe — and
+        # tolerates legacy bridges that pre-date this field.
+        max_tokens_override=getattr(bridge, "_context_window_override", None),
+    )
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
