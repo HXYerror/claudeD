@@ -1623,6 +1623,20 @@ class ClaudedBot(commands.Bot):
         # restart, /session stop, etc.), use the persisted resume id so
         # the injected message lands in the same conversation history.
         bridge = self.session_manager.get_session(thread_id)
+        # #285: probe the bridge to detect ghost (is_active=True but SDK dead)
+        if bridge is not None and getattr(bridge, "is_active", False):
+            try:
+                probe = await asyncio.wait_for(
+                    bridge.get_context_usage(), timeout=10,
+                )
+                if probe is None:
+                    raise RuntimeError("get_context_usage returned None")
+            except Exception:
+                log.warning(
+                    "#285 ghost bridge detected for thread=%s; discarding",
+                    thread_id,
+                )
+                bridge = None
         if bridge is None or not getattr(bridge, "is_active", False):
             stored = self.session_manager.get_stored_session(thread_id)
             resume_id = stored.get("session_id") if stored else None
