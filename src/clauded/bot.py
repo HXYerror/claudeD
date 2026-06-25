@@ -1623,6 +1623,16 @@ class ClaudedBot(commands.Bot):
         # restart, /session stop, etc.), use the persisted resume id so
         # the injected message lands in the same conversation history.
         bridge = self.session_manager.get_session(thread_id)
+        # #285: probe the bridge to detect ghost (is_active=True but SDK dead)
+        if bridge is not None and getattr(bridge, "is_active", False):
+            try:
+                await bridge.get_context_usage()
+            except Exception:
+                log.warning(
+                    "#285 ghost bridge detected for thread=%s; discarding",
+                    thread_id,
+                )
+                bridge = None
         if bridge is None or not getattr(bridge, "is_active", False):
             stored = self.session_manager.get_stored_session(thread_id)
             resume_id = stored.get("session_id") if stored else None
@@ -1666,6 +1676,14 @@ class ClaudedBot(commands.Bot):
         await self._safe_fire_render(
             renderer=renderer, bridge=bridge, what=what, thread=thread,
         )
+        # #285 AC3: detect zero-event ghost render. DiscordRenderer tracks
+        # _message_count internally; if zero, the bridge was likely dead.
+        msg_count = getattr(renderer, "_message_count", None)
+        if msg_count is not None and msg_count == 0:
+            log.warning(
+                "#285 zero-event render for schedule=%s thread=%s",
+                sched.get("schedule_id"), thread_id,
+            )
 
     async def _fire_schedule_new_task(self, sched: dict) -> None:
         """Kind=new_task fire: spawn a fresh thread + fresh session, inject
