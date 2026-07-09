@@ -374,8 +374,10 @@ class ClaudedBot(commands.Bot):
         """Register slash command groups and sync to Discord."""
         # Cache claude version (#86)
         try:
+            import shutil
+            claude_bin = shutil.which("claude") or "claude"
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--version",
+                claude_bin, "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

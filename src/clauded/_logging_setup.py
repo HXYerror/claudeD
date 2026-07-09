@@ -27,8 +27,15 @@ from pathlib import Path
 # When changing any of these, grep the repo for the matching string in the
 # bash scripts + plist template.
 # --------------------------------------------------------------------------
-_LOG_DIR = Path.home() / "Library" / "Logs" / "clauded"
-_CACHE_DIR = Path.home() / "Library" / "Caches" / "clauded"
+_LOG_DIR: Path
+_CACHE_DIR: Path
+if sys.platform == "win32":
+    _appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    _LOG_DIR = _appdata / "clauded" / "logs"
+    _CACHE_DIR = _appdata / "clauded" / "cache"
+else:
+    _LOG_DIR = Path.home() / "Library" / "Logs" / "clauded"
+    _CACHE_DIR = Path.home() / "Library" / "Caches" / "clauded"
 
 
 def _ensure_runtime_dirs() -> None:
@@ -40,7 +47,7 @@ def _ensure_runtime_dirs() -> None:
     ``OSError`` so a read-only or sandboxed home doesn't crash startup; the
     individual write call sites handle the consequence.
     """
-    if sys.platform != "darwin":
+    if sys.platform not in ("darwin", "win32"):
         return
     for d in (_LOG_DIR, _CACHE_DIR):
         try:
@@ -64,7 +71,7 @@ def _configure_logging() -> None:
     if os.environ.get("PYTEST_CURRENT_TEST"):
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
-    if sys.platform != "darwin":
+    if sys.platform not in ("darwin", "win32"):
         logging.basicConfig(level=logging.INFO, format=fmt)
         return
     # _LOG_DIR was created at startup by _ensure_runtime_dirs(); if it's still

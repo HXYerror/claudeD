@@ -60,7 +60,9 @@ async def _run_git_diff(cwd: str, staged: bool) -> tuple[int, str, str]:
     so a runaway git process (rare but possible with huge diffs or
     filesystem locks) can't stall the slash command.
     """
-    args = ["git", "diff", "--no-color"]
+    import shutil
+    git_bin = shutil.which("git") or "git"
+    args = [git_bin, "diff", "--no-color"]
     if staged:
         args.append("--staged")
     proc = await asyncio.create_subprocess_exec(
