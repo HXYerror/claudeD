@@ -181,9 +181,17 @@ def redact_text(text: str, *, username: str | None = None) -> str:
         username = _current_username()
     for prefix in ("/Users/", "/home/"):
         text = re.sub(
-            rf"{re.escape(prefix)}{re.escape(username)}(/|\b)",
+            rf"{re.escape(prefix)}{re.escape(username)}([/\\]|\b)",
             rf"{prefix}<user>\1",
             text,
+        )
+    # Windows paths (#289)
+    for win_prefix in ("C:\\Users\\", "C:/Users/"):
+        text = re.sub(
+            re.escape(win_prefix) + re.escape(username) + r"([/\\]|\b)",
+            win_prefix.replace("\\", "/") + r"<user>\1",
+            text,
+            flags=re.IGNORECASE,
         )
     return text
 
