@@ -20,7 +20,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import pwd
+import getpass
+try:
+    import pwd
+except ImportError:  # Windows
+    pwd = None  # type: ignore[assignment]
 import re
 from typing import Iterable
 
@@ -129,7 +133,9 @@ def redact_env(env: dict[str, str] | None = None) -> dict[str, str]:
 def _current_username() -> str:
     """Best-effort: get the OS account name. Falls back to ``$USER`` or 'user'."""
     try:
-        return pwd.getpwuid(os.getuid()).pw_name
+        if pwd is not None:
+            return pwd.getpwuid(os.getuid()).pw_name
+        return getpass.getuser()
     except Exception:
         return os.environ.get("USER", "user") or "user"
 
@@ -147,11 +153,18 @@ def redact_path(path: str, *, username: str | None = None) -> str:
     # Use re.sub so we catch both ``/Users/alice/`` and ``/Users/alice``
     # (no trailing) without breaking on the platform's path-sep variants.
     for prefix in ("/Users/", "/home/"):
-        # Replace ``<prefix><username>/`` and ``<prefix><username>$``
         path = re.sub(
-            rf"{re.escape(prefix)}{re.escape(username)}(/|$)",
+            rf"{re.escape(prefix)}{re.escape(username)}([/\\]|$)",
             rf"{prefix}<user>\1",
             path,
+        )
+    # Windows path (case-insensitive, backslash or forward slash)
+    for win_prefix in ("C:\\Users\\", "C:/Users/"):
+        path = re.sub(
+            re.escape(win_prefix) + re.escape(username) + r"([/\\]|$)",
+            win_prefix.replace("\\", "/") + r"<user>\1",
+            path,
+            flags=re.IGNORECASE,
         )
     return path
 

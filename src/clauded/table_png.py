@@ -129,6 +129,11 @@ FONT_CANDIDATES = (
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",                    # macOS GB CJK
     "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",          # broad coverage
+    # Windows CJK (#289)
+    "C:\\Windows\\Fonts\\msyh.ttc",                                   # 微软雅黑
+    "C:\\Windows\\Fonts\\simsun.ttc",                                  # 宋体
+    "C:\\Windows\\Fonts\\msyhbd.ttc",                                  # 雅黑 Bold
+    "C:\\Windows\\Fonts\\arial.ttf",                                   # ASCII fallback
     # Linux CJK (docker / future deploys)
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK.ttc",

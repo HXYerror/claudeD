@@ -259,6 +259,12 @@ def _is_path_allowed(path: Path, project_path: Path | None) -> bool:
         return False
 
     allowed_roots: list[Path] = []
+    # Cross-platform temp directory (#289)
+    try:
+        import tempfile
+        allowed_roots.append(Path(tempfile.gettempdir()).resolve())
+    except OSError:
+        pass
     try:
         allowed_roots.append(Path("/tmp").resolve())
     except OSError:
