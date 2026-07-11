@@ -2812,7 +2812,7 @@ async def case_session_state_resume_after_restart(bot) -> CaseResult:
     import tempfile
     d = tempfile.mkdtemp(prefix="cc_ss_")
     ss = SessionStore(data_dir=d)
-    ss.save_session(thread_id=999, session_id="sess-x", project_path="/tmp")
+    ss.save_session(thread_id=999, session_id="sess-x")
     # Pretend restart
     ss2 = SessionStore(data_dir=d)
     stored = ss2.get_session_info(999)
@@ -2833,10 +2833,10 @@ async def case_save_session_state_after_crash(bot) -> CaseResult:
     d = tempfile.mkdtemp(prefix="cc_ssac_")
     ss = SessionStore(data_dir=d)
     # First, write a known-good state
-    ss.save_session(thread_id=1, session_id="a", project_path="/x")
+    ss.save_session(thread_id=1, session_id="a")
     # Now simulate concurrent _save call
     try:
-        await asyncio.to_thread(ss.save_session, 2, "b", "/y")
+        await asyncio.to_thread(ss.save_session, 2, "b")
     except Exception:
         pass
     # File should still parse as valid JSON

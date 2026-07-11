@@ -20,7 +20,12 @@ class Config:
 
     discord_bot_token: str
     claude_model: Optional[str]
-    claude_permission_mode: str
+    # #295: mirrors #198's ``claude_model`` semantics. Unset env
+    # (``CLAUDE_PERMISSION_MODE``) → ``None`` → SDK call omits
+    # ``permission_mode`` → CLI's ``~/.claude/settings.json``
+    # ``permissions.defaultMode`` governs. Setting the env var pins the
+    # mode for every session (still overridable per-thread via ``/mode set``).
+    claude_permission_mode: Optional[str]
     projects_root: str
     # SECURITY: when False (default), an unbound channel's @bot message is
     # silently ignored — restoring v1.0 behavior. When True, the on-message
@@ -63,13 +68,17 @@ def load_config() -> Config:
     _claude_model_env = os.environ.get("CLAUDE_MODEL", "").strip()
     claude_model: Optional[str] = _claude_model_env or None
 
+    # #295: same shape as #198 above — unset env var means "let CLI
+    # settings.json govern" (no forced ``permission_mode=default`` that
+    # used to override ``permissions.defaultMode``). Empty / whitespace
+    # is treated as unset.
+    _claude_perm_env = os.environ.get("CLAUDE_PERMISSION_MODE", "").strip()
+    claude_permission_mode: Optional[str] = _claude_perm_env or None
+
     return Config(
         discord_bot_token=token,
         claude_model=claude_model,
-        claude_permission_mode=(
-            os.environ.get("CLAUDE_PERMISSION_MODE", "default").strip()
-            or "default"
-        ),
+        claude_permission_mode=claude_permission_mode,
         projects_root=projects_root,
         allow_unbound_fallback=(
             os.environ.get("CLAUDED_ALLOW_UNBOUND_FALLBACK", "").strip().lower()

@@ -67,10 +67,26 @@ def test_blank_model_env_is_none(isolated_env: pytest.MonkeyPatch) -> None:
 
 
 def test_default_permission_mode(isolated_env: pytest.MonkeyPatch) -> None:
-    """The current default permission mode is ``"default"``."""
+    """#295: CLAUDE_PERMISSION_MODE unset → ``None`` (was ``"default"``).
+
+    Mirrors the #198 ``claude_model`` semantic: ``None`` signals "no
+    admin override, let SDK omit the flag so ``~/.claude/settings.json``
+    ``permissions.defaultMode`` governs" — matches terminal ``claude``
+    behavior instead of silently overriding it with ``"default"``.
+    """
     isolated_env.setenv("DISCORD_BOT_TOKEN", "tok-abc")
     cfg = load_config()
-    assert cfg.claude_permission_mode == "default"
+    assert cfg.claude_permission_mode is None
+
+
+def test_blank_permission_mode_env_is_none(
+    isolated_env: pytest.MonkeyPatch,
+) -> None:
+    """#295: whitespace-only CLAUDE_PERMISSION_MODE is treated as unset → None."""
+    isolated_env.setenv("DISCORD_BOT_TOKEN", "tok-abc")
+    isolated_env.setenv("CLAUDE_PERMISSION_MODE", "   ")
+    cfg = load_config()
+    assert cfg.claude_permission_mode is None
 
 
 def test_explicit_overrides(isolated_env: pytest.MonkeyPatch) -> None:

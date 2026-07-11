@@ -481,24 +481,26 @@ def test_save_session_state_persists_only_explicit_override_no_sdk_loop():
     # Capture what gets passed to the store
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
         captured.update(
-            thread_id=thread_id, session_id=session_id, project_path=project_path,
-            model=model, system_prompt=system_prompt,
+            thread_id=thread_id, session_id=session_id,
+            permission_mode_override=permission_mode_override,
         )
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(42)
 
-    # The persisted model MUST be the explicit override (None), NOT the
-    # SDK-observed value. Without this, future resumes lock to
-    # "claude-haiku-4-5" even when user changes settings.json.
-    assert captured["model"] is None, (
-        f"save_session_state must persist user-explicit override only, "
-        f"not _sdk_model. Got: {captured['model']!r} (expected None for "
-        f"the no-override case). This is the architect-flagged "
-        f"persistence-loop bug from #198 R1 review."
+    # #295 update: model is no longer in the persisted payload at all.
+    # Pre-#295 this test asserted ``captured["model"] is None``; post-#295
+    # the field simply isn't part of ``save_session``'s signature, which
+    # makes the "no persistence loop" guarantee even stronger. Pin that
+    # the call still happened (session_id captured) — proving that
+    # save_session_state no longer threads model through.
+    assert "model" not in captured, (
+        f"save_session_state must not thread model through to save_session; "
+        f"got {captured!r}. #295 removed model from the persistence layer."
     )
+    assert captured["session_id"] == "sess-abc"
 
 
 def test_save_session_state_persists_user_override_when_set():
@@ -531,12 +533,16 @@ def test_save_session_state_persists_user_override_when_set():
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
-        captured["model"] = model
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
+        captured["session_id"] = session_id
+        captured["permission_mode_override"] = permission_mode_override
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(99)
 
-    # #210: always None — model_override is ephemeral, no cross-restart
-    # persistence even when the user has explicitly switched.
-    assert captured["model"] is None
+    # #295: model is not in the payload at all — persistence layer no
+    # longer knows about model. #210's "ephemeral override" contract is
+    # thus strengthened: no dead field carrying stale state across
+    # restarts.
+    assert "model" not in captured
+    assert captured["session_id"] == "sess-xyz"

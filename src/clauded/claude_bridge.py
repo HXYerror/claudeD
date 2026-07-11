@@ -542,6 +542,19 @@ class ClaudeBridge:
         # whatever was resolved on turn 1 even if settings.json changes.
         chosen_model = self._model_override or self._config.claude_model
 
+        # #295: SDK-input value for ``permission_mode``. We deliberately
+        # do NOT use ``effective_permission_mode`` here — that accessor
+        # falls back to ``"default"`` for display purposes, but sending
+        # ``permission_mode="default"`` to the SDK overrides the CLI's
+        # own ``~/.claude/settings.json`` ``permissions.defaultMode``.
+        # We want the SDK to receive a value ONLY when the user (or
+        # operator via env) has explicitly asked for one; otherwise pass
+        # None so CLI settings govern (mirror of #198's ``model`` gate).
+        perm_mode_for_sdk = (
+            self._permission_mode_override
+            or self._config.claude_permission_mode
+        )
+
         options = ClaudeAgentOptions(
             cwd=self.project_path,
             env=self._env or {},
@@ -550,7 +563,9 @@ class ClaudeBridge:
             # an auto-resumed session with a persisted override re-enters the
             # bridge with the right mode on the very first turn (not just
             # after the user re-runs ``/mode set``).
-            permission_mode=self.effective_permission_mode,
+            # #295: passing ``None`` when nothing is explicitly set — see
+            # ``perm_mode_for_sdk`` above.
+            permission_mode=perm_mode_for_sdk,
             model=chosen_model,
             resume=self._resume_session_id,
             # R3 (#116): system_prompt preset dict replaces append_system_prompt

@@ -85,8 +85,7 @@ async def test_session_clear_removes_persisted_resume(bot: ClaudedBot) -> None:
     thread_id = 23456
     # Pre-seed a stored session via the store directly
     bot.session_manager._session_store.save_session(
-        thread_id, "sess-stored-id", "/tmp/proj",
-        model="sonnet", system_prompt=None,
+        thread_id, "sess-stored-id",
     )
     assert bot.session_manager.get_stored_session(thread_id) is not None
 
@@ -136,8 +135,7 @@ async def test_session_clear_both_active_and_stored(bot: ClaudedBot) -> None:
     mock_bridge.system_prompt = None
     bot.session_manager._sessions[thread_id] = mock_bridge
     bot.session_manager._session_store.save_session(
-        thread_id, "sess-stored-id", "/tmp/proj",
-        model="sonnet", system_prompt=None,
+        thread_id, "sess-stored-id",
     )
 
     interaction = _make_interaction(bot, thread_id)
@@ -176,8 +174,7 @@ async def test_clear_session_holds_per_thread_lock(bot: ClaudedBot) -> None:
     import asyncio
     thread_id = 67890
     bot.session_manager._session_store.save_session(
-        thread_id, "sess-id", "/tmp/proj",
-        model="sonnet", system_prompt=None,
+        thread_id, "sess-id",
     )
 
     pre_held = asyncio.Event()
@@ -217,8 +214,7 @@ async def test_clear_session_atomic_against_concurrent_resume(bot: ClaudedBot) -
     import asyncio
     thread_id = 78901
     bot.session_manager._session_store.save_session(
-        thread_id, "sess-stored", "/tmp",
-        model="sonnet", system_prompt=None,
+        thread_id, "sess-stored",
     )
 
     # Race: kick off clear_session AND a re-save (simulating resume's
@@ -227,8 +223,7 @@ async def test_clear_session_atomic_against_concurrent_resume(bot: ClaudedBot) -
         async with bot.session_manager.get_lock(thread_id):
             # Simulate what resume does: save_session_state
             bot.session_manager._session_store.save_session(
-                thread_id, "sess-resumed", "/tmp",
-                model="sonnet", system_prompt=None,
+                thread_id, "sess-resumed",
             )
 
     # Order: clear acquires first, completes; then fake_resume acquires,

@@ -215,6 +215,19 @@ async def session_resume(interaction: discord.Interaction) -> None:
     if not stored:
         await interaction.response.send_message("No saved session to resume.", ephemeral=True)
         return
+    # #295: system_prompt and project_path are no longer shadowed in
+    # sessions.json — read them from ``ProjectManager`` (canonical source)
+    # keyed off the parent channel so bindings still resolve inside threads.
+    parent_id = getattr(interaction.channel, "parent_id", None) or thread_id
+    project_path = bot.project_manager.get_path(parent_id)
+    if not project_path:
+        await interaction.response.send_message(
+            "Cannot resume: this channel is no longer bound to a project. "
+            "Use `/project bind` first.",
+            ephemeral=True,
+        )
+        return
+    system_prompt = bot.project_manager.get_system_prompt(parent_id)
     await interaction.response.defer()
     lock = bot.session_manager.get_lock(thread_id)
     async with lock:
@@ -227,7 +240,7 @@ async def session_resume(interaction: discord.Interaction) -> None:
         # user intent ("没设置就是 claude code 默认的"). The SDK falls back
         # to ~/.claude/settings.json (CLI default) when model_override is None.
         sc = SessionConfig(
-            system_prompt=stored.get("system_prompt"),
+            system_prompt=system_prompt,
             model_override=None,  # #210: ephemeral; see note above
             # #211: opposite of model_override — permission_mode_override
             # IS persistent (PRD user decision #4 contrast with #210). Read
@@ -239,7 +252,7 @@ async def session_resume(interaction: discord.Interaction) -> None:
         )
         try:
             await bot.session_manager.create_session(
-                thread_id, stored["project_path"], bot.config, sc,
+                thread_id, project_path, bot.config, sc,
             )
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to resume: `{exc}`", ephemeral=True)
