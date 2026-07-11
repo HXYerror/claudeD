@@ -365,6 +365,48 @@ class ClaudeBridge:
                 })
             raise
 
+    async def get_mcp_status(self) -> dict | None:
+        """Return live MCP server connection status, or ``None`` if not connected.
+
+        Public wrapper for ``_client.get_mcp_status()`` — parallel to
+        :meth:`get_server_info`. Used by ``/mcp list`` (#293) to display
+        the servers the CLI has actually loaded (project ``.mcp.json`` +
+        user settings + plugin-declared) instead of only the ones stored
+        in the bot's own project_manager JSON.
+
+        Returns the raw SDK ``McpStatusResponse`` dict (has key
+        ``"mcpServers"`` → list of ``{name, status, config, scope, ...}``).
+        A future SDK refactor could break that shape — callers should
+        still ``try/except`` and degrade gracefully.
+        """
+        client = self._client
+        if client is None or not self._active:
+            return None
+        log.debug("get_mcp_status -> requesting")
+        try:
+            result = await client.get_mcp_status()
+            log.debug(
+                "get_mcp_status -> %s (%d servers)",
+                "None" if result is None else "dict",
+                len((result or {}).get("mcpServers", []) or []),
+            )
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_mcp_status",
+                    "server_count": len((result or {}).get("mcpServers", []) or []),
+                })
+            return result
+        except Exception:
+            log.warning("get_mcp_status failed", exc_info=True)
+            if stream_logger.is_enabled():
+                stream_logger.log_event({
+                    "type": "ControlPlane",
+                    "method": "get_mcp_status",
+                    "error": True,
+                })
+            raise
+
     async def get_context_usage(self) -> dict | None:
         """Return current context-window usage, or ``None`` if not connected.
 

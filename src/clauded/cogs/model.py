@@ -160,6 +160,18 @@ async def model_switch(interaction: discord.Interaction, name: str) -> None:
 
 @model_group.command(name="list", description="List available models + show current")
 async def model_list(interaction: discord.Interaction) -> None:
+    """List models the SDK reports as available for the current session (#293).
+
+    Precedence:
+
+    1. **Active session** — call ``bridge.get_server_info()`` and use its
+       ``models`` array (CLI-authoritative). Fall back to ``KNOWN_MODELS``
+       only if the SDK call fails or returns nothing.
+    2. **No active session** — display ``KNOWN_MODELS`` as before, but
+       clearly flagged as static reference data.
+
+    ``current`` marker resolution unchanged (``bridge.model`` chain).
+    """
     from ..bot import ClaudedBot
     bot = interaction.client
     if not isinstance(bot, ClaudedBot):
@@ -167,26 +179,71 @@ async def model_list(interaction: discord.Interaction) -> None:
         return
     current = _current_model_for_thread(bot, interaction.channel)
     bridge = _resolve_session_bridge(bot, interaction.channel)
-    # Build the rendered list
-    lines = []
-    for alias, info in KNOWN_MODELS.items():
-        ctx = _fmt_context(info["context"])
-        tier = info["tier"]
-        model_id = info["id"]
-        # Mark currently-active model (match alias OR id)
-        marker = "🟢 " if current and (current == alias or current == model_id) else "• "
-        lines.append(f"{marker}**{alias}** (`{model_id}`) - {tier}, {ctx} context")
+
+    sdk_models: list[dict] = []
+    if bridge is not None:
+        try:
+            info = await bridge.get_server_info()
+        except Exception as exc:
+            log.debug("/model list: get_server_info failed: %r", exc)
+            info = None
+        if info:
+            raw = info.get("models") or []
+            if isinstance(raw, list):
+                sdk_models = [m for m in raw if isinstance(m, dict)]
+
+    lines: list[str] = []
+    if sdk_models:
+        for m in sdk_models:
+            value = str(m.get("value") or "").strip()
+            display_name = str(m.get("displayName") or value or "?").strip()
+            description = str(m.get("description") or "").strip()
+            # Enrich with KNOWN_MODELS context/tier when we recognize the alias
+            # so the display keeps its familiar shape without re-hardcoding.
+            enrich = KNOWN_MODELS.get(value)
+            ctx_suffix = ""
+            if enrich is not None:
+                ctx_suffix = f" — {enrich['tier']}, {_fmt_context(enrich['context'])} context"
+            marker = (
+                "🟢 " if current and (current == value or (enrich and current == enrich["id"]))
+                else "• "
+            )
+            # Cap description to keep the embed under Discord's 4096 char
+            # limit on description; ``models`` typically returns 5 entries
+            # so the total stays well under.
+            desc_short = description[:120] + ("…" if len(description) > 120 else "")
+            row = f"{marker}**{display_name}** (`{value}`){ctx_suffix}"
+            if desc_short:
+                row += f"\n  {desc_short}"
+            lines.append(row)
+    else:
+        for alias, meta in KNOWN_MODELS.items():
+            ctx = _fmt_context(meta["context"])
+            tier = meta["tier"]
+            model_id = meta["id"]
+            marker = "🟢 " if current and (current == alias or current == model_id) else "• "
+            lines.append(f"{marker}**{alias}** (`{model_id}`) - {tier}, {ctx} context")
+
     desc = "\n".join(lines)
     if current:
         header = f"**Current**: `{current}`\n\n**Available models**:\n"
     elif bridge is not None:
-        # Session exists but model not yet determined (pre-first-turn)
         header = "**Current**: _(unset - will use CLI default)_\n\n**Available models**:\n"
     else:
         header = "_No active session. Run inside a thread to see current model._\n\n**Available models**:\n"
+
+    footer_note = (
+        "\n\nUse `/model switch <name>` to switch.\n"
+        "-# Switching resets the conversation context."
+    )
+    if not sdk_models:
+        footer_note += (
+            "\n-# ⚠️ Static reference — start a session to see the CLI's actual models."
+        )
+
     embed = discord.Embed(
         title="🤖 Model Selection",
-        description=header + desc + "\n\nUse `/model switch <name>` to switch.\n-# Switching resets the conversation context.",
+        description=header + desc + footer_note,
         color=COLOR_INFO,
     )
     await interaction.response.send_message(embed=embed)
