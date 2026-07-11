@@ -923,7 +923,10 @@ class ClaudedBot(commands.Bot):
                     # intent ("没设置就是 claude code 默认的"). The SDK falls
                     # back to ~/.claude/settings.json (CLI default) when
                     # model_override is None.
-                    stored_prompt = stored.get("system_prompt") if stored else None
+                    # #295: system_prompt is likewise NOT read from stored —
+                    # ``ProjectManager.get_system_prompt(parent_id)`` above is
+                    # the canonical source; the old shadow copy has been
+                    # dropped from sessions.json.
                     # #211: read the user-explicit permission-mode override
                     # from the stored row so a bot restart preserves the
                     # user's last ``/mode set`` / cycle choice (PRD user
@@ -952,7 +955,7 @@ class ClaudedBot(commands.Bot):
                     env_vars = self.project_manager.get_env(parent_id)
                     _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
                     sc = SessionConfig(
-                        system_prompt=stored_prompt or system_prompt,
+                        system_prompt=system_prompt,
                         model_override=None,  # #210: ephemeral; see note above
                         permission_mode_override=stored_perm_mode,  # #211: persistent
                         resume_session_id=resume_id,

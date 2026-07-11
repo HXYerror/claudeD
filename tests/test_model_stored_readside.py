@@ -261,12 +261,19 @@ async def test_session_resume_ignores_polluted_stored_model() -> None:
     bot.session_manager.get_lock = MagicMock(return_value=MagicMock(
         __aenter__=AsyncMock(), __aexit__=AsyncMock()
     ))
+    # #295: /session resume now reads project_path + system_prompt from
+    # project_manager (not from stored). Wire up a project_manager mock
+    # that returns a valid bound path.
+    bot.project_manager = MagicMock()
+    bot.project_manager.get_path = MagicMock(return_value="/tmp")
+    bot.project_manager.get_system_prompt = MagicMock(return_value="")
     bot.config = _config(claude_model=None)
 
     interaction = MagicMock()
     interaction.client = bot
     interaction.channel_id = 9999
     interaction.channel = MagicMock()
+    interaction.channel.parent_id = 9999
     interaction.response = MagicMock()
     interaction.response.defer = AsyncMock()
     interaction.followup = MagicMock()
@@ -313,24 +320,25 @@ def test_save_session_state_always_writes_none() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
         captured.update(
             thread_id=thread_id, session_id=session_id,
-            project_path=project_path, model=model,
-            system_prompt=system_prompt,
+            permission_mode_override=permission_mode_override,
         )
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(42)
 
-    assert captured["model"] is None, (
-        f"#210: save_session_state must always write model=None; got "
-        f"{captured['model']!r}. The persistence-field is deprecated; "
+    # #295: model field is entirely gone from save_session's signature
+    # — no stored model at all, which strengthens #210's contract
+    # (ephemeral override, read side ignores stored.model).
+    assert "model" not in captured, (
+        f"#295 + #210: save_session_state must not thread model to save_session; "
+        f"got {captured!r}. The persistence-field is deprecated; "
         f"read paths ignore it; new rows must be clean."
     )
-    # Cross-check that the rest of the kwargs are still threaded through.
+    # Cross-check that session_id still threads through.
     assert captured["session_id"] == "sess-abc"
-    assert captured["project_path"] == "/tmp/proj"
 
 
 def test_save_session_state_writes_none_when_no_user_override() -> None:
@@ -350,12 +358,13 @@ def test_save_session_state_writes_none_when_no_user_override() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
-        captured["model"] = model
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
+        captured["session_id"] = session_id
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(99)
-    assert captured["model"] is None
+    # #295: model is no longer a save_session parameter at all.
+    assert "model" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -453,20 +462,25 @@ async def test_session_info_no_bridge() -> None:
 
 
 # ---------------------------------------------------------------------------
-# S5 — Startup legacy-entry count log.
+# S5 — Startup legacy-field migration (updated for #295).
+#
+# #210's earlier forensic-preserving behavior (count + INFO log, no mutation)
+# was superseded by #295: the load path now strips ``model`` /
+# ``system_prompt`` / ``project_path`` from every entry so operators don't
+# carry stale shadow data forward. These three tests are the #295 version
+# of the previous #210 log tests.
 # ---------------------------------------------------------------------------
 
 
-def test_session_store_logs_legacy_model_count(
+def test_session_store_strips_legacy_shadow_fields(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """SessionStore._load reports the number of rows with non-null model.
-    The file is NOT mutated."""
+    """#295: _load strips model/system_prompt/project_path and rewrites the file."""
     from clauded.session_store import SessionStore
 
     payload = {
         "1": {"session_id": "a", "project_path": "/p", "model": "sonnet",
-              "system_prompt": "", "last_active": "x"},
+              "system_prompt": "sp", "last_active": "x"},
         "2": {"session_id": "b", "project_path": "/p", "model": "opus",
               "system_prompt": "", "last_active": "x"},
         "3": {"session_id": "c", "project_path": "/p", "model": None,
@@ -477,51 +491,62 @@ def test_session_store_logs_legacy_model_count(
     sessions_path = data_dir / "sessions.json"
     sessions_path.write_text(json.dumps(payload))
 
-    snapshot_before = sessions_path.read_text()
     with caplog.at_level(logging.INFO, logger="clauded.session_store"):
         store = SessionStore(data_dir=str(data_dir))
 
-    # 2 of the 3 entries have non-null model
-    matches = [r for r in caplog.records if "#210" in r.getMessage()]
-    assert matches, "expected one #210 legacy-count INFO log"
-    msg = matches[0].getMessage()
-    assert "2 legacy" in msg, f"got: {msg!r}"
-    # Forensic-preserving: file is byte-identical to before
-    assert sessions_path.read_text() == snapshot_before
-    # And the entries are still loaded (read path is unaffected)
-    assert store.get_session_info(1) == payload["1"]
+    # #295 log emitted, no more #210 forensic log.
+    matches = [r for r in caplog.records if "#295" in r.getMessage()]
+    assert matches, "expected one #295 shadow-field strip INFO log"
+    assert not [r for r in caplog.records if "#210" in r.getMessage()]
+
+    # File has been rewritten with shadow fields removed.
+    after = json.loads(sessions_path.read_text())
+    for entry in after.values():
+        assert "model" not in entry
+        assert "system_prompt" not in entry
+        assert "project_path" not in entry
+    # session_id / last_active preserved verbatim.
+    assert after["1"]["session_id"] == "a"
+    assert after["1"]["last_active"] == "x"
+    # And the in-memory copy matches the on-disk copy.
+    assert store.get_session_info(1) == after["1"]
 
 
 def test_session_store_no_legacy_no_log(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """All rows clean (model=None) → no #210 log emitted."""
+    """All rows already clean → no #295 strip log emitted, file untouched."""
     from clauded.session_store import SessionStore
 
     payload = {
-        "1": {"session_id": "a", "project_path": "/p", "model": None,
-              "system_prompt": "", "last_active": "x"},
+        "1": {"session_id": "a", "last_active": "x"},
     }
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    (data_dir / "sessions.json").write_text(json.dumps(payload))
+    sessions_path = data_dir / "sessions.json"
+    sessions_path.write_text(json.dumps(payload))
+    before = sessions_path.read_text()
 
     with caplog.at_level(logging.INFO, logger="clauded.session_store"):
         SessionStore(data_dir=str(data_dir))
 
+    assert not [r for r in caplog.records if "#295" in r.getMessage()]
     assert not [r for r in caplog.records if "#210" in r.getMessage()]
+    # No mutation when nothing to strip.
+    assert sessions_path.read_text() == before
 
 
 def test_session_store_missing_file_no_log(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """No sessions.json at all → no #210 log, no crash."""
+    """No sessions.json at all → no strip log, no crash."""
     from clauded.session_store import SessionStore
 
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     with caplog.at_level(logging.INFO, logger="clauded.session_store"):
         SessionStore(data_dir=str(data_dir))
+    assert not [r for r in caplog.records if "#295" in r.getMessage()]
     assert not [r for r in caplog.records if "#210" in r.getMessage()]
 
 
@@ -595,16 +620,18 @@ def test_regression_199_r1_no_sdk_loop_still_holds() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None, system_prompt=None, **kwargs):
-        captured["model"] = model
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
+        captured["session_id"] = session_id
+        captured["permission_mode_override"] = permission_mode_override
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(42)
 
-    # The #199 invariant: model is NOT _sdk_model
-    assert captured["model"] != bridge._sdk_model
-    # The #210 strengthening: model is None
-    assert captured["model"] is None
+    # #295: model is no longer a save_session parameter at all — the
+    # #199 "model != _sdk_model" and #210 "model is None" invariants
+    # are subsumed: the field simply doesn't exist in the payload,
+    # which is the strongest possible form of both guarantees.
+    assert "model" not in captured
 
 
 @pytest.mark.asyncio

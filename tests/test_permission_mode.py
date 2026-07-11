@@ -341,8 +341,7 @@ def test_session_store_round_trips_permission_mode_override(tmp_path: Path) -> N
 
     store = SessionStore(data_dir=str(tmp_path))
     store.save_session(
-        thread_id=42, session_id="sess-1", project_path="/tmp/p",
-        model=None, system_prompt="",
+        thread_id=42, session_id="sess-1",
         permission_mode_override="bypassPermissions",
     )
     info = store.get_session_info(42)
@@ -393,16 +392,15 @@ def test_save_session_state_persists_explicit_override() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None,
-                   system_prompt=None, permission_mode_override=None):
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
+        captured["thread_id"] = thread_id
+        captured["session_id"] = session_id
         captured["permission_mode_override"] = permission_mode_override
-        captured["model"] = model
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
     sm.save_session_state(1)
     assert captured["permission_mode_override"] == "plan"
-    # #211 doesn't change the #210 model=None invariant
-    assert captured["model"] is None
+    assert captured["session_id"] == "sess"
 
 
 def test_save_session_state_persists_none_when_no_user_override() -> None:
@@ -420,8 +418,7 @@ def test_save_session_state_persists_none_when_no_user_override() -> None:
 
     captured: dict = {}
 
-    def _fake_save(thread_id, session_id, project_path, *, model=None,
-                   system_prompt=None, permission_mode_override=None):
+    def _fake_save(thread_id, session_id, *, permission_mode_override=None):
         captured["permission_mode_override"] = permission_mode_override
 
     sm._session_store.save_session = _fake_save  # type: ignore[method-assign]
@@ -534,12 +531,18 @@ async def test_session_resume_threads_permission_mode_override() -> None:
     bot.session_manager.get_lock = MagicMock(return_value=MagicMock(
         __aenter__=AsyncMock(), __aexit__=AsyncMock(),
     ))
+    # #295: /session resume now reads project_path + system_prompt from
+    # project_manager (not from stored).
+    bot.project_manager = MagicMock()
+    bot.project_manager.get_path = MagicMock(return_value="/tmp")
+    bot.project_manager.get_system_prompt = MagicMock(return_value="")
     bot.config = _config()
 
     interaction = MagicMock()
     interaction.client = bot
     interaction.channel_id = 99
     interaction.channel = MagicMock()
+    interaction.channel.parent_id = 99
     interaction.response = MagicMock()
     interaction.response.defer = AsyncMock()
     interaction.followup = MagicMock()

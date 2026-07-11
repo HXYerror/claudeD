@@ -95,33 +95,22 @@ class SessionManager:
     def save_session_state(self, thread_id: int) -> None:
         """Persist the current session state for ``thread_id`` to the store.
 
-        #198 PRD §Design line 92: persist ONLY the user-explicit override
-        (``bridge.explicit_model_override``), not the collapsed
-        ``bridge.model`` property. The collapsed property includes
-        ``_sdk_model`` (what the SDK reported back), and persisting it
-        would lock future resumes onto the SDK-observed value even after
-        the user edits ``~/.claude/settings.json``.
+        #295: The store now holds only ``session_id`` and
+        ``permission_mode_override`` (plus ``last_active``). The former
+        shadow fields (``project_path``, ``system_prompt``, ``model``)
+        have canonical sources on ``ProjectManager`` / are already
+        deprecated (#210), so we no longer duplicate them here.
 
-        #210: After the read-side stopped reading ``stored.get("model")``
-        (see ``bot.py`` thread-resume and ``cogs/session.py`` /session
-        resume), the persisted ``model`` field is purely vestigial — it
-        is never consumed. To keep new rows clearly distinguishable from
-        legacy "sonnet"-polluted rows during forensic inspection, we now
-        always write ``model=None`` regardless of the explicit override.
-        ``/model switch`` is intentionally ephemeral per user intent;
-        cross-restart, the user re-runs ``/model switch`` if they want
-        it again.
+        #211 semantics preserved: we persist ONLY the user-explicit
+        override (``bridge.permission_mode_override``). Missing/None
+        means the user has not run ``/mode set`` / cycle on this thread
+        and readers should fall back to env / CLI settings.
         """
         bridge = self._sessions.get(thread_id)
         if bridge and bridge.session_id:
             self._session_store.save_session(
-                thread_id, bridge.session_id, bridge.project_path,
-                model=None,  # #210: ephemeral; read-side ignores this field
-                system_prompt=bridge.system_prompt,
-                # #211: persist the user-explicit override (None when
-                # they've never run /mode set on this thread; the
-                # SessionStore happily round-trips None for legacy rows
-                # / unset cases).
+                thread_id,
+                bridge.session_id,
                 permission_mode_override=getattr(
                     bridge, "permission_mode_override", None
                 ),
