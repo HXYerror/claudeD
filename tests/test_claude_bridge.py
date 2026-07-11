@@ -184,7 +184,8 @@ def test_bridge_default_session_config(cfg: Config) -> None:
     """ClaudeBridge uses default SessionConfig when none is provided."""
     bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
     assert bridge.system_prompt is None
-    assert bridge._effort is None
+    # #291: default effort is now "max" (configurable via CLAUDED_DEFAULT_EFFORT)
+    assert bridge._effort == "max"
     assert bridge._user is None
 
 

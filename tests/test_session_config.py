@@ -13,7 +13,8 @@ def test_default_values():
     assert sc.system_prompt is None
     assert sc.model_override is None
     assert sc.resume_session_id is None
-    assert sc.effort is None
+    # effort default is now driven by CLAUDED_DEFAULT_EFFORT env (see #291);
+    # covered by dedicated tests below.
     assert sc.allowed_tools == []
     assert sc.disallowed_tools == []
     assert sc.max_budget_usd is None
@@ -225,3 +226,21 @@ def test_bridge_stores_bare_and_session_name():
     bridge = ClaudeBridge(project_path="/tmp/p", config=cfg, session_config=sc)
     assert bridge._bare is True
     assert bridge._session_name == "test-session"
+
+
+def test_effort_default_is_max(monkeypatch):
+    """AC1: effort defaults to 'max' when CLAUDED_DEFAULT_EFFORT is unset."""
+    monkeypatch.delenv("CLAUDED_DEFAULT_EFFORT", raising=False)
+    sc = SessionConfig()
+    assert sc.effort == "max"
+
+
+def test_effort_env_override(monkeypatch):
+    """AC3: CLAUDED_DEFAULT_EFFORT env overrides the default."""
+    monkeypatch.setenv("CLAUDED_DEFAULT_EFFORT", "high")
+    sc = SessionConfig()
+    assert sc.effort == "high"
+
+    monkeypatch.setenv("CLAUDED_DEFAULT_EFFORT", "low")
+    sc2 = SessionConfig()
+    assert sc2.effort == "low"
