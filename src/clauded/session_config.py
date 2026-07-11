@@ -1,6 +1,7 @@
 """Session configuration dataclass — replaces 25+ kwargs threading."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,7 +14,7 @@ class SessionConfig:
     model_override: str | None = None
     permission_mode_override: str | None = None
     resume_session_id: str | None = None
-    effort: str | None = None
+    effort: str | None = field(default_factory=lambda: os.environ.get("CLAUDED_DEFAULT_EFFORT", "max"))
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
     max_budget_usd: float | None = None
