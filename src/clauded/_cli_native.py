@@ -81,14 +81,15 @@ def write_agent_md(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     desc_line = (description or "").replace("\r", " ").replace("\n", " ")
-    # C2: YAML-escape name and description to prevent frontmatter injection
-    safe_name = name.replace('"', '\\"')
-    safe_desc = desc_line.replace('"', '\\"')
+    # C2: YAML-safe quoting via json.dumps (handles \, ", etc.)
+    import json
+    safe_name = json.dumps(name)  # produces "name" with proper escapes
+    safe_desc = json.dumps(desc_line)
     body = prompt or ""
     # Ensure trailing newline so ``cat`` / editors behave.
     if body and not body.endswith("\n"):
         body = body + "\n"
-    content = f'---\nname: "{safe_name}"\ndescription: "{safe_desc}"\n---\n{body}'
+    content = f'---\nname: {safe_name}\ndescription: {safe_desc}\n---\n{body}'
 
     tmp = target.with_suffix(f".{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
