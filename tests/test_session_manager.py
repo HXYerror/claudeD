@@ -357,40 +357,62 @@ async def test_create_session_with_user(cfg: Config, tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# #301: early session_id persistence
+# #301 R2: session_id persistence via _on_session_id_cb callback
 # ---------------------------------------------------------------------------
 
 
-class _FakeBridgeWithSessionId(_FakeBridge):
-    """Like ``_FakeBridge`` but returns a real ``session_id`` after start."""
+class _FakeBridgeWithCallback(_FakeBridge):
+    """Like ``_FakeBridge`` but supports ``_on_session_id_cb``."""
 
-    _fake_session_id = "sess-early-persist-test"
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._session_id: str | None = None
+        self._on_session_id_cb = None
 
     @property
     def session_id(self) -> str | None:  # type: ignore[override]
-        return self._fake_session_id if self.started else None
+        return self._session_id
+
+    def simulate_first_result_message(self, sid: str) -> None:
+        """Mimic what ``_update_stats`` does on the first ResultMessage."""
+        first_time = self._session_id is None
+        self._session_id = sid
+        if first_time and self._on_session_id_cb is not None:
+            self._on_session_id_cb(sid)
 
 
 @pytest.mark.asyncio
-async def test_session_id_persisted_immediately_after_create(
+async def test_session_id_persisted_on_first_result_message(
     cfg: Config, tmp_path, monkeypatch,
 ) -> None:
-    """#301: session_id must appear in sessions.json right after create_session,
-    before any ResultMessage is processed."""
+    """#301 R2: session_id must be persisted the moment the first
+    ResultMessage arrives (via the _on_session_id_cb callback), not after
+    render_response finishes."""
     monkeypatch.setattr(
-        "clauded.session_manager.ClaudeBridge", _FakeBridgeWithSessionId
+        "clauded.session_manager.ClaudeBridge", _FakeBridgeWithCallback
     )
     store = SessionStore(data_dir=str(tmp_path / "store301"))
     sm = SessionManager(session_store=store)
 
     bridge = await sm.create_session(99, "/tmp/p", cfg)
-    assert bridge.session_id == "sess-early-persist-test"
+    assert bridge.session_id is None  # no session_id yet
 
-    # Simulate what bot.py now does immediately after create_session (#301).
-    if bridge and bridge.session_id:
-        sm.save_session_state(99)
+    # Wire the callback — same as bot.py does after create_session.
+    bridge._on_session_id_cb = lambda sid: sm.save_session_state(99)
 
-    # The session_id must be on disk — no ResultMessage needed.
+    # Simulate streaming: first ResultMessage carries a session_id.
+    bridge.simulate_first_result_message("sess-from-stream-001")
+
+    assert bridge.session_id == "sess-from-stream-001"
+
+    # The callback should have persisted it immediately.
     stored = store.get_session_info(99)
     assert stored is not None, "session entry missing from store"
-    assert stored["session_id"] == "sess-early-persist-test"
+    assert stored["session_id"] == "sess-from-stream-001"
+
+    # A second ResultMessage must NOT re-fire the callback.
+    bridge._on_session_id_cb = lambda sid: (_ for _ in ()).throw(
+        AssertionError("callback fired twice")
+    )
+    bridge.simulate_first_result_message("sess-from-stream-002")
+    assert bridge.session_id == "sess-from-stream-002"  # updated

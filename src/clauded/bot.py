@@ -896,6 +896,7 @@ class ClaudedBot(commands.Bot):
                     self.config,
                     sc,
                 )
+                self._wire_session_persist_cb(bridge, thread.id)
             except Exception as exc:
                 log.exception("Failed to start ClaudeBridge")
                 err_embed = discord.Embed(
@@ -906,10 +907,6 @@ class ClaudedBot(commands.Bot):
                 # #148 architect §3 — retry-aware send (transient blip survival).
                 await safe_send_message(thread, embed=err_embed)
                 return
-
-            # #301: persist session_id immediately so mid-turn kill won't lose it.
-            if bridge and bridge.session_id:
-                self.session_manager.save_session_state(thread.id)
 
             # Feature #66: Add hourglass reaction (#245: safe wrapper)
             await safe_add_reaction(message, "⏳")
@@ -1106,6 +1103,7 @@ class ClaudedBot(commands.Bot):
                         self.config,
                         sc,
                     )
+                    self._wire_session_persist_cb(bridge, thread_id)
                 except Exception as exc:
                     log.exception("Failed to start ClaudeBridge for thread=%s", thread_id)
                     err_embed = discord.Embed(
@@ -1116,10 +1114,6 @@ class ClaudedBot(commands.Bot):
                     # #148 architect §3 — retry-aware send (transient blip survival).
                     await safe_send_message(message.channel, embed=err_embed)
                     return
-
-            # #301: persist session_id immediately so mid-turn kill won't lose it.
-            if bridge and bridge.session_id:
-                self.session_manager.save_session_state(thread_id)
 
             # Feature #66: Add hourglass reaction (#245: safe wrapper)
             await safe_add_reaction(message, "⏳")
@@ -1292,6 +1286,10 @@ class ClaudedBot(commands.Bot):
             return stored.get("session_id")
         return None
 
+    def _wire_session_persist_cb(self, bridge: "ClaudeBridge", thread_id: int) -> None:
+        """#301 R2: persist session_id the moment the first ResultMessage arrives."""
+        bridge._on_session_id_cb = lambda sid: self.session_manager.save_session_state(thread_id)
+
     async def _recreate_session(
         self,
         interaction: discord.Interaction,
@@ -1373,6 +1371,7 @@ class ClaudedBot(commands.Bot):
                 bridge = await self.session_manager.create_session(
                     thread_id, project_path, self.config, sc,
                 )
+                self._wire_session_persist_cb(bridge, thread_id)
             except Exception as exc:
                 await interaction.followup.send(
                     embed=discord.Embed(
@@ -1383,9 +1382,6 @@ class ClaudedBot(commands.Bot):
                     ephemeral=True,
                 )
                 return None
-            # #301: persist session_id immediately so mid-turn kill won't lose it.
-            if bridge and bridge.session_id:
-                self.session_manager.save_session_state(thread_id)
         return bridge
 
     async def _render_with_retry(
@@ -1500,6 +1496,7 @@ class ClaudedBot(commands.Bot):
                             self.config,
                             retry_sc,
                         )
+                        self._wire_session_persist_cb(new_bridge, thread_id)
                     except Exception as start_exc:
                         log.exception("Retry: failed to restart ClaudeBridge")
                         err_embed = discord.Embed(
@@ -1511,9 +1508,6 @@ class ClaudedBot(commands.Bot):
                         # blip; on permanent failure we silently drop.
                         await safe_send_message(thread, embed=err_embed)
                         return
-                    # #301: persist session_id immediately so mid-turn kill won't lose it.
-                    if new_bridge and new_bridge.session_id:
-                        self.session_manager.save_session_state(thread_id)
                     new_renderer = DiscordRenderer(thread, bot=self, project_path=Path(project_path) if project_path else None)
                     await self._render_with_retry(
                         renderer=new_renderer,
@@ -1800,10 +1794,7 @@ class ClaudedBot(commands.Bot):
             bridge = await self.session_manager.create_session(
                 thread_id, project_path, self.config, sc,
             )
-
-        # #301: persist session_id immediately so mid-turn kill won't lose it.
-        if bridge and bridge.session_id:
-            self.session_manager.save_session_state(thread_id)
+            self._wire_session_persist_cb(bridge, thread_id)
 
         self._register_scheduler_ctx(
             thread_id=thread_id,
@@ -1956,10 +1947,7 @@ class ClaudedBot(commands.Bot):
         bridge = await self.session_manager.create_session(
             thread.id, project_path, self.config, sc,
         )
-
-        # #301: persist session_id immediately so mid-turn kill won't lose it.
-        if bridge and bridge.session_id:
-            self.session_manager.save_session_state(thread.id)
+        self._wire_session_persist_cb(bridge, thread.id)
 
         self._register_scheduler_ctx(
             thread_id=thread.id,
