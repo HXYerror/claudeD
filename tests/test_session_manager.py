@@ -354,3 +354,43 @@ async def test_create_session_with_user(cfg: Config, tmp_path) -> None:
     bridge = await sm.create_session(60, "/tmp/p", cfg, sc)
     assert bridge.user == "testuser#1234"
     assert bridge.started
+
+
+# ---------------------------------------------------------------------------
+# #301: early session_id persistence
+# ---------------------------------------------------------------------------
+
+
+class _FakeBridgeWithSessionId(_FakeBridge):
+    """Like ``_FakeBridge`` but returns a real ``session_id`` after start."""
+
+    _fake_session_id = "sess-early-persist-test"
+
+    @property
+    def session_id(self) -> str | None:  # type: ignore[override]
+        return self._fake_session_id if self.started else None
+
+
+@pytest.mark.asyncio
+async def test_session_id_persisted_immediately_after_create(
+    cfg: Config, tmp_path, monkeypatch,
+) -> None:
+    """#301: session_id must appear in sessions.json right after create_session,
+    before any ResultMessage is processed."""
+    monkeypatch.setattr(
+        "clauded.session_manager.ClaudeBridge", _FakeBridgeWithSessionId
+    )
+    store = SessionStore(data_dir=str(tmp_path / "store301"))
+    sm = SessionManager(session_store=store)
+
+    bridge = await sm.create_session(99, "/tmp/p", cfg)
+    assert bridge.session_id == "sess-early-persist-test"
+
+    # Simulate what bot.py now does immediately after create_session (#301).
+    if bridge and bridge.session_id:
+        sm.save_session_state(99)
+
+    # The session_id must be on disk — no ResultMessage needed.
+    stored = store.get_session_info(99)
+    assert stored is not None, "session entry missing from store"
+    assert stored["session_id"] == "sess-early-persist-test"
