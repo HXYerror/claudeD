@@ -343,6 +343,9 @@ class ClaudedBot(commands.Bot):
         # message in a 3rd-party thread. Set of thread_ids we've already
         # logged the ownership-skip for; cleared on bot restart.
         self._logged_third_party_thread: set[int] = set()
+        # #292 S3: bot-level workflow task registry. DiscordRenderer writes
+        # task lifecycle states here (via self._bot ref); /workflow cog reads.
+        self._workflow_tasks: dict = {}
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -548,6 +551,8 @@ class ClaudedBot(commands.Bot):
         from .cogs.log_dump import log_group
         # #241: /schedule group (message/new_task/list/delete/toggle).
         from .cogs.schedule import schedule_group
+        # #292 S3: /workflow group (list/kill/detail).
+        from .cogs.workflow import workflow_group
 
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
@@ -580,6 +585,8 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(log_group)
         # #241: /schedule group (message/new_task/list/delete/toggle)
         self.tree.add_command(schedule_group)
+        # #292 S3: /workflow group (list/kill/detail)
+        self.tree.add_command(workflow_group)
         # #185: do NOT sync globally here — historically claudeD synced
         # via both ``tree.sync()`` (global) AND PR-specific per-guild
         # PUT calls, so commands ended up registered in BOTH scopes and

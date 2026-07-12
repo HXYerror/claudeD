@@ -738,6 +738,27 @@ class DiscordRenderer:
         self._task_states: dict[str, _TaskState] = {}
 
     # ------------------------------------------------------------------
+    # #292 S3: sync task lifecycle state to bot-level registry
+    # ------------------------------------------------------------------
+
+    def _sync_task_to_bot(self, task_id: str, state: _TaskState | None) -> None:
+        """Write/remove a task state entry in ``bot._workflow_tasks``.
+
+        Called from TaskStarted (write), TaskNotification/TaskUpdated (remove).
+        The bot-level dict is what ``/workflow list|detail|kill`` reads.
+        """
+        bot = self._bot
+        if bot is None:
+            return
+        wt = getattr(bot, "_workflow_tasks", None)
+        if wt is None:
+            return
+        if state is None:
+            wt.pop(task_id, None)
+        else:
+            wt[task_id] = state
+
+    # ------------------------------------------------------------------
     # Helper: build a tool embed from a ToolUseBlock
     # ------------------------------------------------------------------
 
@@ -844,7 +865,7 @@ class DiscordRenderer:
             target_renderer = subagent_renderers[tool_use_id]
 
         msg = await target_renderer._safe_send(embed=embed)
-        self._task_states[task_id] = _TaskState(
+        state = _TaskState(
             description=description,
             task_type=task_type,
             tool_use_id=tool_use_id,
@@ -853,6 +874,8 @@ class DiscordRenderer:
             last_edit_at=0.0,
             last_usage=None,
         )
+        self._task_states[task_id] = state
+        self._sync_task_to_bot(task_id, state)
 
     async def _handle_task_progress(
         self,
@@ -963,6 +986,7 @@ class DiscordRenderer:
             await self._safe_send(embed=embed)
 
         self._task_states.pop(task_id, None)
+        self._sync_task_to_bot(task_id, None)
 
     async def _handle_task_notification(
         self,
@@ -1104,6 +1128,9 @@ class DiscordRenderer:
         # #292 Dynamic Workflow: reset per-turn task lifecycle state.
         # Instance-level dict so /workflow commands can query across turns;
         # cleared at each new render_response invocation.
+        # Also clean bot-level registry for any stale tasks from this renderer.
+        for stale_id in list(self._task_states):
+            self._sync_task_to_bot(stale_id, None)
         self._task_states.clear()
 
         result_received = False
