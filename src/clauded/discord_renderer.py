@@ -888,19 +888,23 @@ class DiscordRenderer:
         if state.message is None:
             return
 
+        # Build usage stats for inline display
+        usage = state.last_usage or {}
+        tokens = int(usage.get("total_tokens", 0) or 0)
+        tool_uses = int(usage.get("tool_uses", 0) or 0)
+        duration_ms = int(usage.get("duration_ms", 0) or 0)
+        duration = f"{duration_ms / 1000:.1f}" if duration_ms >= 1000 else f"{duration_ms / 1000:.1f}"
+
         embed = discord.Embed(
-            title="🔄 Task Running",
-            description=state.description,
+            title="🔄 Dynamic Workflow Running",
+            description=(
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔮 Task: {state.description[:60]}\n"
+                f"💭 Last tool: {last_tool or '—'}\n"
+                f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
+            ),
             color=COLOR_TOOL_RUNNING,
         )
-        footer_bits: list[str] = []
-        if last_tool:
-            footer_bits.append(f"💭 {last_tool}")
-        usage_seg = self._fmt_task_usage(state.last_usage)
-        if usage_seg:
-            footer_bits.append(usage_seg)
-        if footer_bits:
-            embed.set_footer(text=" · ".join(footer_bits))
 
         ok = await self._safe_edit(state.message, embed=embed)
         if ok:
@@ -1102,8 +1106,19 @@ class DiscordRenderer:
         # cleared at each new render_response invocation.
         self._task_states.clear()
 
+        result_received = False
+        drain_deadline = 0.0
+
         try:
             async for event in bridge.send_message(user_text):
+                # AC6: drain timeout check — after ResultMessage, keep
+                # looping only while tasks are still pending and within 5s.
+                if result_received and not self._task_states:
+                    break  # all tasks finished after drain
+                if result_received and time.monotonic() > drain_deadline:
+                    log.warning("#292 drain timeout: %d tasks still pending", len(self._task_states))
+                    break
+
                 _log_stream(event, buffer_len=len(buffer))
 
                 # Tool results can arrive on UserMessage objects too — handle any
@@ -1337,7 +1352,12 @@ class DiscordRenderer:
                     stats["context_percentage"] = await _fetch_context_pct_settled(
                         bridge, log_label="footer"
                     )
-                    break
+                    if not self._task_states:
+                        break  # no pending tasks, exit immediately
+                    # AC6: drain trailing Task* messages for up to 5s
+                    drain_deadline = time.monotonic() + 5.0
+                    result_received = True
+                    continue  # keep looping to catch Task* after Result
 
 
                 # -------------------------------------------------------
