@@ -980,6 +980,10 @@ class DiscordRenderer:
         task_id = getattr(event, "task_id", None)
         if not task_id:
             return
+        # E3: guard against duplicate terminal when Notification already handled
+        if task_id not in task_states:
+            log.debug("TaskUpdated task_id=%s already cleaned; skip", task_id)
+            return
         status = str(getattr(event, "status", "") or "").lower()
         terminal = {"completed", "failed", "killed"}
         if status not in terminal:
