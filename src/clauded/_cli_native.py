@@ -47,8 +47,17 @@ _FILE_LOCK = threading.RLock()
 
 
 def agent_md_path(project_path: Path | str, name: str) -> Path:
-    """Return the canonical path for an agent's ``.md`` under a project."""
-    return Path(project_path) / ".claude" / "agents" / f"{name}.md"
+    """Return the canonical path for an agent's ``.md`` under a project.
+
+    Raises ValueError if name contains path separators or traversal sequences.
+    """
+    # C1 guard: reject path-separator / traversal in name
+    if any(c in name for c in ("/", "\\", "\x00")) or ".." in name:
+        raise ValueError(f"Agent name contains invalid characters: {name!r}")
+    safe_name = name.strip().replace(" ", "-")
+    if not safe_name:
+        raise ValueError("Agent name is empty after sanitization")
+    return Path(project_path) / ".claude" / "agents" / f"{safe_name}.md"
 
 
 def write_agent_md(
@@ -72,11 +81,14 @@ def write_agent_md(
     target.parent.mkdir(parents=True, exist_ok=True)
 
     desc_line = (description or "").replace("\r", " ").replace("\n", " ")
+    # C2: YAML-escape name and description to prevent frontmatter injection
+    safe_name = name.replace('"', '\\"')
+    safe_desc = desc_line.replace('"', '\\"')
     body = prompt or ""
     # Ensure trailing newline so ``cat`` / editors behave.
     if body and not body.endswith("\n"):
         body = body + "\n"
-    content = f"---\nname: {name}\ndescription: {desc_line}\n---\n{body}"
+    content = f'---\nname: "{safe_name}"\ndescription: "{safe_desc}"\n---\n{body}'
 
     tmp = target.with_suffix(f".{os.getpid()}.{secrets.token_hex(4)}.tmp")
     try:
