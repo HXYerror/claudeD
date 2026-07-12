@@ -916,7 +916,7 @@ class DiscordRenderer:
         tokens = int(usage.get("total_tokens", 0) or 0)
         tool_uses = int(usage.get("tool_uses", 0) or 0)
         duration_ms = int(usage.get("duration_ms", 0) or 0)
-        duration = f"{duration_ms / 1000:.1f}" if duration_ms >= 1000 else f"{duration_ms / 1000:.1f}"
+        duration = f"{duration_ms / 1000:.1f}"
 
         embed = discord.Embed(
             title="🔄 Dynamic Workflow Running",
@@ -1124,14 +1124,6 @@ class DiscordRenderer:
         # attachment — only the clicker sees it, zero channel real-estate.
         medium_results: dict[str, tuple[str, str]] = {}
         tool_results_view: ToolResultsView | None = None
-
-        # #292 Dynamic Workflow: reset per-turn task lifecycle state.
-        # Instance-level dict so /workflow commands can query across turns;
-        # cleared at each new render_response invocation.
-        # Also clean bot-level registry for any stale tasks from this renderer.
-        for stale_id in list(self._task_states):
-            self._sync_task_to_bot(stale_id, None)
-        self._task_states.clear()
 
         result_received = False
         drain_deadline = 0.0

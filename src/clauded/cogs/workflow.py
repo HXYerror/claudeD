@@ -19,7 +19,7 @@ import discord
 from discord import app_commands
 
 from ._unbound import USE_IN_THREAD_MESSAGE, resolve_session_id
-from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE, COLOR_TOOL_SUCCESS
+from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
 
