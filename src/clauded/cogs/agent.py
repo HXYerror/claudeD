@@ -207,7 +207,8 @@ async def agent_list(interaction: discord.Interaction) -> None:
         if len(value) > 1024:
             value = value[:1020] + "…"
         embed.add_field(name=aname, value=value, inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    _send = interaction.followup.send if _deferred else interaction.response.send_message
+    await _send(embed=embed, ephemeral=True)
 
 
 @agent_group.command(name="use", description="Use a custom agent in this thread")
