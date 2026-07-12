@@ -129,6 +129,20 @@ def resolve_binding_id(interaction: discord.Interaction) -> int | None:
     return channel.id
 
 
+async def _reply(
+    interaction: discord.Interaction, _deferred: bool, /, **kwargs
+) -> None:
+    """Send a response via followup or initial response based on defer state.
+
+    Eliminates the repeated ``_send = interaction.followup.send if _deferred
+    else interaction.response.send_message`` pattern (#293 R5 DRY).
+    """
+    if _deferred:
+        await interaction.followup.send(**kwargs)
+    else:
+        await interaction.response.send_message(**kwargs)
+
+
 async def reject_if_unbound(interaction: discord.Interaction, bot) -> bool:
     """Refuse Group A commands on unbound channels. Returns True iff refusal sent."""
     # ``resolve_channel_id`` already walks thread → parent for thread

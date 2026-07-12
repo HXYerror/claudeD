@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import discord
 from discord import app_commands
 
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE, COLOR_TOOL_SUCCESS
+
+from ._unbound import _reply
 
 log = logging.getLogger("clauded.bot")
 
@@ -180,10 +183,13 @@ async def model_list(interaction: discord.Interaction) -> None:
     current = _current_model_for_thread(bot, interaction.channel)
     bridge = _resolve_session_bridge(bot, interaction.channel)
 
+    _deferred = False
     sdk_models: list[dict] = []
     if bridge is not None:
+        await interaction.response.defer(ephemeral=True)
+        _deferred = True
         try:
-            info = await bridge.get_server_info()
+            info = await asyncio.wait_for(bridge.get_server_info(), timeout=10)
         except Exception as exc:
             log.debug("/model list: get_server_info failed: %r", exc)
             info = None
@@ -246,7 +252,7 @@ async def model_list(interaction: discord.Interaction) -> None:
         description=header + desc + footer_note,
         color=COLOR_INFO,
     )
-    await interaction.response.send_message(embed=embed)
+    await _reply(interaction, _deferred, embed=embed)
 
 
 @model_group.command(name="current", description="Show current Claude model for this thread")

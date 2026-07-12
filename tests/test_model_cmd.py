@@ -77,10 +77,12 @@ async def test_model_list_with_active_session_marks_current():
     interaction = MagicMock()
     interaction.client = bot_spec
     interaction.channel.id = 99
+    interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
+    interaction.followup.send = AsyncMock()
     await model_list.callback(interaction)
-    interaction.response.send_message.assert_awaited_once()
-    embed = interaction.response.send_message.await_args.kwargs["embed"]
+    interaction.followup.send.assert_awaited_once()
+    embed = interaction.followup.send.await_args.kwargs["embed"]
     assert "Current" in embed.description
     assert "opus" in embed.description
     assert "🟢" in embed.description, f"Current model marker missing; desc={embed.description!r}"
@@ -292,9 +294,11 @@ async def test_model_list_pre_first_turn_shows_unset():
     interaction.client = bot_spec
     interaction.channel = MagicMock(spec=discord.Thread)
     interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
     interaction.response.send_message = AsyncMock()
+    interaction.followup.send = AsyncMock()
     await model_list.callback(interaction)
-    embed = interaction.response.send_message.await_args.kwargs["embed"]
+    embed = interaction.followup.send.await_args.kwargs["embed"]
     assert "unset" in embed.description.lower(), (
         f"Pre-first-turn should show 'unset', got: {embed.description!r}"
     )

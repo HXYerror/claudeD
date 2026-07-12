@@ -8,7 +8,7 @@ import logging
 import discord
 from discord import app_commands
 
-from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
+from ._unbound import NO_CHANNEL_MESSAGE, _reply, reject_if_unbound, resolve_binding_id
 from .. import _cli_native
 from ..discord_renderer import COLOR_INFO
 
@@ -230,9 +230,10 @@ async def mcp_list(interaction: discord.Interaction) -> None:
         if status is not None:
             servers = status.get("mcpServers") or []
             if not servers:
-                _send = interaction.followup.send if _deferred else interaction.response.send_message
-                await _send(
-                    "No MCP servers loaded by the current session.",
+                await _reply(
+                    interaction,
+                    _deferred,
+                    content="No MCP servers loaded by the current session.",
                     ephemeral=True,
                 )
                 return
@@ -247,8 +248,7 @@ async def mcp_list(interaction: discord.Interaction) -> None:
                 if len(field_value) > 1024:
                     field_value = field_value[:1020] + "…"
                 embed.add_field(name=field_name, value=field_value, inline=False)
-            _send = interaction.followup.send if _deferred else interaction.response.send_message
-            await _send(embed=embed, ephemeral=True)
+            await _reply(interaction, _deferred, embed=embed, ephemeral=True)
             return
 
     # --- Path B: no live session → fall back to stored config ---------
@@ -256,14 +256,14 @@ async def mcp_list(interaction: discord.Interaction) -> None:
         return
     binding_id = resolve_binding_id(interaction)
     if binding_id is None:
-        _send = interaction.followup.send if _deferred else interaction.response.send_message
-        await _send(NO_CHANNEL_MESSAGE, ephemeral=True)
+        await _reply(interaction, _deferred, content=NO_CHANNEL_MESSAGE, ephemeral=True)
         return
     servers = bot.project_manager.get_mcp_servers(binding_id)
     if not servers:
-        _send = interaction.followup.send if _deferred else interaction.response.send_message
-        await _send(
-            "No MCP servers configured. "
+        await _reply(
+            interaction,
+            _deferred,
+            content="No MCP servers configured. "
             "-# Start a session to see all servers loaded by the CLI.",
             ephemeral=True,
         )
@@ -283,8 +283,7 @@ async def mcp_list(interaction: discord.Interaction) -> None:
         text="Showing bot-configured servers only. "
         "Start a session to see everything the CLI loaded (project + user + plugins)."
     )
-    _send = interaction.followup.send if _deferred else interaction.response.send_message
-    await _send(embed=embed, ephemeral=True)
+    await _reply(interaction, _deferred, embed=embed, ephemeral=True)
 
 
 @mcp_group.command(name="remove", description="Remove an MCP server")

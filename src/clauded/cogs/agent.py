@@ -9,7 +9,7 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ._unbound import reject_if_unbound, resolve_binding_id, resolve_channel_id
+from ._unbound import _reply, reject_if_unbound, resolve_binding_id, resolve_channel_id
 from .. import _cli_native
 from ..discord_renderer import COLOR_INFO
 
@@ -220,9 +220,10 @@ async def agent_list(interaction: discord.Interaction) -> None:
         }
 
     if not merged:
-        _send = interaction.followup.send if _deferred else interaction.response.send_message
-        await _send(
-            "No agents defined. Use `/agent create` or drop a `.md` file "
+        await _reply(
+            interaction,
+            _deferred,
+            content="No agents defined. Use `/agent create` or drop a `.md` file "
             "in `.claude/agents/`.",
             ephemeral=True,
         )
@@ -239,8 +240,7 @@ async def agent_list(interaction: discord.Interaction) -> None:
         if len(value) > 1024:
             value = value[:1020] + "…"
         embed.add_field(name=aname, value=value, inline=False)
-    _send = interaction.followup.send if _deferred else interaction.response.send_message
-    await _send(embed=embed, ephemeral=True)
+    await _reply(interaction, _deferred, embed=embed, ephemeral=True)
 
 
 @agent_group.command(name="use", description="Use a custom agent in this thread")
