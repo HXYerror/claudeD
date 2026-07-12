@@ -53,21 +53,21 @@ from .claude_bridge import (
 )
 from claude_agent_sdk.types import AssistantMessageError, StreamEvent, UserMessage  # noqa: F401 — AssistantMessageError documents the contract pinned by tests/test_api_error_render.py::test_assistant_message_error_field_exists_on_sdk; runtime detection uses getattr() for duck-typing flexibility.
 
-# #292 Dynamic Workflow events. SDK 0.2.110 ships TaskStarted/Progress/
-# Notification; ``TaskUpdatedMessage`` is not yet in this SDK version so we
-# duck-type it below via class-name + attribute checks. Wrapped in a try
-# for forward-compatibility with older SDKs that lack these entirely — the
-# renderer falls back to the legacy silent-ignore behavior when None.
+# #292 Dynamic Workflow events. SDK 0.2.110 ships all four Task* message
+# types. Wrapped in a try for forward-compatibility with older SDKs that
+# lack these entirely — the renderer falls back to silent-ignore when None.
 try:
     from claude_agent_sdk.types import (  # noqa: F401
         TaskStartedMessage as _SdkTaskStartedMessage,
         TaskProgressMessage as _SdkTaskProgressMessage,
         TaskNotificationMessage as _SdkTaskNotificationMessage,
+        TaskUpdatedMessage as _SdkTaskUpdatedMessage,
     )
 except ImportError:  # pragma: no cover — legacy SDK
     _SdkTaskStartedMessage = None  # type: ignore[assignment,misc]
     _SdkTaskProgressMessage = None  # type: ignore[assignment,misc]
     _SdkTaskNotificationMessage = None  # type: ignore[assignment,misc]
+    _SdkTaskUpdatedMessage = None  # type: ignore[assignment,misc]
 from .stream_logger import log_event as _log_stream
 from .cogs._table_view import CopyTableTextView
 from ._errors import is_transient_discord_error
@@ -242,6 +242,7 @@ COLOR_TOOL_FAILURE = 0xEF4444  # Red — tool failed / error
 _WEBSEARCH_TITLE_PREFIX = "🔍 Searching: "
 COLOR_INFO = 0x3B82F6          # Blue — info / commands
 COLOR_THINKING = 0x6B7280      # Gray — thinking
+COLOR_WORKFLOW = 0x8B5CF6      # Purple — Dynamic Workflow banner
 
 # Discord caps message content at 2000 characters; we leave a small margin so
 # we can append a cursor or close-and-reopen a code fence safely.
@@ -732,6 +733,30 @@ class DiscordRenderer:
         # Message.edit() is not in-place; reading msg.content post-edit returns
         # stale text. See docs/investigations/stale-message-content.md (#113).
         self._last_msg_text: str = ""
+        # #292 Dynamic Workflow: per-task lifecycle state keyed by task_id.
+        # Instance-level so /workflow commands can inspect across turns.
+        self._task_states: dict[str, _TaskState] = {}
+
+    # ------------------------------------------------------------------
+    # #292 S3: sync task lifecycle state to bot-level registry
+    # ------------------------------------------------------------------
+
+    def _sync_task_to_bot(self, task_id: str, state: _TaskState | None) -> None:
+        """Write/remove a task state entry in ``bot._workflow_tasks``.
+
+        Called from TaskStarted (write), TaskNotification/TaskUpdated (remove).
+        The bot-level dict is what ``/workflow list|detail|kill`` reads.
+        """
+        bot = self._bot
+        if bot is None:
+            return
+        wt = getattr(bot, "_workflow_tasks", None)
+        if wt is None:
+            return
+        if state is None:
+            wt.pop(task_id, None)
+        else:
+            wt[task_id] = state
 
     # ------------------------------------------------------------------
     # Helper: build a tool embed from a ToolUseBlock
@@ -804,7 +829,6 @@ class DiscordRenderer:
     async def _handle_task_started(
         self,
         event: Any,
-        task_states: dict[str, _TaskState],
         subagent_renderers: dict[str, "DiscordRenderer"],
     ) -> None:
         """Render a 🚀 embed for a newly-launched Dynamic Workflow subtask.
@@ -823,17 +847,16 @@ class DiscordRenderer:
         task_type = getattr(event, "task_type", None)
         tool_use_id = getattr(event, "tool_use_id", None)
 
-        footer_bits: list[str] = []
-        if task_type:
-            footer_bits.append(str(task_type))
-        footer_bits.append(f"id={str(task_id)[:8]}")
-
         embed = discord.Embed(
-            title="🚀 Task Started",
-            description=description,
-            color=COLOR_INFO,
+            title="⚡ Dynamic Workflow Started",
+            description=(
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔮 Task: {description[:60]}\n"
+                f"🤖 Type: {task_type or 'workflow'}\n"
+                f"📋 ID: `{task_id[:8]}`"
+            ),
+            color=COLOR_WORKFLOW,
         )
-        embed.set_footer(text=" · ".join(footer_bits))
 
         # Route to sub-agent thread if this task belongs to one; otherwise
         # main target. Preserves the existing #172 grouping discipline.
@@ -842,7 +865,7 @@ class DiscordRenderer:
             target_renderer = subagent_renderers[tool_use_id]
 
         msg = await target_renderer._safe_send(embed=embed)
-        task_states[task_id] = _TaskState(
+        state = _TaskState(
             description=description,
             task_type=task_type,
             tool_use_id=tool_use_id,
@@ -851,11 +874,12 @@ class DiscordRenderer:
             last_edit_at=0.0,
             last_usage=None,
         )
+        self._task_states[task_id] = state
+        self._sync_task_to_bot(task_id, state)
 
     async def _handle_task_progress(
         self,
         event: Any,
-        task_states: dict[str, _TaskState],
     ) -> None:
         """Edit the task's message with fresh usage stats, throttled.
 
@@ -869,7 +893,7 @@ class DiscordRenderer:
         task_id = getattr(event, "task_id", None)
         if not task_id:
             return
-        state = task_states.get(task_id)
+        state = self._task_states.get(task_id)
         if state is None:
             # Progress before Started — SDK ordering violation. Log and
             # skip; we don't have a message to edit.
@@ -887,19 +911,23 @@ class DiscordRenderer:
         if state.message is None:
             return
 
+        # Build usage stats for inline display
+        usage = state.last_usage or {}
+        tokens = int(usage.get("total_tokens", 0) or 0)
+        tool_uses = int(usage.get("tool_uses", 0) or 0)
+        duration_ms = int(usage.get("duration_ms", 0) or 0)
+        duration = f"{duration_ms / 1000:.1f}"
+
         embed = discord.Embed(
-            title="🔄 Task Running",
-            description=state.description,
+            title="🔄 Dynamic Workflow Running",
+            description=(
+                "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔮 Task: {state.description[:60]}\n"
+                f"💭 Last tool: {last_tool or '—'}\n"
+                f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
+            ),
             color=COLOR_TOOL_RUNNING,
         )
-        footer_bits: list[str] = []
-        if last_tool:
-            footer_bits.append(f"💭 {last_tool}")
-        usage_seg = self._fmt_task_usage(state.last_usage)
-        if usage_seg:
-            footer_bits.append(usage_seg)
-        if footer_bits:
-            embed.set_footer(text=" · ".join(footer_bits))
 
         ok = await self._safe_edit(state.message, embed=embed)
         if ok:
@@ -911,7 +939,6 @@ class DiscordRenderer:
         status: str,
         description: str,
         usage: dict | None,
-        task_states: dict[str, _TaskState],
     ) -> None:
         """Render a terminal (✅/❌/⏹️) task embed and drop the task from state.
 
@@ -927,8 +954,8 @@ class DiscordRenderer:
         Prefers ``_safe_edit`` on the existing task-state message when we
         have one (keeps the whole subtask on a single Discord slot); falls
         back to ``_safe_send`` if state was lost or the initial send never
-        succeeded. Always pops the task from ``task_states`` so subsequent
-        events for the same ``task_id`` are ignored.
+        succeeded. Always pops the task from ``self._task_states`` so
+        subsequent events for the same ``task_id`` are ignored.
         """
         if status == "completed":
             title = "✅ Task Complete"
@@ -951,19 +978,19 @@ class DiscordRenderer:
         if usage_seg:
             embed.set_footer(text=usage_seg)
 
-        state = task_states.get(task_id)
+        state = self._task_states.get(task_id)
         edited = False
         if state and state.message is not None:
             edited = await self._safe_edit(state.message, embed=embed)
         if not edited:
             await self._safe_send(embed=embed)
 
-        task_states.pop(task_id, None)
+        self._task_states.pop(task_id, None)
+        self._sync_task_to_bot(task_id, None)
 
     async def _handle_task_notification(
         self,
         event: Any,
-        task_states: dict[str, _TaskState],
     ) -> None:
         """Render the terminal (✅/❌/⏹️) embed and drop the task from state.
 
@@ -983,7 +1010,7 @@ class DiscordRenderer:
         summary = (getattr(event, "summary", "") or "")[:3800]
         usage = getattr(event, "usage", None)
 
-        state = task_states.get(task_id)
+        state = self._task_states.get(task_id)
         description = summary or (state.description if state else "")
         # Prefer the terminal usage payload; fall back to the last known
         # progress snapshot so we never show an empty footer when the SDK
@@ -991,21 +1018,19 @@ class DiscordRenderer:
         effective_usage = usage if isinstance(usage, dict) else (state.last_usage if state else None)
 
         await self._render_terminal_task(
-            task_id, status, description, effective_usage, task_states
+            task_id, status, description, effective_usage,
         )
 
     async def _handle_task_updated(
         self,
         event: Any,
-        task_states: dict[str, _TaskState],
     ) -> None:
         """Handle ``TaskUpdatedMessage`` — the ``killed`` fallback for
         stopped-in-background tasks that never emit a Notification.
 
-        The SDK 0.2.110 shipped in this repo does *not* export
-        ``TaskUpdatedMessage`` yet, which is why callers route here via
-        duck-typing (class-name + ``hasattr(task_id)`` check). When it does
-        appear, ``event.status`` is one of ``pending``/``running``/
+        SDK 0.2.110 now exports ``TaskUpdatedMessage`` so callers use
+        ``isinstance`` dispatch. ``event.status`` is one of ``pending``/
+        ``running``/
         ``paused``/``completed``/``failed``/``killed``; we only act on
         terminal states — non-terminal patches are logged and left to the
         Progress stream. Rendering itself is delegated to
@@ -1015,7 +1040,7 @@ class DiscordRenderer:
         if not task_id:
             return
         # E3: guard against duplicate terminal when Notification already handled
-        if task_id not in task_states:
+        if task_id not in self._task_states:
             log.debug("TaskUpdated task_id=%s already cleaned; skip", task_id)
             return
         status = str(getattr(event, "status", "") or "").lower()
@@ -1024,27 +1049,13 @@ class DiscordRenderer:
             log.debug("TaskUpdated non-terminal status=%s task_id=%s; skip", status, task_id)
             return
 
-        state = task_states.get(task_id)
+        state = self._task_states.get(task_id)
         description = state.description if state else "Task terminated"
         usage = state.last_usage if state else None
 
         await self._render_terminal_task(
-            task_id, status, description, usage, task_states
+            task_id, status, description, usage,
         )
-
-    @staticmethod
-    def _is_task_updated_message(event: Any) -> bool:
-        """Duck-type check for ``TaskUpdatedMessage`` (SDK 0.2.110 doesn't
-        export the class yet — see #292 PRD "SDK types" note). Any message
-        whose class name is ``TaskUpdatedMessage`` and which carries both
-        ``task_id`` and a ``patch`` attribute is treated as one. Guarded
-        against the three isinstance-detected classes so we don't
-        double-dispatch when a future SDK subclass overlaps.
-        """
-        cls_name = type(event).__name__
-        if cls_name != "TaskUpdatedMessage":
-            return False
-        return hasattr(event, "task_id") and hasattr(event, "patch")
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -1114,17 +1125,19 @@ class DiscordRenderer:
         medium_results: dict[str, tuple[str, str]] = {}
         tool_results_view: ToolResultsView | None = None
 
-        # #292 Dynamic Workflow: per-task lifecycle state keyed by
-        # ``task_id``. Populated in the TaskStarted branch, drained on
-        # TaskNotification / terminal TaskUpdated. Local to render_response
-        # by design — a single Discord turn's workflow is self-contained;
-        # cross-turn state would need to be lifted to bridge/session (see
-        # PRD "Potential bug" note about ResultMessage-then-TaskNotification
-        # races for long-running background tasks).
-        task_states: dict[str, _TaskState] = {}
+        result_received = False
+        drain_deadline = 0.0
 
         try:
             async for event in bridge.send_message(user_text):
+                # AC6: drain timeout check — after ResultMessage, keep
+                # looping only while tasks are still pending and within 5s.
+                if result_received and not self._task_states:
+                    break  # all tasks finished after drain
+                if result_received and time.monotonic() > drain_deadline:
+                    log.warning("#292 drain timeout: %d tasks still pending", len(self._task_states))
+                    break
+
                 _log_stream(event, buffer_len=len(buffer))
 
                 # Tool results can arrive on UserMessage objects too — handle any
@@ -1309,20 +1322,20 @@ class DiscordRenderer:
                 # sub-agent execution. Handlers own the entire render for
                 # these events — no ``content`` list to feed the main
                 # AssistantMessage/UserMessage branches below. The order
-                # matters: TaskUpdated is duck-typed and *must* run last
-                # so a future SDK subclass overlap doesn't shadow the
-                # isinstance-matched types above it.
+                # matters: TaskUpdated must run last so a future SDK
+                # subclass overlap doesn't shadow the isinstance-matched
+                # types above it.
                 if _SdkTaskStartedMessage is not None and isinstance(event, _SdkTaskStartedMessage):
-                    await self._handle_task_started(event, task_states, subagent_renderers)
+                    await self._handle_task_started(event, subagent_renderers)
                     continue
                 if _SdkTaskProgressMessage is not None and isinstance(event, _SdkTaskProgressMessage):
-                    await self._handle_task_progress(event, task_states)
+                    await self._handle_task_progress(event)
                     continue
                 if _SdkTaskNotificationMessage is not None and isinstance(event, _SdkTaskNotificationMessage):
-                    await self._handle_task_notification(event, task_states)
+                    await self._handle_task_notification(event)
                     continue
-                if self._is_task_updated_message(event):
-                    await self._handle_task_updated(event, task_states)
+                if _SdkTaskUpdatedMessage is not None and isinstance(event, _SdkTaskUpdatedMessage):
+                    await self._handle_task_updated(event)
                     continue
 
                 if isinstance(event, ResultMessage):
@@ -1358,7 +1371,12 @@ class DiscordRenderer:
                     stats["context_percentage"] = await _fetch_context_pct_settled(
                         bridge, log_label="footer"
                     )
-                    break
+                    if not self._task_states:
+                        break  # no pending tasks, exit immediately
+                    # AC6: drain trailing Task* messages for up to 5s
+                    drain_deadline = time.monotonic() + 5.0
+                    result_received = True
+                    continue  # keep looping to catch Task* after Result
 
 
                 # -------------------------------------------------------
@@ -4079,4 +4097,5 @@ __all__ = [
     "COLOR_TOOL_FAILURE",
     "COLOR_INFO",
     "COLOR_THINKING",
+    "COLOR_WORKFLOW",
 ]

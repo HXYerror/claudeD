@@ -762,6 +762,12 @@ class ClaudeBridge:
             log.warning("Failed to interrupt Claude session", exc_info=True)
             return False
 
+    async def stop_task(self, task_id: str) -> None:
+        """Stop a running dynamic workflow task."""
+        if self._client is None:
+            raise RuntimeError("bridge not active")
+        await self._client.stop_task(task_id)
+
     async def stop(self) -> None:
         """Stop the bridge, force-dropping after CLAUDED_BRIDGE_STOP_TIMEOUT (default 30s).
 
