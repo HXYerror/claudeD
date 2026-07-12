@@ -905,6 +905,61 @@ class DiscordRenderer:
         if ok:
             state.last_edit_at = now
 
+    async def _render_terminal_task(
+        self,
+        task_id: str,
+        status: str,
+        description: str,
+        usage: dict | None,
+        task_states: dict[str, _TaskState],
+    ) -> None:
+        """Render a terminal (✅/❌/⏹️) task embed and drop the task from state.
+
+        Shared body for :meth:`_handle_task_notification` (source:
+        ``TaskNotificationMessage`` with statuses ``completed`` / ``failed``
+        / ``stopped``) and :meth:`_handle_task_updated` (source:
+        ``TaskUpdatedMessage`` with terminal statuses ``completed`` /
+        ``failed`` / ``killed``). Callers are responsible for extracting
+        ``status`` / ``description`` / ``usage`` from their event and for
+        any pre-flight guards (e.g. the updated handler's E3 duplicate-skip
+        and non-terminal-status filter).
+
+        Prefers ``_safe_edit`` on the existing task-state message when we
+        have one (keeps the whole subtask on a single Discord slot); falls
+        back to ``_safe_send`` if state was lost or the initial send never
+        succeeded. Always pops the task from ``task_states`` so subsequent
+        events for the same ``task_id`` are ignored.
+        """
+        if status == "completed":
+            title = "✅ Task Complete"
+            color = COLOR_TOOL_SUCCESS
+        elif status == "failed":
+            title = "❌ Task Failed"
+            color = COLOR_TOOL_FAILURE
+        elif status == "stopped":
+            title = "⏹️ Task Stopped"
+            color = COLOR_THINKING
+        elif status == "killed":
+            title = "⏹️ Task Killed"
+            color = COLOR_THINKING
+        else:
+            title = f"ℹ️ Task ({status or 'unknown'})"
+            color = COLOR_INFO
+
+        embed = discord.Embed(title=title, description=description, color=color)
+        usage_seg = self._fmt_task_usage(usage)
+        if usage_seg:
+            embed.set_footer(text=usage_seg)
+
+        state = task_states.get(task_id)
+        edited = False
+        if state and state.message is not None:
+            edited = await self._safe_edit(state.message, embed=embed)
+        if not edited:
+            await self._safe_send(embed=embed)
+
+        task_states.pop(task_id, None)
+
     async def _handle_task_notification(
         self,
         event: Any,
@@ -917,9 +972,9 @@ class DiscordRenderer:
         subagent; we cap it at 3800 chars to leave headroom under Discord's
         4096 description limit for the title + emoji.
 
-        Uses ``_safe_edit`` on the existing message when we have one (keeps
-        the whole subtask on a single Discord slot); falls back to
-        ``_safe_send`` if the state was lost or the send never succeeded.
+        Delegates the embed/edit/cleanup dance to
+        :meth:`_render_terminal_task` after extracting summary/usage from
+        the event.
         """
         task_id = getattr(event, "task_id", None)
         if not task_id:
@@ -928,38 +983,16 @@ class DiscordRenderer:
         summary = (getattr(event, "summary", "") or "")[:3800]
         usage = getattr(event, "usage", None)
 
-        if status == "completed":
-            title = "✅ Task Complete"
-            color = COLOR_TOOL_SUCCESS
-        elif status == "failed":
-            title = "❌ Task Failed"
-            color = COLOR_TOOL_FAILURE
-        elif status == "stopped":
-            title = "⏹️ Task Stopped"
-            color = COLOR_THINKING
-        else:
-            title = f"ℹ️ Task ({status or 'unknown'})"
-            color = COLOR_INFO
-
         state = task_states.get(task_id)
         description = summary or (state.description if state else "")
-        embed = discord.Embed(title=title, description=description, color=color)
-
         # Prefer the terminal usage payload; fall back to the last known
         # progress snapshot so we never show an empty footer when the SDK
         # skips ``usage`` on the notification.
         effective_usage = usage if isinstance(usage, dict) else (state.last_usage if state else None)
-        usage_seg = self._fmt_task_usage(effective_usage)
-        if usage_seg:
-            embed.set_footer(text=usage_seg)
 
-        edited = False
-        if state and state.message is not None:
-            edited = await self._safe_edit(state.message, embed=embed)
-        if not edited:
-            await self._safe_send(embed=embed)
-
-        task_states.pop(task_id, None)
+        await self._render_terminal_task(
+            task_id, status, description, effective_usage, task_states
+        )
 
     async def _handle_task_updated(
         self,
@@ -975,7 +1008,8 @@ class DiscordRenderer:
         appear, ``event.status`` is one of ``pending``/``running``/
         ``paused``/``completed``/``failed``/``killed``; we only act on
         terminal states — non-terminal patches are logged and left to the
-        Progress stream.
+        Progress stream. Rendering itself is delegated to
+        :meth:`_render_terminal_task`.
         """
         task_id = getattr(event, "task_id", None)
         if not task_id:
@@ -990,30 +1024,13 @@ class DiscordRenderer:
             log.debug("TaskUpdated non-terminal status=%s task_id=%s; skip", status, task_id)
             return
 
-        if status == "completed":
-            title = "✅ Task Complete"
-            color = COLOR_TOOL_SUCCESS
-        elif status == "failed":
-            title = "❌ Task Failed"
-            color = COLOR_TOOL_FAILURE
-        else:  # killed
-            title = "⏹️ Task Killed"
-            color = COLOR_THINKING
-
         state = task_states.get(task_id)
         description = state.description if state else "Task terminated"
-        embed = discord.Embed(title=title, description=description, color=color)
-        usage_seg = self._fmt_task_usage(state.last_usage if state else None)
-        if usage_seg:
-            embed.set_footer(text=usage_seg)
+        usage = state.last_usage if state else None
 
-        edited = False
-        if state and state.message is not None:
-            edited = await self._safe_edit(state.message, embed=embed)
-        if not edited:
-            await self._safe_send(embed=embed)
-
-        task_states.pop(task_id, None)
+        await self._render_terminal_task(
+            task_id, status, description, usage, task_states
+        )
 
     @staticmethod
     def _is_task_updated_message(event: Any) -> bool:
