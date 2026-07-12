@@ -105,7 +105,7 @@ async def mcp_add(
         description=f"Type: stdio\nCommand: `{command}`" + (f"\nArgs: `{args}`" if args else ""),
         color=COLOR_INFO,
     )
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @mcp_group.command(name="add-url", description="Add an HTTP MCP server")
@@ -157,7 +157,7 @@ async def mcp_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    _deferred = False
 
     # --- Path A: live bridge → SDK's mcp status -----------------------
     session_id = interaction.channel_id
@@ -167,6 +167,8 @@ async def mcp_list(interaction: discord.Interaction) -> None:
         else None
     )
     if bridge is not None:
+        await interaction.response.defer(ephemeral=True)
+        _deferred = True
         status: dict | None = None
         try:
             status = await asyncio.wait_for(bridge.get_mcp_status(), timeout=10)

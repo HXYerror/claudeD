@@ -98,7 +98,7 @@ async def agent_create(
         description=f"Prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}",
         color=COLOR_INFO,
     )
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @agent_group.command(name="list", description="List available agents")
@@ -125,7 +125,7 @@ async def agent_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
 
-    await interaction.response.defer(ephemeral=True)
+    _deferred = False
 
     # {name: {description, source, prompt_preview?}}. ``source`` is one of
     # ``"sdk"``, ``"local"``, or ``"file"`` — used only to nudge the UI copy
@@ -140,6 +140,8 @@ async def agent_list(interaction: discord.Interaction) -> None:
         else None
     )
     if bridge is not None:
+        await interaction.response.defer(ephemeral=True)
+        _deferred = True
         try:
             info = await asyncio.wait_for(bridge.get_server_info(), timeout=10)
         except Exception as exc:
@@ -186,7 +188,8 @@ async def agent_list(interaction: discord.Interaction) -> None:
         }
 
     if not merged:
-        await interaction.followup.send(
+        _send = interaction.followup.send if _deferred else interaction.response.send_message
+        await _send(
             "No agents defined. Use `/agent create` or drop a `.md` file "
             "in `.claude/agents/`.",
             ephemeral=True,
