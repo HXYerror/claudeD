@@ -38,3 +38,4 @@ bot.env.txt
 
 # Editor / dev artifacts
 log.txt
+.mcp.json

@@ -82,7 +82,6 @@ def write_agent_md(
 
     desc_line = (description or "").replace("\r", " ").replace("\n", " ")
     # C2: YAML-safe quoting via json.dumps (handles \, ", etc.)
-    import json
     safe_name = json.dumps(name)  # produces "name" with proper escapes
     safe_desc = json.dumps(desc_line)
     body = prompt or ""
