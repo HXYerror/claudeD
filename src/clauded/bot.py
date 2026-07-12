@@ -36,6 +36,7 @@ from . import scheduler_mcp
 from .scheduler_mcp import set_ctx as _scheduler_set_ctx, get_ctx as _scheduler_get_ctx
 from .cost_tracker import CostTracker
 from .agent_manager import AgentManager
+from . import _cli_native
 from . import stream_logger
 from .cogs._unbound import UNBOUND_HINT_MESSAGE, UNBOUND_REFUSE_MESSAGE
 from .cogs._table_view import CopyTableTextView
@@ -317,6 +318,12 @@ class ClaudedBot(commands.Bot):
         self._start_time = time.time()
         self.cost_tracker = CostTracker()
         self.agent_manager = AgentManager()
+        # #294: one-shot migration from shadow config to CLI-native
+        # ``.claude/agents/`` + ``.mcp.json``. Runs after both managers
+        # have loaded their JSON so we have the full legacy view. Idempotent
+        # (skips agents/servers whose file/entry already exists) so process
+        # restarts are safe.
+        self._migrate_shadow_to_cli_native()
         self._claude_version: str = "unknown"
         self._debug_logging: bool = False
         # v1.18 #160: runtime-toggleable allow_unbound_fallback. Initialized
@@ -369,6 +376,120 @@ class ClaudedBot(commands.Bot):
         # bot is ready so missed-fire bookkeeping happens with a live event
         # loop (cannot be done from __init__).
         self._scheduler_catch_up_done = False
+
+    # ------------------------------------------------------------------ #294
+    # One-shot legacy → CLI-native migration
+    # ------------------------------------------------------------------
+    def _migrate_shadow_to_cli_native(self) -> None:
+        """Migrate legacy shadow config to CLI-native storage (#294).
+
+        Two shadow stores need porting to the Claude CLI's own file
+        layout so ``claude`` picks up the same agents / MCP servers that
+        our slash commands manage:
+
+        * ``data/agents.json`` (per-bot registry) → one
+          ``{project_path}/.claude/agents/<name>.md`` per bound project.
+          Every bound project gets a copy so channels sharing an agent
+          continue to work when the CLI is invoked outside our bridge.
+        * ``data/projects.json``'s ``mcp_servers`` field (per-channel) →
+          one ``{project_path}/.mcp.json`` merging every channel's
+          servers for that path.
+
+        Idempotent: skips agents whose ``.md`` file already exists and
+        MCP servers already present in ``.mcp.json`` (so a hand-edited
+        file wins). All exceptions are swallowed with a warning so a
+        broken filesystem can never brick bot startup — the shadow
+        stores stay authoritative until the file write succeeds on a
+        later boot.
+        """
+        # --- agents.json → .claude/agents/*.md ----------------------------
+        try:
+            legacy_agents = self.agent_manager.list_all()
+        except Exception:
+            log.exception("#294 migration: could not read agent_manager")
+            legacy_agents = {}
+
+        if legacy_agents:
+            # Collect every distinct bound project path once so we don't
+            # rewrite the same ``.md`` for N channels sharing a path.
+            project_paths: set[Path] = set()
+            for _cid, path, _mcps in self.project_manager.iter_mcp_bindings():
+                project_paths.add(Path(path))
+            # ``iter_mcp_bindings`` only returns bindings with mcp_servers;
+            # we also want bindings without any MCP config, so pull those
+            # from the raw project list.
+            try:
+                for key, entry in list(self.project_manager._projects.items()):
+                    path = entry.get("path")
+                    if path:
+                        project_paths.add(Path(path))
+            except Exception:
+                log.exception("#294 migration: could not scan projects for agent copy")
+
+            for project_path in project_paths:
+                for name, info_dict in legacy_agents.items():
+                    target = _cli_native.agent_md_path(project_path, name)
+                    if target.exists():
+                        # Idempotent — respect hand edits and rerun-safety.
+                        continue
+                    try:
+                        _cli_native.write_agent_md(
+                            project_path,
+                            name,
+                            info_dict.get("prompt", "") or "",
+                            info_dict.get("description", "") or "",
+                        )
+                        log.info(
+                            "#294 migration: wrote agent %r to %s",
+                            name,
+                            target,
+                        )
+                    except OSError:
+                        log.exception(
+                            "#294 migration: agent %r → %s failed", name, target
+                        )
+
+        # --- projects.json mcp_servers → .mcp.json ------------------------
+        try:
+            bindings = self.project_manager.iter_mcp_bindings()
+        except Exception:
+            log.exception("#294 migration: could not read project_manager")
+            bindings = []
+
+        # Multiple channels can share a project path; merge their server
+        # dicts into a single ``.mcp.json`` per path. Last channel wins
+        # on same-name collisions (rare — the shadow store rejects dupes
+        # per-channel but two channels can independently register the
+        # same-named server).
+        merged_by_path: dict[Path, dict] = {}
+        for _cid, path_str, mcps in bindings:
+            path = Path(path_str)
+            bucket = merged_by_path.setdefault(path, {})
+            for sname, sconfig in mcps.items():
+                bucket.setdefault(sname, sconfig)
+
+        for project_path, servers in merged_by_path.items():
+            for sname, sconfig in servers.items():
+                try:
+                    _cli_native.add_mcp_server(project_path, sname, sconfig)
+                    log.info(
+                        "#294 migration: wrote MCP %r → %s/.mcp.json",
+                        sname,
+                        project_path,
+                    )
+                except ValueError:
+                    # ``.mcp.json`` already lists the server — idempotent skip.
+                    log.debug(
+                        "#294 migration: MCP %r already present in %s/.mcp.json",
+                        sname,
+                        project_path,
+                    )
+                except OSError:
+                    log.exception(
+                        "#294 migration: MCP %r → %s/.mcp.json failed",
+                        sname,
+                        project_path,
+                    )
 
     async def setup_hook(self) -> None:
         """Register slash command groups and sync to Discord."""

@@ -9,7 +9,8 @@ from pathlib import Path
 import discord
 from discord import app_commands
 
-from ._unbound import reject_if_unbound, resolve_channel_id
+from ._unbound import reject_if_unbound, resolve_binding_id, resolve_channel_id
+from .. import _cli_native
 from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
@@ -88,10 +89,41 @@ async def agent_create(
         return
     if await reject_if_unbound(interaction, bot):
         return
+    # #294: primary storage is the CLI-native ``.claude/agents/<name>.md``.
+    # ``AgentManager.create`` still runs so the legacy in-memory registry
+    # (used by ``/agent use`` and autocomplete) stays populated and its
+    # duplicate-name validation gates the write. On success we ALSO drop
+    # the file so the Claude CLI itself picks the agent up (AC1). If the
+    # file write fails after the manager already recorded the entry, we
+    # roll back the manager state so the two stores can't diverge.
     try:
         bot.agent_manager.create(name, prompt, description)
     except ValueError as exc:
         await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
+    binding_id = resolve_binding_id(interaction)
+    project_path = (
+        bot.project_manager.get_path(binding_id) if binding_id is not None else None
+    )
+    if project_path is None:
+        # reject_if_unbound already covered the "no binding" case; a None
+        # here means the channel is bound but ``get_path`` returned None
+        # (partial entry). Fail closed and roll back the manager write so
+        # the shadow store doesn't drift.
+        bot.agent_manager.delete(name)
+        await interaction.response.send_message(
+            "\u274c Could not resolve project path for this channel.",
+            ephemeral=True,
+        )
+        return
+    try:
+        _cli_native.write_agent_md(project_path, name, prompt, description)
+    except OSError as exc:
+        bot.agent_manager.delete(name)
+        log.exception("write_agent_md failed for %s in %s", name, project_path)
+        await interaction.response.send_message(
+            f"\u274c Failed to write agent file: {exc}", ephemeral=True
+        )
         return
     embed = discord.Embed(
         title=f"\u2705 Agent `{name}` created",
@@ -249,7 +281,24 @@ async def agent_delete(interaction: discord.Interaction, name: str) -> None:
         return
     if await reject_if_unbound(interaction, bot):
         return
-    if bot.agent_manager.delete(name):
+    # #294: mirror /agent create — delete BOTH the CLI-native ``.md`` file
+    # AND the legacy AgentManager entry. Either store may be the only one
+    # holding the agent (migration in progress, or user hand-edited
+    # ``.claude/agents/``), so we consider the delete a success if either
+    # side removed something.
+    binding_id = resolve_binding_id(interaction)
+    project_path = (
+        bot.project_manager.get_path(binding_id) if binding_id is not None else None
+    )
+    file_removed = False
+    if project_path is not None:
+        try:
+            file_removed = _cli_native.delete_agent_md(project_path, name)
+        except OSError:
+            log.exception("delete_agent_md failed for %s in %s", name, project_path)
+            file_removed = False
+    manager_removed = bot.agent_manager.delete(name)
+    if file_removed or manager_removed:
         embed = discord.Embed(
             title=f"\U0001f5d1\ufe0f Agent `{name}` deleted",
             color=COLOR_INFO,

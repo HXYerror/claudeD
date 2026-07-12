@@ -391,6 +391,32 @@ class ProjectManager:
                 return True
             return False
 
+    # #294: one-time migration helper. Yields ``(channel_id_int, path,
+    # mcp_servers_dict)`` for every binding that has at least one legacy
+    # ``mcp_servers`` entry, so ``ClaudedBot.__init__`` can write out the
+    # equivalent ``.mcp.json`` for each project without any of its
+    # callers reaching into ``_projects`` directly.
+    def iter_mcp_bindings(self) -> list[tuple[int, str, dict]]:
+        """Return snapshot of ``[(channel_id, path, mcp_servers_dict), ...]``.
+
+        Only bindings whose entry has a non-empty ``mcp_servers`` dict AND
+        a resolvable ``path`` are included. Copies the ``mcp_servers`` sub-
+        dict so mutations to the returned tuples cannot corrupt the store.
+        """
+        out: list[tuple[int, str, dict]] = []
+        with self._lock:
+            for key, entry in self._projects.items():
+                mcps = entry.get("mcp_servers") or {}
+                path = entry.get("path")
+                if not mcps or not path:
+                    continue
+                try:
+                    cid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                out.append((cid, str(path), dict(mcps)))
+        return out
+
     # ------------------------------------------------------------------
     # Environment variables
     # ------------------------------------------------------------------
