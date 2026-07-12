@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 
 from ._unbound import NO_CHANNEL_MESSAGE, reject_if_unbound, resolve_binding_id
+from .. import _cli_native
 from ..discord_renderer import COLOR_INFO
 
 log = logging.getLogger("clauded.bot")
@@ -95,10 +96,38 @@ async def mcp_add(
     config: dict = {"type": "stdio", "command": command}
     if args:
         config["args"] = args.split()
+    # #294: primary storage is the CLI-native ``.mcp.json`` under the
+    # bound project. ``project_manager.add_mcp_server`` still runs so the
+    # legacy per-channel shadow store stays in sync (backwards compat +
+    # its name-validation gate). If the shadow write succeeds but the
+    # ``.mcp.json`` write fails, we roll back so the two stores agree.
     try:
         bot.project_manager.add_mcp_server(binding_id, name, config)
     except ValueError as exc:
         await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(binding_id)
+    if project_path is None:
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        await interaction.response.send_message(
+            "\u274c Could not resolve project path for this channel.",
+            ephemeral=True,
+        )
+        return
+    try:
+        _cli_native.add_mcp_server(project_path, name, config)
+    except ValueError as exc:
+        # ``.mcp.json`` already had the same-named entry (e.g. hand-edited).
+        # Roll back the shadow store so the two views can't diverge.
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
+    except OSError as exc:
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        log.exception("add_mcp_server: .mcp.json write failed at %s", project_path)
+        await interaction.response.send_message(
+            f"\u274c Failed to write .mcp.json: {exc}", ephemeral=True
+        )
         return
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
@@ -123,10 +152,33 @@ async def mcp_add_url(interaction: discord.Interaction, name: str, url: str) -> 
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
     config: dict = {"type": "http", "url": url}
+    # #294: dual-write ``.mcp.json`` + legacy shadow, with rollback on
+    # failure. See mcp_add for the full rationale.
     try:
         bot.project_manager.add_mcp_server(binding_id, name, config)
     except ValueError as exc:
         await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
+    project_path = bot.project_manager.get_path(binding_id)
+    if project_path is None:
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        await interaction.response.send_message(
+            "\u274c Could not resolve project path for this channel.",
+            ephemeral=True,
+        )
+        return
+    try:
+        _cli_native.add_mcp_server(project_path, name, config)
+    except ValueError as exc:
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        await interaction.response.send_message(f"\u274c {exc}", ephemeral=True)
+        return
+    except OSError as exc:
+        bot.project_manager.remove_mcp_server(binding_id, name)
+        log.exception("add_mcp_server (url): .mcp.json write failed at %s", project_path)
+        await interaction.response.send_message(
+            f"\u274c Failed to write .mcp.json: {exc}", ephemeral=True
+        )
         return
     embed = discord.Embed(
         title=f"\u2705 MCP server `{name}` added",
@@ -249,7 +301,19 @@ async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
     if binding_id is None:
         await interaction.response.send_message(NO_CHANNEL_MESSAGE, ephemeral=True)
         return
-    if bot.project_manager.remove_mcp_server(binding_id, name):
+    # #294: remove from BOTH stores. Either side may be the only holder
+    # (migration edge case, or user hand-edited ``.mcp.json``), so we
+    # report success as long as either removed something.
+    project_path = bot.project_manager.get_path(binding_id)
+    file_removed = False
+    if project_path is not None:
+        try:
+            file_removed = _cli_native.remove_mcp_server(project_path, name)
+        except OSError:
+            log.exception("remove_mcp_server: .mcp.json write failed at %s", project_path)
+            file_removed = False
+    manager_removed = bot.project_manager.remove_mcp_server(binding_id, name)
+    if file_removed or manager_removed:
         embed = discord.Embed(
             title=f"\u2705 MCP server `{name}` removed",
             color=COLOR_INFO,
