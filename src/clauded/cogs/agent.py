@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 
@@ -97,7 +98,7 @@ async def agent_create(
         description=f"Prompt: {prompt[:200]}{'…' if len(prompt) > 200 else ''}",
         color=COLOR_INFO,
     )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @agent_group.command(name="list", description="List available agents")
@@ -124,6 +125,8 @@ async def agent_list(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Bot not ready.", ephemeral=True)
         return
 
+    await interaction.response.defer(ephemeral=True)
+
     # {name: {description, source, prompt_preview?}}. ``source`` is one of
     # ``"sdk"``, ``"local"``, or ``"file"`` — used only to nudge the UI copy
     # (no user-visible tag today, but keeps merge-order deterministic).
@@ -138,7 +141,7 @@ async def agent_list(interaction: discord.Interaction) -> None:
     )
     if bridge is not None:
         try:
-            info = await bridge.get_server_info()
+            info = await asyncio.wait_for(bridge.get_server_info(), timeout=10)
         except Exception as exc:
             log.debug("/agent list: get_server_info failed: %r", exc)
             info = None
@@ -153,7 +156,7 @@ async def agent_list(interaction: discord.Interaction) -> None:
                 merged.setdefault(name, {"description": desc, "source": "sdk"})
 
     # --- Path B: filesystem fallback when no bridge -------------------
-    if bridge is None:
+    if bridge is None or not merged:  # E4: fallback if SDK returned no agents
         binding_id = resolve_channel_id(interaction)
         if binding_id is not None:
             cwd, is_bound = bot.project_manager.get_path_or_default(binding_id)
@@ -183,7 +186,7 @@ async def agent_list(interaction: discord.Interaction) -> None:
         }
 
     if not merged:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No agents defined. Use `/agent create` or drop a `.md` file "
             "in `.claude/agents/`.",
             ephemeral=True,
