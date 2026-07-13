@@ -684,6 +684,92 @@ def test_r1_bot_flags_includes_runtime_overrides():
     assert "permission_mode_override" in s
 
 
+# ---------------------------------------------------------------------------
+# #304 — CLI session transcript in bundle
+# ---------------------------------------------------------------------------
+
+
+def test_304_bundle_includes_session_transcript(tmp_path, monkeypatch):
+    """#304 AC1+AC2: bundle contains transcripts/<session_id>.tail.jsonl
+    for each stored session whose transcript file exists."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+
+    # Plant sessions.json with two sessions
+    sessions = {
+        "42": {
+            "session_id": "sess-aaa",
+            "project_path": "/Users/alice/repo",
+        },
+        "99": {
+            "session_id": "sess-bbb",
+            "project_path": "/Users/alice/other-proj",
+        },
+    }
+    (data_dir / "sessions.json").write_text(json.dumps(sessions))
+
+    # Create fake transcript files under ~/.claude/projects/<slug>/
+    fake_home = tmp_path / "home"
+    claude_projects = fake_home / ".claude" / "projects"
+
+    slug_a = "Users-alice-repo"
+    slug_b = "Users-alice-other-proj"
+    (claude_projects / slug_a).mkdir(parents=True)
+    (claude_projects / slug_b).mkdir(parents=True)
+
+    transcript_a = claude_projects / slug_a / "sess-aaa.jsonl"
+    transcript_a.write_text('{"type":"assistant","content":"hello"}\n')
+
+    transcript_b = claude_projects / slug_b / "sess-bbb.jsonl"
+    transcript_b.write_text('{"type":"tool_use","name":"bash"}\n')
+
+    # Redirect Path.home() to our fake home
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=tmp_path / "fake-logs",
+    )
+
+    with zipfile.ZipFile(out_path) as z:
+        names = set(z.namelist())
+
+    assert "transcripts/sess-aaa.tail.jsonl" in names, (
+        "#304 AC1: transcript for sess-aaa missing from bundle"
+    )
+    assert "transcripts/sess-bbb.tail.jsonl" in names, (
+        "#304 AC2: transcript for sess-bbb missing from bundle"
+    )
+
+
+def test_304_missing_transcript_graceful_skip(tmp_path, monkeypatch):
+    """#304 AC3: missing transcript file does not crash — graceful skip."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    sessions = {
+        "42": {
+            "session_id": "sess-gone",
+            "project_path": "/Users/alice/repo",
+        },
+    }
+    (data_dir / "sessions.json").write_text(json.dumps(sessions))
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    # No transcript file created — should not crash
+    out_path = bundle_mod.generate_bundle(
+        data_dir=data_dir,
+        out_dir=tmp_path,
+        log_dir=tmp_path / "fake-logs",
+    )
+    with zipfile.ZipFile(out_path) as z:
+        names = set(z.namelist())
+    assert "transcripts/sess-gone.tail.jsonl" not in names
+
+
 @pytest.mark.asyncio
 async def test_r1_log_dump_cog_runtime_dispatch(tmp_path, monkeypatch):
     """R1 tester: real-runtime test for the /log dump command.
