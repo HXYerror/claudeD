@@ -22,8 +22,8 @@ Bundle layout (per PRD §Bundle Contents):
     ├── runtime/
     │   ├── sessions-live.json
     │   └── bot-flags.json
-    └── diagnostics/
-        └── manifest.txt
+    └── transcripts/                 (#304)
+        └── <session_id>.tail.jsonl  (tail 1 MB)
 
 This module imports lazily — bundle generation should not pull in
 discord.py at module-load time.
@@ -52,6 +52,7 @@ log = logging.getLogger("clauded.diagnostics.bundle")
 BUNDLE_SIZE_BUDGET = 8 * 1024 * 1024  # 8 MB (T0 guild limit 10 MB - 20%)
 LOG_TAIL_BYTES = 1 * 1024 * 1024  # 1 MB per tailed log file
 STREAM_DEBUG_TAIL_BYTES = 5 * 1024 * 1024  # 5 MB jsonl tail
+TRANSCRIPT_TAIL_BYTES = 1 * 1024 * 1024  # 1 MB per session transcript
 
 # Directory where rotating logs land (matches _logging_setup._LOG_DIR).
 _LOG_DIR = Path.home() / "Library" / "Logs" / "clauded"
@@ -250,6 +251,52 @@ def _build_manifest(
 
 
 # ---------------------------------------------------------------------------
+# CLI session transcript collection (#304)
+# ---------------------------------------------------------------------------
+
+
+def _collect_transcripts(
+    zf: zipfile.ZipFile,
+    bot: Any,
+    data_dir: Path,
+) -> None:
+    """Collect CLI session transcripts from stored sessions.
+
+    For each session with a ``session_id``, compute the project slug from
+    ``project_path`` (replace ``/`` → ``-``, strip leading ``-``) and look
+    for ``~/.claude/projects/<slug>/<session_id>.jsonl``. If it exists,
+    tail 1 MB and add to the zip as ``transcripts/<session_id>.tail.jsonl``.
+    """
+    # Read stored sessions from data_dir/sessions.json
+    raw, found = _read_state_file(data_dir, "sessions.json")
+    if not found:
+        return
+    try:
+        sessions = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return
+    if not isinstance(sessions, dict):
+        return
+
+    claude_projects = Path.home() / ".claude" / "projects"
+
+    for _thread_id, stored in sessions.items():
+        session_id = stored.get("session_id") if isinstance(stored, dict) else None
+        project_path = (stored.get("project_path") or "") if isinstance(stored, dict) else ""
+        if not session_id or not project_path:
+            continue
+
+        slug = project_path.replace("/", "-").lstrip("-")
+        transcript = claude_projects / slug / f"{session_id}.jsonl"
+        if not transcript.exists():
+            continue
+
+        tail = _tail_bytes(transcript, TRANSCRIPT_TAIL_BYTES)
+        if tail:
+            zf.writestr(f"transcripts/{session_id}.tail.jsonl", tail)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -358,6 +405,9 @@ def generate_bundle(
                 "runtime/bot-flags.json",
                 json.dumps(_snapshot_bot_flags(bot), indent=2, ensure_ascii=False),
             )
+
+        # #304: CLI session transcripts (tail 1 MB each)
+        _collect_transcripts(zf, bot, data_dir)
 
         # #224 R1 simplicity: diagnostics/info.json had 2 fields
         # (python_executable + sys_path_len); merged into manifest.json's
