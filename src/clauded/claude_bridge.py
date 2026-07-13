@@ -124,6 +124,7 @@ class ClaudeBridge:
         self._client: ClaudeSDKClient | None = None
         self._active = False
         self._session_id: str | None = None
+        self._on_session_id_cb: Callable[[str], None] | None = None
         # Aggregate stats updated whenever we observe a ResultMessage. They
         # are purely informational (surfaced via /session info) so the
         # exact semantics — total cost across the session, last-known turn
@@ -837,7 +838,10 @@ class ClaudeBridge:
         # Extract session_id from ResultMessage
         sid = getattr(msg, "session_id", None)
         if isinstance(sid, str) and sid:
+            first_time = self._session_id is None
             self._session_id = sid
+            if first_time and self._on_session_id_cb is not None:
+                self._on_session_id_cb(sid)
 
         cost = getattr(msg, "total_cost_usd", None)
         if isinstance(cost, (int, float)):
