@@ -257,7 +257,6 @@ def _build_manifest(
 
 def _collect_transcripts(
     zf: zipfile.ZipFile,
-    bot: Any,
     data_dir: Path,
 ) -> None:
     """Collect CLI session transcripts from stored sessions.
@@ -293,7 +292,9 @@ def _collect_transcripts(
 
         tail = _tail_bytes(transcript, TRANSCRIPT_TAIL_BYTES)
         if tail:
-            zf.writestr(f"transcripts/{session_id}.tail.jsonl", tail)
+            # Apply path redaction (consistent with other bundle blobs)
+            redacted = redact.redact_text(tail.decode("utf-8", errors="replace"))
+            zf.writestr(f"transcripts/{session_id}.tail.jsonl", redacted.encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +408,7 @@ def generate_bundle(
             )
 
         # #304: CLI session transcripts (tail 1 MB each)
-        _collect_transcripts(zf, bot, data_dir)
+        _collect_transcripts(zf, data_dir)
 
         # #224 R1 simplicity: diagnostics/info.json had 2 fields
         # (python_executable + sys_path_len); merged into manifest.json's
