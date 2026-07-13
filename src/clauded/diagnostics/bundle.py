@@ -443,7 +443,7 @@ def _emergency_truncate(*, buf: io.BytesIO, out_path: Path, size_budget: int) ->
     out_buf = io.BytesIO()
     with zipfile.ZipFile(out_buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for info in in_zip.infolist():
-            if info.filename.startswith("logs/"):
+            if info.filename.startswith("logs/") or info.filename.startswith("transcripts/"):
                 continue  # drop the bulk
             zf.writestr(info, in_zip.read(info.filename))
         zf.writestr(
