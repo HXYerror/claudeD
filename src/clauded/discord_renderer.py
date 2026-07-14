@@ -1326,17 +1326,29 @@ class DiscordRenderer:
                 # subclass overlap doesn't shadow the isinstance-matched
                 # types above it.
                 if _SdkTaskStartedMessage is not None and isinstance(event, _SdkTaskStartedMessage):
-                    await self._handle_task_started(event, subagent_renderers)
-                    continue
+                    task_type = getattr(event, "task_type", "") or ""
+                    if "workflow" in task_type.lower():
+                        await self._handle_task_started(event, subagent_renderers)
+                        continue
+                    # Normal subagent — fall through to sub-thread path
+
                 if _SdkTaskProgressMessage is not None and isinstance(event, _SdkTaskProgressMessage):
-                    await self._handle_task_progress(event)
-                    continue
+                    task_id = getattr(event, "task_id", "")
+                    if task_id in self._task_states:  # Only handle if we started tracking it (workflow)
+                        await self._handle_task_progress(event)
+                        continue
+
                 if _SdkTaskNotificationMessage is not None and isinstance(event, _SdkTaskNotificationMessage):
-                    await self._handle_task_notification(event)
-                    continue
+                    task_id = getattr(event, "task_id", "")
+                    if task_id in self._task_states:
+                        await self._handle_task_notification(event)
+                        continue
+
                 if _SdkTaskUpdatedMessage is not None and isinstance(event, _SdkTaskUpdatedMessage):
-                    await self._handle_task_updated(event)
-                    continue
+                    task_id = getattr(event, "task_id", "")
+                    if task_id in self._task_states:
+                        await self._handle_task_updated(event)
+                        continue
 
                 if isinstance(event, ResultMessage):
                     # Capture stats from the result.
