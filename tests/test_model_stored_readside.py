@@ -137,6 +137,12 @@ class _BotStub:
         self._logged_third_party_thread: set[int] = set()
         self._pre_tool_notifications: bool = False
         self._notify_enabled: dict[int, bool] = {}
+        self._subagent_threads: dict[str, int] = {}
+
+    def _make_subagent_stop_cb(self, thread_id: int):
+        async def _noop(input_data: dict) -> None:
+            pass
+        return _noop
 
     @property
     def user(self) -> Any:
