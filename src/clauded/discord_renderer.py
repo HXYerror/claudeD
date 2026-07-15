@@ -2687,6 +2687,38 @@ class DiscordRenderer:
         fresh = await self._safe_send(content=content)
         return fresh if fresh is not None else live_msg
 
+    @staticmethod
+    def _find_table_boundary(buffer: str) -> int:
+        """Return byte offset where a trailing table block starts, or -1.
+
+        A "trailing table" is a contiguous run of lines at the end of
+        *buffer* where each non-empty line starts with ``|``.  We require
+        at least 2 such lines (header + separator or data row) to consider
+        it a table in progress.
+        """
+        lines = buffer.split("\n")
+        # Walk backwards finding consecutive table lines.
+        table_line_count = 0
+        first_table_line_idx = len(lines)
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = lines[i].strip()
+            if stripped.startswith("|"):
+                table_line_count += 1
+                first_table_line_idx = i
+            elif stripped == "":
+                # Allow trailing blank lines inside table block
+                if table_line_count > 0:
+                    first_table_line_idx = i
+                    continue
+                break
+            else:
+                break
+        if table_line_count < 2:
+            return -1
+        # Compute byte offset of line at first_table_line_idx.
+        offset = sum(len(lines[j]) + 1 for j in range(first_table_line_idx))
+        return offset
+
     async def _typewriter_tick(
         self, live_msg: discord.Message | None, buffer: str
     ) -> tuple[discord.Message | None, str]:
@@ -2703,6 +2735,18 @@ class DiscordRenderer:
 
         if len(buffer) <= soft_limit:
             return await self._typewriter_apply(live_msg, buffer + CURSOR), buffer
+
+        # #308: check if buffer tail has an in-progress table
+        table_start = self._find_table_boundary(buffer)
+        if table_start > 0:
+            # Split at table boundary — send pre-table, keep table in buffer
+            pre_table = buffer[:table_start]
+            if pre_table.strip():
+                chunks = self._smart_split(pre_table, limit=soft_limit)
+                for chunk in chunks[:-1]:
+                    await self._safe_send(content=chunk)
+                live_msg = await self._typewriter_apply(live_msg, chunks[-1])
+            return live_msg, buffer[table_start:]
 
         # Buffer too big for one message — split it.
         chunks = self._smart_split(buffer, limit=soft_limit)
