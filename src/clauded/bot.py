@@ -881,24 +881,7 @@ class ClaudedBot(commands.Bot):
                     reason = input_data.get("stop_reason", "unknown")
                     log.info("Session stopped: %s", reason)
                     # #310: warn user if subagents still running
-                    pending = sum(
-                        1 for sid, tid in self._subagent_threads.items()
-                        if tid == thread.id
-                    )
-                    if pending > 0:
-                        warn_embed = discord.Embed(
-                            title="⏹️ Session ended",
-                            description=(
-                                f"Reason: {reason}\n"
-                                f"⚠️ {pending} subagent(s) still running in background "
-                                f"— will notify when complete"
-                            ),
-                            color=COLOR_INFO,
-                        )
-                        try:
-                            await safe_send_message(thread, embed=warn_embed)
-                        except Exception:
-                            log.debug("#310: failed to send pending-subagent warning", exc_info=True)
+                    await self._warn_pending_subagents(thread.id, reason)
 
                 env_vars = self.project_manager.get_env(channel.id)
                 _notify = self._notify_enabled.get(thread.id, self._pre_tool_notifications)
@@ -1105,26 +1088,7 @@ class ClaudedBot(commands.Bot):
                         reason = input_data.get("stop_reason", "unknown")
                         log.info("Session stopped: %s", reason)
                         # #310: warn user if subagents still running
-                        pending = sum(
-                            1 for sid, tid in self._subagent_threads.items()
-                            if tid == thread_id
-                        )
-                        if pending > 0:
-                            warn_embed = discord.Embed(
-                                title="⏹️ Session ended",
-                                description=(
-                                    f"Reason: {reason}\n"
-                                    f"⚠️ {pending} subagent(s) still running in background "
-                                    f"— will notify when complete"
-                                ),
-                                color=COLOR_INFO,
-                            )
-                            try:
-                                ch = self.get_channel(thread_id) or await self.fetch_channel(thread_id)
-                                if ch:
-                                    await safe_send_message(ch, embed=warn_embed)
-                            except Exception:
-                                log.debug("#310: failed to send pending-subagent warning", exc_info=True)
+                        await self._warn_pending_subagents(thread_id, reason)
 
                     env_vars = self.project_manager.get_env(parent_id)
                     _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
@@ -1344,6 +1308,33 @@ class ClaudedBot(commands.Bot):
             self._subagent_threads[sid] = thread_id
         bridge._on_session_id_cb = _on_sid
 
+
+    async def _warn_pending_subagents(self, thread_id: int, reason: str) -> None:
+        """#310: send warning embed if subagents are still running when session stops."""
+        pending = sum(
+            1 for _sid, tid in self._subagent_threads.items()
+            if tid == thread_id
+        )
+        if pending <= 0:
+            return
+        embed = discord.Embed(
+            title="⏹️ Session ended",
+            description=(
+                f"Reason: {reason}\n"
+                f"⚠️ {pending} subagent(s) still running in background "
+                f"— will notify when complete"
+            ),
+            color=COLOR_INFO,
+        )
+        try:
+            channel = self.get_channel(thread_id)
+            if channel is None:
+                channel = await self.fetch_channel(thread_id)
+            if channel:
+                await safe_send_message(channel, embed=embed)
+        except Exception:
+            log.debug("#310: failed to send pending-subagent warning", exc_info=True)
+
     def _make_subagent_stop_cb(self, thread_id: int) -> Any:
         """#310: build a callback that notifies Discord when a subagent completes.
 
@@ -1465,26 +1456,7 @@ class ClaudedBot(commands.Bot):
             reason = input_data.get("stop_reason", "unknown")
             log.info("Session stopped: %s", reason)
             # #310: warn user if subagents still running
-            pending = sum(
-                1 for sid, tid in self._subagent_threads.items()
-                if tid == thread_id
-            )
-            if pending > 0:
-                warn_embed = discord.Embed(
-                    title="⏹️ Session ended",
-                    description=(
-                        f"Reason: {reason}\n"
-                        f"⚠️ {pending} subagent(s) still running in background "
-                        f"— will notify when complete"
-                    ),
-                    color=COLOR_INFO,
-                )
-                try:
-                    ch = self.get_channel(thread_id) or await self.fetch_channel(thread_id)
-                    if ch:
-                        await safe_send_message(ch, embed=warn_embed)
-                except Exception:
-                    log.debug("#310: failed to send pending-subagent warning", exc_info=True)
+            await self._warn_pending_subagents(thread_id, reason)
 
         sc = SessionConfig(
             system_prompt=self.project_manager.get_system_prompt(parent_id),
