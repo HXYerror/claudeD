@@ -1610,6 +1610,12 @@ class DiscordRenderer:
                                 })
 
                             if name in ("Task", "Agent"):
+                                # #311: flush pending text before subagent dispatch
+                                # so user sees claude's message immediately.
+                                if buffer.strip():
+                                    live_msg, buffer = await self._typewriter_tick(
+                                        live_msg, buffer
+                                    )
                                 task_depth += 1
                                 desc = block.input.get("description", "")[:200]
 
