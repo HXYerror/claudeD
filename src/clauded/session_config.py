@@ -37,6 +37,7 @@ class SessionConfig:
     on_pre_tool_use: Any = None  # callback
     on_post_tool_use: Any = None  # callback
     on_stop: Any = None  # callback
+    on_subagent_stop: Any = None  # callback: fired when a subagent stops
 
 
 __all__ = ["SessionConfig"]

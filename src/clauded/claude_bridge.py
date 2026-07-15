@@ -558,11 +558,13 @@ class ClaudeBridge:
             context: HookContext,
         ) -> dict[str, Any]:
             log.info("Subagent stopped: %s", str(input_data)[:200])
-            if self._session_config.on_stop:
+            # #310: fire dedicated on_subagent_stop callback so the bot can
+            # notify the user even after the main renderer has returned.
+            if self._session_config.on_subagent_stop:
                 try:
-                    await self._session_config.on_stop(input_data)
+                    await self._session_config.on_subagent_stop(input_data)
                 except Exception:
-                    log.debug("on_stop callback raised in SubagentStop; ignoring", exc_info=True)
+                    log.debug("on_subagent_stop callback raised; ignoring", exc_info=True)
             return {}
 
         _hooks_dict["SubagentStop"] = [HookMatcher(matcher=None, hooks=[_hook_subagent_stop])]
