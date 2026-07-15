@@ -998,7 +998,7 @@ class DiscordRenderer:
                 folded.extend(agent_lines[-2:])
                 lines.extend(folded)
             else:
-                lines.extend(agent_lines[:8])
+                lines.extend(agent_lines)
 
         # Usage footer
         tok_display = f"{tokens / 1000:.0f}k" if tokens >= 1000 else str(tokens)
