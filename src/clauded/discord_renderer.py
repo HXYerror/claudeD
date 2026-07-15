@@ -918,20 +918,130 @@ class DiscordRenderer:
         duration_ms = int(usage.get("duration_ms", 0) or 0)
         duration = f"{duration_ms / 1000:.1f}"
 
-        embed = discord.Embed(
-            title="🔄 Dynamic Workflow Running",
-            description=(
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔮 Task: {state.description[:60]}\n"
-                f"💭 Last tool: {last_tool or '—'}\n"
-                f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
-            ),
-            color=COLOR_TOOL_RUNNING,
-        )
+        # --- Parse workflowProgress from event data ---
+        data = getattr(event, "data", None) or {}
+        progress = data.get("workflowProgress", [])
+
+        if progress:
+            embed = self._build_workflow_progress_embed(
+                progress, tokens, tool_uses, duration, last_tool,
+            )
+        else:
+            # Fallback: simple format when no workflowProgress data
+            embed = discord.Embed(
+                title="🔄 Dynamic Workflow Running",
+                description=(
+                    "━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔮 Task: {state.description[:60]}\n"
+                    f"💭 Last tool: {last_tool or '—'}\n"
+                    f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
+                ),
+                color=COLOR_TOOL_RUNNING,
+            )
 
         ok = await self._safe_edit(state.message, embed=embed)
         if ok:
             state.last_edit_at = now
+
+    def _build_workflow_progress_embed(
+        self,
+        progress: list[dict],
+        tokens: int,
+        tool_uses: int,
+        duration: str,
+        last_tool: str | None,
+    ) -> "discord.Embed":
+        """Build a rich embed from workflowProgress data."""
+        phases = [p for p in progress if p.get("type") == "workflow_phase"]
+        agents = [a for a in progress if a.get("type") == "workflow_agent"]
+
+        lines: list[str] = ["━━━━━━━━━━━━━━━━━━━━━━━"]
+
+        # Phase line
+        if phases:
+            current_phase = next(
+                (p for p in phases if p.get("status") == "running"), None,
+            )
+            total_phases = len(phases)
+            if current_phase:
+                idx = current_phase.get("index", 0) + 1
+                title = current_phase.get("title", "…")
+                lines.append(f'📋 Phase {idx}/{total_phases}: "{title}"')
+            else:
+                # No running phase — show total
+                completed = sum(1 for p in phases if p.get("status") == "completed")
+                lines.append(f"📋 Phases: {completed}/{total_phases} completed")
+
+        # Agent summary
+        if agents:
+            running = sum(
+                1 for a in agents if a.get("state") in ("start", "progress")
+            )
+            done = sum(1 for a in agents if a.get("state") == "done")
+            failed = sum(1 for a in agents if a.get("state") == "error")
+            parts = []
+            if running:
+                parts.append(f"{running} running")
+            if done:
+                parts.append(f"{done} done")
+            if failed:
+                parts.append(f"{failed} failed")
+            if parts:
+                lines.append(f"🤖 Agents: {' · '.join(parts)}")
+
+            # Per-agent lines (fold if >10)
+            agent_lines = self._format_agent_lines(agents, last_tool)
+            if len(agent_lines) > 10:
+                # Show first 5 + "... N more" + last 2
+                folded = agent_lines[:5]
+                folded.append(f"  … {len(agent_lines) - 7} more …")
+                folded.extend(agent_lines[-2:])
+                lines.extend(folded)
+            else:
+                lines.extend(agent_lines[:8])
+
+        # Usage footer
+        tok_display = f"{tokens / 1000:.0f}k" if tokens >= 1000 else str(tokens)
+        lines.append(f"🪙 {tok_display} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s")
+
+        description = "\n".join(lines)
+        # Cap at 4000 chars (Discord embed limit)
+        if len(description) > 4000:
+            description = description[:3997] + "…"
+
+        return discord.Embed(
+            title="⚡ Dynamic Workflow Running",
+            description=description,
+            color=COLOR_TOOL_RUNNING,
+        )
+
+    @staticmethod
+    def _format_agent_lines(
+        agents: list[dict], last_tool: str | None,
+    ) -> list[str]:
+        """Format per-agent status lines."""
+        lines: list[str] = []
+        for a in agents:
+            idx = a.get("index", 0) + 1
+            label = a.get("label", f"Agent {idx}")
+            state = a.get("state", "")
+            agent_tokens = a.get("tokens", 0) or 0
+
+            if state == "done":
+                tok_k = f"{agent_tokens / 1000:.0f}k tok" if agent_tokens else ""
+                suffix = f" ({tok_k})" if tok_k else ""
+                lines.append(f"  ✅ #{idx} {label}{suffix}")
+            elif state in ("start", "progress"):
+                tool_hint = a.get("promptPreview") or last_tool or "…"
+                lines.append(f"  🔄 #{idx} {label}... (💭 {tool_hint})")
+            elif state == "error":
+                lines.append(f"  ❌ #{idx} {label}")
+            elif state == "skipped":
+                lines.append(f"  ⏭️ #{idx} {label}")
+            else:
+                # pending or unknown
+                lines.append(f"  ⏳ #{idx} {label}")
+        return lines
 
     async def _render_terminal_task(
         self,
