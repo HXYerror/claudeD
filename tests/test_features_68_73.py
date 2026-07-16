@@ -78,7 +78,7 @@ class TestAutoExpiry:
         client.connect = AsyncMock()
         client.disconnect = AsyncMock()
         client.query = AsyncMock()
-        client.receive_messages = lambda: _async_iter([rm])
+        client.receive_response = lambda: _async_iter([rm])
         monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", lambda options=None: client)
 
         bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)

@@ -37,12 +37,12 @@ def cfg() -> Config:
     )
 
 
-def _make_client(receive_messages_factory: Any) -> AsyncMock:
+def _make_client(receive_response_factory: Any) -> AsyncMock:
     client = AsyncMock()
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
     client.query = AsyncMock()
-    client.receive_messages = receive_messages_factory
+    client.receive_response = receive_response_factory
     return client
 
 

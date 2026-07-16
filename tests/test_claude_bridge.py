@@ -38,10 +38,10 @@ def cfg() -> Config:
     )
 
 
-def _make_client(receive_messages_factory: Any) -> AsyncMock:
+def _make_client(receive_response_factory: Any) -> AsyncMock:
     """Build an AsyncMock standing in for ``ClaudeSDKClient``.
 
-    ``receive_messages`` is a *sync* method that returns an *async*
+    ``receive_response`` is a *sync* method that returns an *async*
     iterator, so we wire it as a regular MagicMock side-effect rather
     than an AsyncMock.
     """
@@ -49,7 +49,7 @@ def _make_client(receive_messages_factory: Any) -> AsyncMock:
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
     client.query = AsyncMock()
-    client.receive_messages = receive_messages_factory
+    client.receive_response = receive_response_factory
     return client
 
 

@@ -1392,31 +1392,6 @@ class ClaudedBot(commands.Bot):
             if session_id and session_id in self._subagent_threads:
                 del self._subagent_threads[session_id]
 
-            # #310: inject subagent result back to claude so it receives the callback
-            bridge = self.session_manager.get_session(thread_id)
-            if bridge and bridge.is_active:
-                # SubagentStop hook provides last_assistant_message directly
-                result = input_data.get("last_assistant_message", "")
-                if not result:
-                    result = "(subagent completed with no text output)"
-
-                inject_msg = (
-                    f"[Background subagent completed]\n"
-                    f"Result: {result[:2000]}\n"
-                    f"Please acknowledge and continue."
-                )
-                try:
-                    thread = self.get_channel(thread_id)
-                    if thread is None:
-                        thread = await self.fetch_channel(thread_id)
-                    renderer = DiscordRenderer(
-                        thread, bot=self, project_path=None,
-                    )
-                    await renderer.render_response(bridge, inject_msg)
-                    log.info("#310: injected background subagent result to claude thread=%d", thread_id)
-                except Exception:
-                    log.warning("#310: failed to inject subagent result", exc_info=True)
-
         return _on_subagent_stop
 
     async def _recreate_session(
