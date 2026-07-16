@@ -38,6 +38,7 @@ class SessionConfig:
     on_post_tool_use: Any = None  # callback
     on_stop: Any = None  # callback
     on_subagent_stop: Any = None  # callback: fired when a subagent stops
+    on_subagent_start: Any = None  # callback: fired when a subagent starts (#310 R2: per-subagent pending tracking)
 
 
 __all__ = ["SessionConfig"]

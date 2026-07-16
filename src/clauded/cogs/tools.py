@@ -110,6 +110,12 @@ async def budget_set(interaction: discord.Interaction, amount: float) -> None:
     if amount <= 0:
         await interaction.response.send_message("Budget must be positive.", ephemeral=True)
         return
+    # review E2: guard unbound channels like the sibling /budget show does.
+    # Without this, an unbound invocation fell through to _recreate_session
+    # (and, on older schemas, set_budget's bound-assertion) with the
+    # interaction never answered → Discord's "application did not respond".
+    if await reject_if_unbound(interaction, bot):
+        return
     binding_id = resolve_binding_id(interaction)
     if binding_id is not None:
         bot.project_manager.set_budget(binding_id, amount)

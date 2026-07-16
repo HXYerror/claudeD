@@ -150,9 +150,15 @@ async def _ensure_bridge(bot, thread_id: int, binding_id: int, user_name: str):
         env=bot.project_manager.get_env(binding_id) or None,
         user=user_name,
     )
-    return await bot.session_manager.create_session(
+    bridge = await bot.session_manager.create_session(
         thread_id, project_path, bot.config, sc,
     )
+    # review D1: wire the session-persist callback so the session_id produced
+    # by this slash-injected turn lands in sessions.json. Without it the whole
+    # /schedule conversation is unresumable after a restart (this path is
+    # outside the natural message handler that normally wires it).
+    bot._wire_session_persist_cb(bridge, thread_id)
+    return bridge
 
 
 def _resolve_full_schedule_id(bot, partial: str) -> tuple[str | None, str | None]:
@@ -222,45 +228,50 @@ async def schedule_message_cmd(
         ephemeral=False,
     )
 
-    try:
-        bridge = await _ensure_bridge(
-            bot, channel.id, parent_id, interaction.user.name,
-        )
-    except Exception as exc:
-        log.exception("/schedule message: failed to start bridge")
-        await channel.send(embed=discord.Embed(
-            title="❌ Failed to open session",
-            description=f"```\n{str(exc)[:500]}\n```",
-            color=COLOR_TOOL_FAILURE,
-        ))
-        return
-
-    bot._register_scheduler_ctx(
-        thread_id=channel.id,
-        channel_id=parent_id,
-        guild_id=getattr(channel.guild, "id", None),
-    )
-    full = _REMINDER_MESSAGE.format(user_text=text)
-    project_path = bot.project_manager.get_path(parent_id)
-    renderer = DiscordRenderer(
-        channel,
-        bot=bot,
-        project_path=Path(project_path) if project_path else None,
-    )
-    try:
-        await renderer.render_response(
-            bridge, full, author_id=interaction.user.id,
-        )
-    except Exception:
-        log.exception("/schedule message render failed")
+    # review B1: hold the per-thread lock across bridge get/create + render so
+    # this slash-injected turn can't race a concurrent @bot turn on the same
+    # ClaudeSDKClient (two receive_response iterators on one stream corrupt
+    # both renders). Same lock every other render_response call site holds.
+    async with bot.session_manager.get_lock(channel.id):
         try:
+            bridge = await _ensure_bridge(
+                bot, channel.id, parent_id, interaction.user.name,
+            )
+        except Exception as exc:
+            log.exception("/schedule message: failed to start bridge")
             await channel.send(embed=discord.Embed(
-                title="❌ Schedule injection failed",
-                description="See bot logs.",
+                title="❌ Failed to open session",
+                description=f"```\n{str(exc)[:500]}\n```",
                 color=COLOR_TOOL_FAILURE,
             ))
+            return
+
+        bot._register_scheduler_ctx(
+            thread_id=channel.id,
+            channel_id=parent_id,
+            guild_id=getattr(channel.guild, "id", None),
+        )
+        full = _REMINDER_MESSAGE.format(user_text=text)
+        project_path = bot.project_manager.get_path(parent_id)
+        renderer = DiscordRenderer(
+            channel,
+            bot=bot,
+            project_path=Path(project_path) if project_path else None,
+        )
+        try:
+            await renderer.render_response(
+                bridge, full, author_id=interaction.user.id,
+            )
         except Exception:
-            pass
+            log.exception("/schedule message render failed")
+            try:
+                await channel.send(embed=discord.Embed(
+                    title="❌ Schedule injection failed",
+                    description="See bot logs.",
+                    color=COLOR_TOOL_FAILURE,
+                ))
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------
@@ -353,9 +364,12 @@ async def schedule_new_task_cmd(
             project_path=Path(project_path) if project_path else None,
         )
         try:
-            await renderer.render_response(
-                bridge, full, author_id=interaction.user.id,
-            )
+            # review B1: serialize the render against any concurrent turn on
+            # this thread's ClaudeSDKClient.
+            async with bot.session_manager.get_lock(thread.id):
+                await renderer.render_response(
+                    bridge, full, author_id=interaction.user.id,
+                )
         except Exception:
             log.exception("/schedule new_task render failed (channel branch)")
         return
@@ -410,9 +424,12 @@ async def schedule_new_task_cmd(
         project_path=Path(project_path) if project_path else None,
     )
     try:
-        await renderer.render_response(
-            bridge, full, author_id=interaction.user.id,
-        )
+        # review B1: serialize the render against any concurrent turn on this
+        # thread's ClaudeSDKClient.
+        async with bot.session_manager.get_lock(thread.id):
+            await renderer.render_response(
+                bridge, full, author_id=interaction.user.id,
+            )
     except Exception:
         log.exception("/schedule new_task render failed")
 

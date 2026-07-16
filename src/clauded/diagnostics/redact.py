@@ -215,12 +215,19 @@ def redact_projects_json(data: dict, *, username: str | None = None) -> dict:
             for path_key in ("path", "system_prompt_path"):
                 if path_key in redacted_v and isinstance(redacted_v[path_key], str):
                     redacted_v[path_key] = redact_path(redacted_v[path_key], username=username)
-            # add_dirs is list[str]
-            if "add_dirs" in redacted_v and isinstance(redacted_v["add_dirs"], list):
-                redacted_v["add_dirs"] = [
-                    redact_path(p, username=username) if isinstance(p, str) else p
-                    for p in redacted_v["add_dirs"]
-                ]
+            # review E1: extra directories are persisted under ``extra_dirs``
+            # (see ProjectManager.add_extra_dir / get_extra_dirs). The old
+            # code redacted ``add_dirs`` — a key projects.json never uses — so
+            # the absolute paths from ``/project add-dir`` (which embed the
+            # operator's username) leaked unredacted into every /log dump.
+            # Redact both: ``extra_dirs`` is the live key, ``add_dirs`` kept
+            # defensively for any older on-disk schema.
+            for dirs_key in ("extra_dirs", "add_dirs"):
+                if dirs_key in redacted_v and isinstance(redacted_v[dirs_key], list):
+                    redacted_v[dirs_key] = [
+                        redact_path(p, username=username) if isinstance(p, str) else p
+                        for p in redacted_v[dirs_key]
+                    ]
             out[k] = redacted_v
         else:
             out[k] = v

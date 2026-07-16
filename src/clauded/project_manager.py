@@ -295,8 +295,16 @@ class ProjectManager:
     # ------------------------------------------------------------------
     # Extra directories
     # ------------------------------------------------------------------
-    def add_extra_dir(self, channel_id: int, path: str) -> str:
-        """Add an extra directory. Validates and stores. Returns resolved path."""
+    def add_extra_dir(
+        self, channel_id: int, path: str, *, guild_id: int | None = None
+    ) -> str:
+        """Add an extra directory. Validates and stores. Returns resolved path.
+
+        review E4: ``guild_id`` selects the confinement root the same way
+        :meth:`bind` does. When omitted the check falls back to the global
+        ``projects_root`` (preserving the pre-fix behaviour for callers that
+        don't have a guild in scope).
+        """
         with self._lock:
             self._assert_bound(channel_id)
             raw_parts = Path(path).expanduser().parts
@@ -305,11 +313,16 @@ class ProjectManager:
             resolved = Path(path).expanduser().resolve(strict=True)
             if not resolved.is_dir():
                 raise ValueError(f"Not a directory: {path}")
+            # review E4: validate against the PER-GUILD root (mirror of bind()),
+            # not the global projects_root. Otherwise a guild confined via
+            # /project set-root could /project add-dir a path outside its
+            # subtree, defeating the confinement boundary.
+            effective_root = self.get_guild_root(guild_id)
             try:
-                resolved.relative_to(self.projects_root)
+                resolved.relative_to(effective_root)
             except ValueError:
                 raise ValueError(
-                    f"Path {resolved} is outside the allowed projects root {self.projects_root}."
+                    f"Path {resolved} is outside the allowed projects root {effective_root}."
                 ) from None
             key = str(channel_id)
             entry = self._projects.get(key, {})

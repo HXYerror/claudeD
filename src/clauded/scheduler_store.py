@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import secrets
+import threading
 from pathlib import Path
+
+from ._json_store import atomic_write_json
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +31,9 @@ class SchedulerStore:
         self._dir = Path(data_dir)
         self._path = self._dir / "schedules.json"
         self._schedules: dict[str, dict] = {}
+        # review E5: shared atomic-writer lock (#252) — serialises the whole
+        # write so in-memory state can't tear between json.dump and os.replace.
+        self._lock = threading.Lock()
         self._load()
 
     # ------------------------------------------------------------------ I/O
@@ -54,13 +59,12 @@ class SchedulerStore:
             self._schedules = {}
 
     def _save(self) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
-            json.dump(self._schedules, f, indent=2, default=str)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, self._path)
+        # review E5: delegate to the shared atomic writer (#252) instead of a
+        # fixed ``schedules.tmp``. The old fixed-tmp name reintroduced exactly
+        # the shared-tmp clobber race #252 eliminated for every other store;
+        # atomic_write_json uses a unique ``.{pid}.{hex}.tmp`` + in-process
+        # lock + fsync + os.replace + stale-tmp cleanup.
+        atomic_write_json(self._path, self._schedules, self._lock, default=str)
 
     # ---------------------------------------------------------------- CRUD
 

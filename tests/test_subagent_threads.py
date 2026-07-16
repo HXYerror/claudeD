@@ -898,3 +898,112 @@ async def test_subagent_footer_renders_from_user_message_tool_use_result():
     assert "850" in desc
     # 1.2k output tokens (1200 humanized)
     assert "1.2k" in desc
+
+
+# ---------------------------------------------------------------------------
+# review A3/A4/A5/A6 — bot-side subagent-completion notification chain.
+#
+# These pin the fix that REPLACED the old #310 ``_subagent_threads`` map
+# (session_id → thread_id) with per-agent_id ``_pending_subagents``
+# (thread_id → {agent_id: agent_type}). The old map (a) always held exactly
+# one entry per session — so `_warn_pending_subagents` false-warned on every
+# normal turn — and (b) was del'd after the FIRST subagent stopped, wiping
+# routing + the count for later parallel subagents.
+#
+# The exhaustive callback-level coverage lives in
+# tests/test_review_subagent_notify.py; here we pin the single most important
+# regression invariant (routing/count survives the first stop) inside the
+# canonical subagent test file.
+# ---------------------------------------------------------------------------
+
+
+class _NotifyChannel:
+    def __init__(self, cid: int) -> None:
+        self.id = cid
+        self.embeds: list = []
+
+    async def send(self, content=None, **kwargs):
+        if kwargs.get("embed") is not None:
+            self.embeds.append(kwargs["embed"])
+        return FakeMessage(id=len(self.embeds))
+
+
+class _NotifyBot:
+    """Binds the real subagent notification methods off ClaudedBot."""
+
+    def __init__(self) -> None:
+        from clauded.bot import ClaudedBot as _CB
+
+        self._pending_subagents: dict[int, dict[str, str]] = {}
+        self._chan: dict[int, _NotifyChannel] = {}
+        self._make_subagent_start_cb = _CB._make_subagent_start_cb.__get__(self)
+        self._make_subagent_stop_cb = _CB._make_subagent_stop_cb.__get__(self)
+        self._warn_pending_subagents = _CB._warn_pending_subagents.__get__(self)
+        # _read_subagent_result is a @staticmethod — bind it as a plain
+        # callable attribute so ``self._read_subagent_result(...)`` works.
+        self._read_subagent_result = _CB._read_subagent_result
+
+    def get_channel(self, cid: int):
+        return self._chan.setdefault(cid, _NotifyChannel(cid))
+
+    async def fetch_channel(self, cid: int):
+        return self.get_channel(cid)
+
+
+@pytest.mark.asyncio
+async def test_subagent_routing_survives_first_stop():
+    """review A4/A5 regression: after the FIRST of two parallel subagents
+    stops, the second is STILL tracked (old code del'd the whole map) and a
+    second completion notification still routes to the same thread."""
+    bot = _NotifyBot()
+    thread_id = 4242
+    ch = bot.get_channel(thread_id)
+
+    start = bot._make_subagent_start_cb(thread_id)
+    stop = bot._make_subagent_stop_cb(thread_id)
+
+    await start({"agent_id": "s1", "agent_type": "general-purpose"})
+    await start({"agent_id": "s2", "agent_type": "Explore"})
+    assert len(bot._pending_subagents[thread_id]) == 2
+
+    await stop({"agent_id": "s1", "agent_type": "general-purpose"})
+    # Routing/count for s2 is intact — this is the core of the old bug.
+    assert list(bot._pending_subagents[thread_id]) == ["s2"]
+    # And a warning at this point reports exactly the 1 remaining subagent.
+    await bot._warn_pending_subagents(thread_id)
+    warn_embeds = [e for e in ch.embeds if "still running" in (e.description or "")]
+    assert len(warn_embeds) == 1
+    assert "1 subagent" in (warn_embeds[0].description or "")
+
+    # Second stop drains to empty; its completion embed still reached the thread.
+    n_before = len(ch.embeds)
+    await stop({"agent_id": "s2", "agent_type": "Explore"})
+    assert bot._pending_subagents.get(thread_id, {}) == {}
+    assert len(ch.embeds) == n_before + 1  # the s2 completion embed
+
+
+@pytest.mark.asyncio
+async def test_subagent_stop_no_attributeerror_from_removed_fields():
+    """review A3: the SubagentStop callback must not touch stop_reason /
+    summary / duration_ms (SubagentStopHookInput has none). Feed a payload
+    with ONLY the real fields and assert no AttributeError/KeyError and a
+    single embed lands."""
+    bot = _NotifyBot()
+    thread_id = 4343
+    ch = bot.get_channel(thread_id)
+    stop = bot._make_subagent_stop_cb(thread_id)
+
+    # Real SubagentStopHookInput shape — no stop_reason/summary/duration_ms.
+    await stop(
+        {
+            "hook_event_name": "SubagentStop",
+            "stop_hook_active": False,
+            "agent_id": "only",
+            "agent_type": "code-reviewer",
+            "agent_transcript_path": "/nonexistent/path.jsonl",
+            "session_id": "sess-x",
+        }
+    )
+    assert len(ch.embeds) == 1
+    assert "code-reviewer" in (ch.embeds[0].title or "")
+

@@ -339,17 +339,23 @@ async def send_to_claude(interaction: discord.Interaction, message: discord.Mess
         except Exception as exc:
             await interaction.followup.send(f"❌ Failed to start session: `{exc}`", ephemeral=True)
             return
-    try:
-        renderer = DiscordRenderer(thread)
-        user_text = message.content or "Hello"
-        await renderer.render_response(bridge, user_text)
-    except Exception:
-        log.exception("send_to_claude render failed")
-        await bot.session_manager.stop_session(thread.id)
+        # review D1: persist the session_id from this context-menu turn so the
+        # conversation survives a restart (create_session alone doesn't wire it).
+        bot._wire_session_persist_cb(bridge, thread.id)
+        # review B1: keep the render INSIDE the lock — it used to run after the
+        # ``async with`` closed, leaving the render unserialized against a
+        # concurrent turn on the same ClaudeSDKClient.
         try:
-            await thread.send(embed=discord.Embed(title="❌ Error", description="Claude session failed", color=0xEF4444))
+            renderer = DiscordRenderer(thread)
+            user_text = message.content or "Hello"
+            await renderer.render_response(bridge, user_text)
         except Exception:
-            pass
+            log.exception("send_to_claude render failed")
+            await bot.session_manager.stop_session(thread.id)
+            try:
+                await thread.send(embed=discord.Embed(title="❌ Error", description="Claude session failed", color=0xEF4444))
+            except Exception:
+                pass
     await interaction.followup.send(f"✅ Sent to Claude in {thread.mention}", ephemeral=True)
 
 

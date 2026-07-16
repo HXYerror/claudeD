@@ -136,10 +136,14 @@ def _snapshot_bot_flags(bot: Any) -> dict:
         "_debug_logging",
         "_pre_tool_notifications",
         "_notify_enabled",
-        "_allow_unbound_fallback",
+        # review E7: the runtime unbound-fallback flag is ``allow_unbound_fallback``
+        # (NO leading underscore — see ClaudedBot.__init__ / #160). The old key
+        # ``_allow_unbound_fallback`` never matched, so the single most
+        # security-relevant flag was silently absent from every /log dump —
+        # exactly the state an operator opens the bundle to inspect.
+        "allow_unbound_fallback",
         "_start_time",
         "_claude_version",
-        "_stream_debug_enabled",
     ]
     out: dict = {}
     for k in keys:
@@ -156,6 +160,15 @@ def _snapshot_bot_flags(bot: Any) -> dict:
                     out[k] = str(v)
             except Exception:
                 out[k] = "<unrenderable>"
+    # review E7: stream-debug state is NOT a bot attribute (the old
+    # ``_stream_debug_enabled`` key never existed); it lives in the
+    # stream_logger module (env CLAUDED_STREAM_DEBUG or set_enabled override).
+    # Local import keeps bundle import-light and avoids any cycle.
+    try:
+        from .. import stream_logger
+        out["stream_debug_enabled"] = stream_logger.is_enabled()
+    except Exception:
+        pass
     return out
 
 
