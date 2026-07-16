@@ -125,6 +125,14 @@ class ClaudeBridge:
         self._active = False
         self._session_id: str | None = None
         self._on_session_id_cb: Callable[[str], None] | None = None
+        # T2-B: set True when a resume was REQUESTED but the CLI handed back a
+        # different session_id on the first message — i.e. the resume silently
+        # failed (session GC'd, cwd/project-hash mismatch, …) and the CLI
+        # started a FRESH conversation. Without this the bot captured the new
+        # id and moved on with zero signal, so users saw "it opened a new
+        # session and I don't know why". We log it + fire on_resume_failed.
+        self.resume_failed: bool = False
+        self._on_resume_failed_cb = sc.on_resume_failed
         # Aggregate stats updated whenever we observe a ResultMessage. They
         # are purely informational (surfaced via /session info) so the
         # exact semantics — total cost across the session, last-known turn
@@ -935,8 +943,31 @@ class ClaudeBridge:
         if isinstance(sid, str) and sid:
             first_time = self._session_id is None
             self._session_id = sid
-            if first_time and self._on_session_id_cb is not None:
-                self._on_session_id_cb(sid)
+            if first_time:
+                # T2-B: silent-resume-failure detection. A successful
+                # ``--resume S`` continues session S and reports session_id S
+                # on its first message; a DIFFERENT id means the CLI could not
+                # resume and quietly started fresh (context lost). ``fork_session``
+                # produces a new id ON PURPOSE, so exclude it.
+                if (
+                    self._resume_session_id
+                    and not self._fork_session
+                    and sid != self._resume_session_id
+                ):
+                    self.resume_failed = True
+                    log.warning(
+                        "resume MISMATCH: requested %s but CLI returned %s — "
+                        "prior conversation was NOT resumed (fresh session started)",
+                        self._resume_session_id,
+                        sid,
+                    )
+                    if self._on_resume_failed_cb is not None:
+                        try:
+                            self._on_resume_failed_cb(self._resume_session_id, sid)
+                        except Exception:
+                            log.debug("on_resume_failed callback raised; ignoring", exc_info=True)
+                if self._on_session_id_cb is not None:
+                    self._on_session_id_cb(sid)
 
     def _update_stats(self, msg: ResultMessage) -> None:
         """Pull per-turn totals off a ``ResultMessage`` into instance state.

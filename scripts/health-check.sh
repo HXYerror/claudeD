@@ -6,6 +6,12 @@ RESTART_COUNTER="$HOME/Library/Caches/clauded/restart-count"
 ALERTS_LOG="$HOME/Library/Logs/clauded/alerts.log"
 HEALTHCHECK_LOG="$HOME/Library/Logs/clauded/healthcheck.log"
 STALE_THRESHOLD_SECS=120
+# T2-D: longer grace window while a turn is in flight. The bot writes the
+# in-flight-turn count as the heartbeat file CONTENT; a transient event-loop
+# stall UNDER a turn (memory-pressure thrash) then gets this bigger budget
+# instead of a hard kickstart -k that would drop the not-yet-persisted
+# session_id and force a cold resume next message (the T2 resume bug).
+ACTIVE_TURN_THRESHOLD_SECS=300
 
 mkdir -p "$(dirname "$HEARTBEAT")" "$(dirname "$ALERTS_LOG")"
 
@@ -45,14 +51,25 @@ fi
 # Stale heartbeat check
 if [ ! -f "$HEARTBEAT" ]; then
     AGE=99999
+    ACTIVE_TURNS=0
 else
     HEARTBEAT_MTIME=$(stat -f %m "$HEARTBEAT")
     AGE=$((NOW - HEARTBEAT_MTIME))
+    # T2-D: heartbeat CONTENT is the in-flight-turn count (integer). Empty or
+    # legacy (mtime-only) files parse to 0, preserving the original 120s path.
+    ACTIVE_TURNS=$(tr -dc '0-9' < "$HEARTBEAT" 2>/dev/null)
+    [ -z "$ACTIVE_TURNS" ] && ACTIVE_TURNS=0
 fi
 
-if [ "$AGE" -gt "$STALE_THRESHOLD_SECS" ]; then
-    log_line "heartbeat stale ($AGE s); kickstarting com.hxy.clauded"
-    echo "$(date '+%F %T') heartbeat stale ($AGE s); kickstarting com.hxy.clauded" >> "$ALERTS_LOG"
+# T2-D: pick the grace window based on whether a turn is actively rendering.
+THRESHOLD=$STALE_THRESHOLD_SECS
+if [ "$ACTIVE_TURNS" -gt 0 ]; then
+    THRESHOLD=$ACTIVE_TURN_THRESHOLD_SECS
+fi
+
+if [ "$AGE" -gt "$THRESHOLD" ]; then
+    log_line "heartbeat stale (${AGE}s > ${THRESHOLD}s, active_turns=${ACTIVE_TURNS}); kickstarting com.hxy.clauded"
+    echo "$(date '+%F %T') heartbeat stale (${AGE}s, active_turns=${ACTIVE_TURNS}); kickstarting com.hxy.clauded" >> "$ALERTS_LOG"
     launchctl kickstart -k "gui/$(id -u)/com.hxy.clauded" 2>/dev/null || true
 
     # Track restart count in rolling 5-min window via /tmp file (per-day rotating)
@@ -74,5 +91,5 @@ if [ "$AGE" -gt "$STALE_THRESHOLD_SECS" ]; then
 else
     # Healthy run — emit a log line so operators can confirm the
     # healthcheck IS firing (was zero-output before #168).
-    log_line "ok — heartbeat age ${AGE}s (threshold ${STALE_THRESHOLD_SECS}s)"
+    log_line "ok — heartbeat age ${AGE}s (threshold ${THRESHOLD}s, active_turns=${ACTIVE_TURNS})"
 fi
