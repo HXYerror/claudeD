@@ -110,6 +110,14 @@ async def test_cleanup_concurrent_one_stuck_two_healthy(
 
     bot.session_manager.list_sessions = MagicMock(return_value=sessions)
     bot.session_manager.save_session_state = MagicMock()
+    # review B2: _cleanup_task now checks ``get_lock(tid).locked()`` and holds
+    # the lock across the stop (so it never disconnects a bridge mid-turn).
+    # Model it with real, unlocked asyncio.Locks so these idle sessions are
+    # eligible for reaping (a bare MagicMock's .locked() is truthy → skipped).
+    _locks: dict[int, asyncio.Lock] = {}
+    bot.session_manager.get_lock = MagicMock(
+        side_effect=lambda tid: _locks.setdefault(tid, asyncio.Lock())
+    )
 
     stopped: list[int] = []
 

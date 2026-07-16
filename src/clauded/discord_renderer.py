@@ -274,6 +274,17 @@ EDIT_INTERVAL_SECONDS = 1.2
 MAX_HTTP_RETRIES = 5
 _BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0)  # seconds, indexed by attempt
 
+# review A1: total wall-clock budget for the post-ResultMessage drain of
+# trailing workflow Task* messages. ``receive_response()`` returns at the
+# first ResultMessage, so a workflow subtask whose terminal
+# TaskNotification/TaskUpdated lands just after the result would otherwise
+# never be finalized (its ``⚡ Running`` embed stays forever + the
+# ``_task_states`` entry leaks into the next turn). We only enter this drain
+# when tasks are still pending, so normal turns pay ZERO latency. Env
+# ``CLAUDED_DRAIN_TOTAL_TIMEOUT`` overrides (default 8s). Per-message gap
+# timeout lives in ``ClaudeBridge.receive_pending`` (``CLAUDED_DRAIN_MSG_TIMEOUT``).
+DRAIN_TOTAL_SECONDS = float(os.environ.get("CLAUDED_DRAIN_TOTAL_TIMEOUT", "8.0"))
+
 # Threshold above which a code block is uploaded as a file attachment.
 CODE_FILE_UPLOAD_THRESHOLD = 3000
 
@@ -1168,6 +1179,67 @@ class DiscordRenderer:
         )
 
     # ------------------------------------------------------------------
+    # review A1: unified Task* dispatch (shared by main loop + drain)
+    # ------------------------------------------------------------------
+
+    async def _dispatch_task_event(
+        self,
+        event: Any,
+        subagent_renderers: dict[str, "DiscordRenderer"],
+    ) -> bool:
+        """Route a #292 Dynamic Workflow ``Task*`` message to its handler.
+
+        Returns ``True`` iff ``event`` was one of the four SDK ``Task*``
+        message types AND we handled it (i.e. the caller should treat it as
+        consumed and ``continue``). Returns ``False`` for any non-Task* event,
+        and also for Task* events we intentionally leave for the sub-thread
+        path (a ``TaskStartedMessage`` whose ``task_type`` is not a workflow —
+        that's a plain sub-agent, handled by the live ``parent_tool_use_id``
+        routing in the main loop) or that we aren't tracking (Progress /
+        Notification / Updated for a ``task_id`` not in ``_task_states``).
+
+        review A1: extracted verbatim from the inline block that used to live
+        in :meth:`render_response`'s main loop (the four ``isinstance(event,
+        _SdkTask*Message)`` checks plus their gates). Sharing one code path
+        means the post-ResultMessage drain (which runs
+        :meth:`ClaudeBridge.receive_pending`) finalizes trailing workflow
+        terminals with byte-for-byte the same behavior as the in-stream case.
+        The ordering matters: ``TaskUpdated`` must be checked last so a future
+        SDK subclass overlap doesn't shadow the isinstance-matched types above
+        it (same rationale as the original inline block).
+        """
+        if _SdkTaskStartedMessage is not None and isinstance(event, _SdkTaskStartedMessage):
+            task_type = getattr(event, "task_type", "") or ""
+            if "workflow" in task_type.lower():
+                await self._handle_task_started(event, subagent_renderers)
+                return True
+            # Normal subagent — fall through to sub-thread path (not handled here)
+            return False
+
+        if _SdkTaskProgressMessage is not None and isinstance(event, _SdkTaskProgressMessage):
+            task_id = getattr(event, "task_id", "")
+            if task_id in self._task_states:  # Only handle if we started tracking it (workflow)
+                await self._handle_task_progress(event)
+                return True
+            return False
+
+        if _SdkTaskNotificationMessage is not None and isinstance(event, _SdkTaskNotificationMessage):
+            task_id = getattr(event, "task_id", "")
+            if task_id in self._task_states:
+                await self._handle_task_notification(event)
+                return True
+            return False
+
+        if _SdkTaskUpdatedMessage is not None and isinstance(event, _SdkTaskUpdatedMessage):
+            task_id = getattr(event, "task_id", "")
+            if task_id in self._task_states:
+                await self._handle_task_updated(event)
+                return True
+            return False
+
+        return False
+
+    # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
@@ -1198,6 +1270,14 @@ class DiscordRenderer:
         last_edit = 0.0
         typewriter = False                        # have we entered typewriter mode?
         saw_text = False                          # any TextBlock seen?
+        # review C1: did streaming deltas deliver text for the CURRENT
+        # assistant message? Set in the ``content_block_delta`` text handler,
+        # consulted + reset when the matching AssistantMessage content list is
+        # processed. When a provider/proxy doesn't emit deltas (non-streaming
+        # gateway / LiteLLM / some Copilot bridges), this stays False and the
+        # AssistantMessage TextBlock branch renders the text as a fallback
+        # instead of dropping it to the "(no text response)" placeholder.
+        stream_text_seen = False
         # tool_use_id -> discord.Message
         tool_msgs: dict[str, discord.Message] = {}
         tool_names: dict[str, str] = {}
@@ -1235,19 +1315,15 @@ class DiscordRenderer:
         medium_results: dict[str, tuple[str, str]] = {}
         tool_results_view: ToolResultsView | None = None
 
+        # review A1: set True when the main loop breaks on ResultMessage.
+        # Gates the post-loop ``receive_pending()`` drain so it only runs on a
+        # normally-completed turn that still has pending workflow tasks (never
+        # on the transient/fatal-error paths, which ``return``/``raise`` before
+        # reaching the drain).
         result_received = False
-        drain_deadline = 0.0
 
         try:
             async for event in bridge.send_message(user_text):
-                # AC6: drain timeout check — after ResultMessage, keep
-                # looping only while tasks are still pending and within 5s.
-                if result_received and not self._task_states:
-                    break  # all tasks finished after drain
-                if result_received and time.monotonic() > drain_deadline:
-                    log.warning("#292 drain timeout: %d tasks still pending", len(self._task_states))
-                    break
-
                 _log_stream(event, buffer_len=len(buffer))
 
                 # Tool results can arrive on UserMessage objects too — handle any
@@ -1431,34 +1507,18 @@ class DiscordRenderer:
                 # types emitted during ``effort=xhigh/max`` parallel
                 # sub-agent execution. Handlers own the entire render for
                 # these events — no ``content`` list to feed the main
-                # AssistantMessage/UserMessage branches below. The order
-                # matters: TaskUpdated must run last so a future SDK
-                # subclass overlap doesn't shadow the isinstance-matched
-                # types above it.
-                if _SdkTaskStartedMessage is not None and isinstance(event, _SdkTaskStartedMessage):
-                    task_type = getattr(event, "task_type", "") or ""
-                    if "workflow" in task_type.lower():
-                        await self._handle_task_started(event, subagent_renderers)
-                        continue
-                    # Normal subagent — fall through to sub-thread path
-
-                if _SdkTaskProgressMessage is not None and isinstance(event, _SdkTaskProgressMessage):
-                    task_id = getattr(event, "task_id", "")
-                    if task_id in self._task_states:  # Only handle if we started tracking it (workflow)
-                        await self._handle_task_progress(event)
-                        continue
-
-                if _SdkTaskNotificationMessage is not None and isinstance(event, _SdkTaskNotificationMessage):
-                    task_id = getattr(event, "task_id", "")
-                    if task_id in self._task_states:
-                        await self._handle_task_notification(event)
-                        continue
-
-                if _SdkTaskUpdatedMessage is not None and isinstance(event, _SdkTaskUpdatedMessage):
-                    task_id = getattr(event, "task_id", "")
-                    if task_id in self._task_states:
-                        await self._handle_task_updated(event)
-                        continue
+                # AssistantMessage/UserMessage branches below.
+                # review A1: dispatch is now delegated to the shared
+                # :meth:`_dispatch_task_event` helper so the identical logic
+                # can be re-run by the post-ResultMessage drain below. It
+                # returns True iff it fully handled a Task* message (workflow
+                # TaskStarted, or a Progress/Notification/Updated for a
+                # tracked task); we ``continue`` then. A non-workflow
+                # TaskStarted returns False so it falls through to the
+                # sub-thread ``parent_tool_use_id`` routing that already ran
+                # above for its content, matching pre-A1 behavior.
+                if await self._dispatch_task_event(event, subagent_renderers):
+                    continue
 
                 if isinstance(event, ResultMessage):
                     # Capture stats from the result.
@@ -1493,12 +1553,15 @@ class DiscordRenderer:
                     stats["context_percentage"] = await _fetch_context_pct_settled(
                         bridge, log_label="footer"
                     )
-                    if not self._task_states:
-                        break  # no pending tasks, exit immediately
-                    # AC6: drain trailing Task* messages for up to 5s
-                    drain_deadline = time.monotonic() + 5.0
+                    # review A1: ``receive_response()`` returns at the first
+                    # ResultMessage, so there is nothing more to iterate here —
+                    # the old ``result_received=True; continue`` path was dead
+                    # code (the ``async for`` ended anyway). Break the main loop
+                    # unconditionally; the bounded ``receive_pending()`` drain
+                    # AFTER the loop is what now finalizes any trailing workflow
+                    # Task* terminals still pending in ``_task_states``.
                     result_received = True
-                    continue  # keep looping to catch Task* after Result
+                    break
 
 
                 # -------------------------------------------------------
@@ -1516,6 +1579,13 @@ class DiscordRenderer:
                             text = delta.get("text", "")
                             if text:
                                 saw_text = True
+                                # review C1: a real streaming text delta arrived
+                                # for the CURRENT assistant message, so the
+                                # trailing AssistantMessage TextBlock replay is
+                                # a duplicate and must be skipped. This flag is
+                                # consumed + reset when we process that
+                                # AssistantMessage's content list below.
+                                stream_text_seen = True
                                 buffer += text
 
                                 now = time.time()
@@ -1636,26 +1706,28 @@ class DiscordRenderer:
                             continue
 
                         if isinstance(block, TextBlock):
-                            # Skip: with include_partial_messages=True, all text
-                            # arrives via StreamEvent first. TextBlock is a duplicate.
+                            # review C1: normally a duplicate — with
+                            # ``include_partial_messages=True`` the text already
+                            # arrived via StreamEvent ``content_block_delta``
+                            # (which set ``stream_text_seen`` + appended
+                            # ``buffer``), so skip it to avoid double-rendering.
+                            # BUT some providers/proxies (non-streaming gateway,
+                            # LiteLLM, certain Copilot bridges) never emit those
+                            # deltas — the real answer arrives ONLY here. When no
+                            # stream text was seen for this assistant message and
+                            # the block carries real text, render it as a
+                            # fallback (append to ``buffer`` + set ``saw_text``)
+                            # so the normal finalize path shows it instead of the
+                            # "(Claude returned no text response)" placeholder.
+                            # Precedent: the #183 synthetic-error branch above
+                            # handles a sibling non-streaming AssistantMessage
+                            # case. Idempotency: gating on ``not
+                            # stream_text_seen`` is what prevents the streaming
+                            # case from rendering text twice.
+                            if not stream_text_seen and block.text.strip():
+                                saw_text = True
+                                buffer += block.text
                             continue
-
-                            now = time.time()
-                            if start_time is None:
-                                start_time = now
-
-                            # Enter typewriter mode once we've been streaming long enough.
-                            if not typewriter and (now - start_time) > FAST_PATH_SECONDS:
-                                typewriter = True
-                                live_msg, buffer = await self._typewriter_tick(
-                                    live_msg, buffer
-                                )
-                                last_edit = now
-                            elif typewriter and (now - last_edit) >= EDIT_INTERVAL_SECONDS:
-                                live_msg, buffer = await self._typewriter_tick(
-                                    live_msg, buffer
-                                )
-                                last_edit = now
 
                         elif isinstance(block, ToolUseBlock):
                             # Finalize any pending typewriter message before
@@ -2446,6 +2518,16 @@ class DiscordRenderer:
                                     if preserved_desc:
                                         result_embed.description = preserved_desc
                                 await self._safe_edit(orig_msg, embed=result_embed)
+                    # review C1: reset the per-message streaming flag at the
+                    # AssistantMessage boundary. Deltas for the NEXT assistant
+                    # message arrive AFTER this event, so clearing here (not at
+                    # the top of the branch) keeps the flag scoped to exactly
+                    # one assistant message. Gated on AssistantMessage because
+                    # UserMessage shares this content-list branch (it carries
+                    # tool results) and must not clear a flag set by the
+                    # assistant text that preceded it.
+                    if isinstance(event, AssistantMessage):
+                        stream_text_seen = False
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # Discord blip — bridge is fine, just couldn't render. The
@@ -2472,6 +2554,23 @@ class DiscordRenderer:
                     await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
                 except Exception:  # noqa: BLE001
                     log.debug("transient-recovery flush also failed; deferring", exc_info=True)
+                # review C3: the blip outlasted our retry budget, so the tail of
+                # the response (and the cost footer) may not have landed — yet
+                # render_response returns normally, so the caller marks the turn
+                # ✅. Post a best-effort notice so the user isn't left with a
+                # misleading clean checkmark. Guarded: if the blip is ongoing
+                # this send just no-ops (it has its own retry budget).
+                try:
+                    await self._safe_send(embed=discord.Embed(
+                        description=(
+                            "⚠️ A Discord connectivity blip interrupted delivery — "
+                            "part of the response above may be missing. "
+                            "Resend your message if it looks truncated."
+                        ),
+                        color=COLOR_TOOL_FAILURE,
+                    ))
+                except Exception:  # noqa: BLE001
+                    log.debug("C3 partial-delivery notice failed", exc_info=True)
                 # Don't re-raise — caller (_render_with_retry) won't stop_session.
                 return
             log.exception("Renderer fatal error; tearing down bridge")
@@ -2482,6 +2581,37 @@ class DiscordRenderer:
             if live_msg is not None:
                 await self._safe_edit(live_msg, content=buffer[:DISCORD_MAX_LEN] or "…")
             raise
+
+        # review A1: bounded post-ResultMessage drain of trailing workflow
+        # Task* terminals. ``bridge.send_message`` streams from
+        # ``client.receive_response()``, which RETURNS at the first
+        # ResultMessage — so a workflow subtask whose terminal
+        # TaskNotification/TaskUpdated arrives just AFTER the main result never
+        # gets finalized by the main loop (its ``⚡ Running`` embed would stay
+        # forever + the ``_task_states`` entry would leak into the next turn).
+        # ``receive_pending()`` opens a SECOND iterator on the SDK's shared
+        # receive stream and drains whatever landed after
+        # ``receive_response()`` stopped. We ONLY enter this when tasks are
+        # still pending, so normal turns pay zero added latency and
+        # ``receive_pending`` is never even consumed. We stop as soon as the
+        # pending set empties (fast path) and hard-cap the total wall-clock at
+        # ``DRAIN_TOTAL_SECONDS`` so a subtask that never terminates can't hang
+        # the turn. Any drain error is swallowed inside ``receive_pending``
+        # (the turn is already complete). Task embeds are their own Discord
+        # messages, so finalizing them here — before the text flush + footer
+        # below — does not disturb the assistant-text ordering.
+        if result_received and self._task_states:
+            drain_deadline = time.monotonic() + DRAIN_TOTAL_SECONDS
+            async for event in bridge.receive_pending():
+                await self._dispatch_task_event(event, subagent_renderers)
+                if not self._task_states:
+                    break
+                if time.monotonic() > drain_deadline:
+                    log.warning(
+                        "review A1: drain timeout, %d task(s) still pending",
+                        len(self._task_states),
+                    )
+                    break
 
         # Stream finished cleanly. Flush whatever is left.
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
@@ -3109,6 +3239,17 @@ class DiscordRenderer:
             # can interleave text segments with PNG follow-ups (PRD R2.2).
             await self._finalize_typewriter(live_msg, buffer)
             return
+
+        # review C2: a whitespace-only buffer is not real content. Sending it
+        # hits Discord 50006 (cannot send an empty message), which logs a
+        # spurious ERROR-level "DROPPED" line, while the "(no text response)"
+        # placeholder below stays suppressed because ``saw_text`` is True (the
+        # whitespace arrived as a text delta). Blank both so we fall through to
+        # the placeholder and give the user a clean acknowledgement instead of
+        # silence + a false content-loss error.
+        if buffer and not buffer.strip():
+            buffer = ""
+            saw_text = False
 
         # Fast-path: split text from tables before send. If buffer is empty
         # the extractor is a no-op (returns ``("", [])``).

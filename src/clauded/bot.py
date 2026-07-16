@@ -8,6 +8,7 @@ messages to a per-thread :class:`ClaudeBridge` session.
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import shutil
@@ -346,10 +347,23 @@ class ClaudedBot(commands.Bot):
         # #292 S3: bot-level workflow task registry. DiscordRenderer writes
         # task lifecycle states here (via self._bot ref); /workflow cog reads.
         self._workflow_tasks: dict = {}
-        # #310: bot-level subagent→thread mapping. Keyed by session_id of the
-        # bridge that spawned the subagent → thread_id where the notification
-        # should go. Survives renderer return so SubagentStop can notify.
-        self._subagent_threads: dict[str, int] = {}
+        # review A4/A5: per-subagent pending tracking. thread_id →
+        # {agent_id: agent_type}. Populated by the SubagentStart hook
+        # (_make_subagent_start_cb) and drained per-agent_id by SubagentStop.
+        # This REPLACES the old #310 ``_subagent_threads`` (session_id →
+        # thread_id) map, which had exactly one entry per session and so
+        # both (a) false-warned "1 subagent still running" on every normal
+        # turn and (b) got del'd after the FIRST subagent stopped, destroying
+        # the count for later parallel subagents. Routing no longer needs a
+        # map at all — the completion/start callbacks are built per-thread via
+        # _make_subagent_{start,stop}_cb(thread_id), so the closure already
+        # captures the correct thread_id.
+        #
+        # Robustness: if the SubagentStart hook does NOT fire in some CLI
+        # versions, this dict simply stays empty → pending count 0 → no
+        # warning at all (graceful degradation; still strictly better than
+        # the old guaranteed false positive).
+        self._pending_subagents: dict[int, dict[str, str]] = {}
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -614,12 +628,24 @@ class ClaudedBot(commands.Bot):
                 to_remove.append(thread_id)
 
         async def _stop_one(tid: int) -> None:
-            try:
-                self.session_manager.save_session_state(tid)
-                await self.session_manager.stop_session(tid)
-                log.info("Auto-expired session for thread %s", tid)
-            except Exception:
-                log.exception("Auto-expire failed for thread %s", tid)
+            # review B2: never disconnect a bridge while a turn is in flight. A
+            # long max-effort turn doesn't refresh ``_last_activity`` mid-run,
+            # so it can look "idle" here; tearing down its client mid-stream
+            # races the renderer's ``receive_response()``. If the per-thread
+            # lock is held a turn is running → the session isn't really idle,
+            # so skip this cycle. Otherwise hold the lock across the stop so a
+            # turn can't start underneath us.
+            lock = self.session_manager.get_lock(tid)
+            if lock.locked():
+                log.debug("Auto-expire skipped (turn in flight) thread %s", tid)
+                return
+            async with lock:
+                try:
+                    self.session_manager.save_session_state(tid)
+                    await self.session_manager.stop_session(tid)
+                    log.info("Auto-expired session for thread %s", tid)
+                except Exception:
+                    log.exception("Auto-expire failed for thread %s", tid)
 
         if to_remove:
             # #146: stop sessions concurrently so one stuck bridge doesn't
@@ -878,10 +904,11 @@ class ClaudedBot(commands.Bot):
                     pass  # logged by bridge already
 
                 async def _stop_notify(input_data: dict) -> None:
-                    reason = input_data.get("stop_reason", "unknown")
-                    log.info("Session stopped: %s", reason)
+                    # review Finding 38: StopHookInput carries NO stop_reason
+                    # (only hook_event_name + stop_hook_active). Don't read it.
+                    log.info("Session stopped (thread=%d)", thread.id)
                     # #310: warn user if subagents still running
-                    await self._warn_pending_subagents(thread.id, reason)
+                    await self._warn_pending_subagents(thread.id)
 
                 env_vars = self.project_manager.get_env(channel.id)
                 _notify = self._notify_enabled.get(thread.id, self._pre_tool_notifications)
@@ -891,6 +918,7 @@ class ClaudedBot(commands.Bot):
                     on_pre_tool_use=_pre_tool_notify if _notify else None,
                     on_post_tool_use=_post_tool_notify,
                     on_stop=_stop_notify,
+                    on_subagent_start=self._make_subagent_start_cb(thread.id),
                     on_subagent_stop=self._make_subagent_stop_cb(thread.id),
                     add_dirs=extra_dirs or None,
                     mcp_servers=mcp_servers or None,
@@ -1085,10 +1113,10 @@ class ClaudedBot(commands.Bot):
                         pass  # logged by bridge already
 
                     async def _stop_notify_thread(input_data: dict) -> None:
-                        reason = input_data.get("stop_reason", "unknown")
-                        log.info("Session stopped: %s", reason)
+                        # review Finding 38: StopHookInput has NO stop_reason.
+                        log.info("Session stopped (thread=%s)", thread_id)
                         # #310: warn user if subagents still running
-                        await self._warn_pending_subagents(thread_id, reason)
+                        await self._warn_pending_subagents(thread_id)
 
                     env_vars = self.project_manager.get_env(parent_id)
                     _notify = self._notify_enabled.get(thread_id, self._pre_tool_notifications)
@@ -1101,6 +1129,7 @@ class ClaudedBot(commands.Bot):
                         on_pre_tool_use=_pre_tool_notify_thread if _notify else None,
                         on_post_tool_use=_post_tool_notify_thread,
                         on_stop=_stop_notify_thread,
+                        on_subagent_start=self._make_subagent_start_cb(thread_id),
                         on_subagent_stop=self._make_subagent_stop_cb(thread_id),
                         add_dirs=extra_dirs or None,
                         mcp_servers=mcp_servers or None,
@@ -1299,28 +1328,94 @@ class ClaudedBot(commands.Bot):
     def _wire_session_persist_cb(self, bridge: "ClaudeBridge", thread_id: int) -> None:
         """#301 R2: persist session_id the moment the first ResultMessage arrives.
 
-        #310: also register session_id → thread_id in ``_subagent_threads``
-        so the SubagentStop callback can look up where to send the notification.
+        review A4/A5: no longer registers a session_id → thread_id map. The
+        old #310 ``_subagent_threads[sid] = thread_id`` line lived here and
+        was the root of the per-session leak + false-warning bugs. Subagent
+        routing now comes from the per-thread closure in
+        _make_subagent_{start,stop}_cb, so nothing needs to be registered.
         """
+        # review A6 tail: this runs only when a FRESH bridge is created (reused
+        # live bridges skip it). A fresh session means any subagents left in
+        # this thread's pending bucket belong to a dead prior session — their
+        # SubagentStop can never arrive — so clear them now. Otherwise an
+        # orphaned entry (SubagentStart fired, session killed before
+        # SubagentStop) would produce a stale "N subagent(s) still running"
+        # warning on a later turn's stop.
+        self._pending_subagents.pop(thread_id, None)
+
         def _on_sid(sid: str) -> None:
             self.session_manager.save_session_state(thread_id)
-            # #310: register mapping so subagent completion can find the thread
-            self._subagent_threads[sid] = thread_id
         bridge._on_session_id_cb = _on_sid
 
+    @staticmethod
+    def _read_subagent_result(agent_transcript_path: str | None) -> str:
+        """review A6: best-effort extract the subagent's final result text.
 
-    async def _warn_pending_subagents(self, thread_id: int, reason: str) -> None:
-        """#310: send warning embed if subagents are still running when session stops."""
-        pending = sum(
-            1 for _sid, tid in self._subagent_threads.items()
-            if tid == thread_id
-        )
+        ``agent_transcript_path`` (from SubagentStopHookInput) points at a
+        JSONL transcript of the subagent's run. We read the TAIL and parse
+        the LAST assistant text block → the subagent's final answer, then
+        truncate to ~800 chars. Any problem (missing/unreadable/malformed
+        file) returns "" so the caller falls back to a generic message and
+        never crashes.
+        """
+        if not agent_transcript_path:
+            return ""
+        try:
+            p = Path(agent_transcript_path)
+            if not p.is_file():
+                return ""
+            # Read the tail only — transcripts can be large. 256 KiB is more
+            # than enough to hold the final assistant turn.
+            data = p.read_bytes()
+            tail = data[-262_144:]
+            text = tail.decode("utf-8", errors="replace")
+            last_text = ""
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    # Partial first line from the tail slice, or non-JSON. Skip.
+                    continue
+                # Transcript rows are typically {"type": "assistant",
+                # "message": {"content": [ {"type": "text", "text": ...}, ...]}}.
+                # Be liberal: also accept a top-level "content" list.
+                if obj.get("type") not in (None, "assistant"):
+                    continue
+                msg = obj.get("message", obj)
+                content = msg.get("content") if isinstance(msg, dict) else None
+                if isinstance(content, str):
+                    last_text = content
+                elif isinstance(content, list):
+                    parts = [
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    joined = "\n".join(t for t in parts if t)
+                    if joined:
+                        last_text = joined
+            return last_text.strip()[:800]
+        except Exception:
+            log.debug("review A6: failed reading subagent transcript", exc_info=True)
+            return ""
+
+    async def _warn_pending_subagents(self, thread_id: int) -> None:
+        """#310 / review A4/A5: warn if subagents are still running on stop.
+
+        Counts real pending subagents for THIS thread via ``_pending_subagents``
+        (one entry per agent_id). On a normal turn with no subagents the count
+        is 0 → we send nothing (the old code always saw 1 stale session entry
+        and false-warned every turn).
+        """
+        pending = len(self._pending_subagents.get(thread_id, {}))
         if pending <= 0:
             return
         embed = discord.Embed(
             title="⏹️ Session ended",
             description=(
-                f"Reason: {reason}\n"
                 f"⚠️ {pending} subagent(s) still running in background "
                 f"— will notify when complete"
             ),
@@ -1335,62 +1430,89 @@ class ClaudedBot(commands.Bot):
         except Exception:
             log.debug("#310: failed to send pending-subagent warning", exc_info=True)
 
-    def _make_subagent_stop_cb(self, thread_id: int) -> Any:
-        """#310: build a callback that notifies Discord when a subagent completes.
+    def _make_subagent_start_cb(self, thread_id: int) -> Any:
+        """review A4/A5: build a SubagentStart callback that records a pending
+        subagent for this thread.
 
-        The callback is stored in SessionConfig.on_subagent_stop and invoked
-        by the SubagentStop hook in claude_bridge.py. It sends a ✅ embed to
-        the thread even if the main renderer has already returned.
+        Stored in SessionConfig.on_subagent_start, invoked by the SubagentStart
+        hook in claude_bridge.py. ``SubagentStartHookInput`` carries agent_id +
+        agent_type (and session_id from BaseHookInput). We key pending state by
+        agent_id so parallel subagents are counted independently and the
+        completion count survives after the first one stops.
+        """
+        async def _on_subagent_start(input_data: dict) -> None:
+            agent_id = input_data.get("agent_id")
+            agent_type = input_data.get("agent_type")
+            if not agent_id:
+                return
+            self._pending_subagents.setdefault(thread_id, {})[agent_id] = (
+                agent_type or "subagent"
+            )
+
+        return _on_subagent_start
+
+    def _make_subagent_stop_cb(self, thread_id: int) -> Any:
+        """#310 / review A3/A6: notify Discord when a subagent completes.
+
+        Stored in SessionConfig.on_subagent_stop, invoked by the SubagentStop
+        hook in claude_bridge.py. Sends a ✅ embed to the thread even if the
+        main renderer has already returned.
+
+        review A3: ``SubagentStopHookInput`` provides agent_id / agent_type /
+        agent_transcript_path — and NO stop_reason / summary / duration_ms.
+        The old code read those non-existent fields, so the embed was always
+        the contentless "Subagent finished." and the real output never reached
+        Discord.
+
+        review A6: we surface the subagent's real result to Discord by reading
+        the tail of agent_transcript_path. Re-injecting that result back into
+        Claude's own conversation is DEFERRED (was reverted in #310, needs a
+        separate design).
         """
         async def _on_subagent_stop(input_data: dict) -> None:
-            reason = input_data.get("stop_reason", "")
-            session_id = input_data.get("session_id", "")
-            # Try to compute duration from bridge start_time if available
-            duration_str = ""
-            if "duration_ms" in input_data:
-                ms = input_data["duration_ms"]
-                secs = int(ms / 1000)
-                if secs >= 60:
-                    duration_str = f"{secs // 60}m {secs % 60}s"
-                else:
-                    duration_str = f"{secs}s"
+            agent_id = input_data.get("agent_id")
+            agent_type = input_data.get("agent_type")
+            agent_transcript_path = input_data.get("agent_transcript_path")
 
-            # Build embed
-            desc_parts = []
-            summary = input_data.get("summary", "")
-            if summary:
-                desc_parts.append(f"📋 **Summary:** {summary[:500]}")
-            if duration_str:
-                desc_parts.append(f"⏱️ Duration: {duration_str}")
-            if reason and reason != "end_turn":
-                desc_parts.append(f"Reason: {reason}")
+            # review A4/A5: drain this agent_id from pending (guard both the
+            # thread bucket and the id — SubagentStart may not have fired).
+            bucket = self._pending_subagents.get(thread_id)
+            if bucket is not None:
+                bucket.pop(agent_id, None)
+                if not bucket:
+                    self._pending_subagents.pop(thread_id, None)
+
+            # review A6: surface the real result (Discord only).
+            result_text = self._read_subagent_result(agent_transcript_path)
+            label = agent_type or "subagent"
+            if result_text:
+                description = result_text
+            else:
+                description = f"✅ Subagent (`{label}`) completed"
 
             embed = discord.Embed(
-                title="✅ Subagent completed",
-                description="\n".join(desc_parts) if desc_parts else "Subagent finished.",
+                title=f"✅ Subagent completed ({label})",
+                description=description,
                 color=COLOR_INFO,
             )
 
-            # Find the thread to send to
-            target_thread_id = thread_id
-            # If there's a sub-thread for this session, prefer that
-            if session_id and session_id in self._subagent_threads:
-                target_thread_id = self._subagent_threads[session_id]
-
+            # Route to the closure thread_id — no session→thread map needed.
             try:
-                channel = self.get_channel(target_thread_id)
+                channel = self.get_channel(thread_id)
                 if channel is None:
-                    channel = await self.fetch_channel(target_thread_id)
+                    channel = await self.fetch_channel(thread_id)
                 if channel is not None:
                     await safe_send_message(channel, embed=embed)
                 else:
-                    log.warning("#310: could not find thread %d for subagent notification", target_thread_id)
+                    log.warning(
+                        "#310: could not find thread %d for subagent notification",
+                        thread_id,
+                    )
             except Exception:
-                log.warning("#310: failed to send subagent completion notification", exc_info=True)
-
-            # Clean up the mapping entry
-            if session_id and session_id in self._subagent_threads:
-                del self._subagent_threads[session_id]
+                log.warning(
+                    "#310: failed to send subagent completion notification",
+                    exc_info=True,
+                )
 
         return _on_subagent_stop
 
@@ -1453,10 +1575,10 @@ class ClaudedBot(commands.Bot):
             pass  # logged by bridge already
 
         async def _stop_notify(input_data: dict) -> None:
-            reason = input_data.get("stop_reason", "unknown")
-            log.info("Session stopped: %s", reason)
+            # review Finding 38: StopHookInput has NO stop_reason.
+            log.info("Session stopped (thread=%s)", thread_id)
             # #310: warn user if subagents still running
-            await self._warn_pending_subagents(thread_id, reason)
+            await self._warn_pending_subagents(thread_id)
 
         sc = SessionConfig(
             system_prompt=self.project_manager.get_system_prompt(parent_id),
@@ -1467,6 +1589,7 @@ class ClaudedBot(commands.Bot):
             on_pre_tool_use=pre_tool_cb,
             on_post_tool_use=_post_tool_notify,
             on_stop=_stop_notify,
+            on_subagent_start=self._make_subagent_start_cb(thread_id),
             on_subagent_stop=self._make_subagent_stop_cb(thread_id),
             **overrides,
         )
@@ -2082,12 +2205,13 @@ class ClaudedBot(commands.Bot):
         )
 
     async def _notify_schedule_expired(self, sched: dict) -> None:
-        """Notify the schedule's created channel that its max_lifetime fired.
+        """Notify the schedule's created channel that it was auto-disabled.
 
-        Called by :meth:`SchedulerManager._check_max_lifetime` once the
-        cumulative lifetime since first fire has elapsed (PRD §3.8). Best-
-        effort: failures are logged but never bubble — the schedule is
-        already disabled by the time we get here.
+        Called by :meth:`SchedulerManager._check_max_lifetime` (max_lifetime
+        reached) and, review E3, by :meth:`SchedulerManager._on_fire_terminal`
+        (retries exhausted / terminal Discord error). We branch on
+        ``state.last_error`` to pick the wording. Best-effort: failures are
+        logged but never bubble — the schedule is already disabled.
         """
         channel_id = sched.get("channel_id")
         if not channel_id:
@@ -2096,17 +2220,31 @@ class ClaudedBot(commands.Bot):
                 sched.get("schedule_id"),
             )
             return
+        sid = (sched.get("schedule_id", "") or "")[:8]
+        name = sched.get("name", "")
+        last_error = (sched.get("state") or {}).get("last_error") or ""
+        if last_error == "max_lifetime reached":
+            title = "⏰ Schedule expired"
+            description = (
+                f"Schedule `{sid}` (*{name}*) reached its max_lifetime "
+                f"and has been auto-disabled."
+            )
+        else:
+            # review E3: crash auto-disable (exhausted retries / terminal error).
+            title = "⚠️ Schedule auto-disabled"
+            description = (
+                f"Schedule `{sid}` (*{name}*) kept failing and has been "
+                f"auto-disabled after repeated attempts.\n"
+                f"Last error: `{last_error[:300]}`\n"
+                f"-# Fix the cause, then recreate/re-enable it."
+            )
         try:
             channel = self.get_channel(channel_id)
             if channel is None:
                 channel = await self.fetch_channel(channel_id)
             embed = discord.Embed(
-                title="⏰ Schedule expired",
-                description=(
-                    f"Schedule `{(sched.get('schedule_id','') or '')[:8]}` "
-                    f"(*{sched.get('name','')}*) reached its max_lifetime "
-                    f"and has been auto-disabled."
-                ),
+                title=title,
+                description=description,
                 color=COLOR_INFO,
             )
             await safe_send_message(channel, embed=embed)

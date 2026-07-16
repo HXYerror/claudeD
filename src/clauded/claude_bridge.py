@@ -569,6 +569,26 @@ class ClaudeBridge:
 
         _hooks_dict["SubagentStop"] = [HookMatcher(matcher=None, hooks=[_hook_subagent_stop])]
 
+        # --- SubagentStart hook: notified when a subagent starts ---
+        # #310 R2: SubagentStartHookInput carries session_id (BaseHookInput),
+        # agent_id and agent_type. The bot uses this to track pending
+        # subagents PER agent_id (not per session), so the completion count
+        # and routing survive multiple parallel subagents in one session.
+        async def _hook_subagent_start(
+            input_data: dict[str, Any],
+            tool_use_id: str | None,
+            context: HookContext,
+        ) -> dict[str, Any]:
+            log.info("Subagent started: %s", str(input_data)[:200])
+            if self._session_config.on_subagent_start:
+                try:
+                    await self._session_config.on_subagent_start(input_data)
+                except Exception:
+                    log.debug("on_subagent_start callback raised; ignoring", exc_info=True)
+            return {}
+
+        _hooks_dict["SubagentStart"] = [HookMatcher(matcher=None, hooks=[_hook_subagent_start])]
+
         # Always assign hooks dict (we now unconditionally register PreCompact etc.)
         hooks = _hooks_dict
 
@@ -714,6 +734,12 @@ class ClaudeBridge:
                 await self._client.query(_stream())
 
             async for msg in self._client.receive_response():
+                # review D2: capture + persist session_id from the EARLIEST
+                # message that carries it (the CLI's init SystemMessage), not
+                # just the terminal ResultMessage. A long fresh first turn that
+                # crashes before its ResultMessage used to leave sessions.json
+                # with no id at all → the whole turn was unresumable.
+                self._capture_session_id(msg)
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
                 yield msg
@@ -753,6 +779,73 @@ class ClaudeBridge:
                         "Error disconnecting ClaudeSDKClient after stream failure"
                     )
             raise
+
+    async def receive_pending(
+        self,
+        per_message_timeout: float | None = None,
+    ) -> AsyncIterator[object]:
+        """Drain SDK messages that arrive AFTER ``receive_response()`` returned.
+
+        ``ClaudeSDKClient.receive_response()`` (used by :meth:`send_message`)
+        terminates at the first ``ResultMessage``. Any messages the CLI emits
+        *after* that — e.g. a trailing ``TaskUpdatedMessage`` /
+        ``TaskNotificationMessage`` for a background/workflow subtask whose
+        terminal state lands just after the main turn's result — stay buffered
+        in the SDK's shared receive stream and are NOT delivered by that
+        ``receive_response()`` call. Without draining them, a workflow
+        subtask's ``⚡ Running`` embed never gets its terminal ✅/❌ and
+        ``_task_states`` leaks into the next turn (review finding A1 / #292).
+
+        Yields further raw SDK message objects, stopping as soon as no message
+        arrives within ``per_message_timeout`` seconds (the trailing burst has
+        drained) or the underlying stream ends. Best-effort: any error ends the
+        drain silently — the turn is already complete, so a failed drain must
+        never surface as a turn error. Callers should stop iterating once their
+        pending-work set is empty (they own the "how long / what to keep"
+        policy) so this only blocks for one ``per_message_timeout`` gap.
+
+        Safe because the SDK's background read task pumps every message into a
+        single shared anyio memory-object stream; a *second* ``receive_messages``
+        iterator continues draining that stream from where ``receive_response``
+        stopped. On the per-message timeout we let ``asyncio.wait_for`` cancel
+        the in-flight ``__anext__``, then STOP and discard the iterator (never
+        resume it), so cancellation happens at most once — anyio memory-stream
+        receives are cancellation-safe and the next turn's fresh
+        ``query()``/``receive_response()`` on the same client is unaffected.
+        """
+        client = self._client
+        if client is None or not self._active:
+            return
+        if per_message_timeout is None:
+            per_message_timeout = float(
+                os.environ.get("CLAUDED_DRAIN_MSG_TIMEOUT", "3.0")
+            )
+        it = client.receive_messages().__aiter__()
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(
+                        it.__anext__(), timeout=per_message_timeout
+                    )
+                except (asyncio.TimeoutError, StopAsyncIteration):
+                    return
+                except Exception:
+                    log.debug(
+                        "receive_pending: drain read failed; stopping", exc_info=True
+                    )
+                    return
+                if isinstance(msg, ResultMessage):
+                    self._update_stats(msg)
+                yield msg
+        finally:
+            aclose = getattr(it, "aclose", None)
+            if aclose is not None:
+                try:
+                    await aclose()
+                except Exception:
+                    log.debug(
+                        "receive_pending: iterator aclose failed", exc_info=True
+                    )
 
     async def interrupt(self) -> bool:
         """Interrupt the current Claude operation. Returns True if interrupted."""
@@ -829,6 +922,22 @@ class ClaudeBridge:
         # Auto-approve all other tools
         return PermissionResultAllow()
 
+    def _capture_session_id(self, msg: object) -> None:
+        """Persist the session_id from any SDK message that carries one.
+
+        review D2: called on EVERY message in the ``send_message`` stream so a
+        fresh session's id is saved as soon as the CLI reports it (its init
+        SystemMessage), not only when the terminal ResultMessage arrives. The
+        ``first_time`` guard means the ``_on_session_id_cb`` (which writes
+        sessions.json) fires exactly once, so hoisting it is free.
+        """
+        sid = getattr(msg, "session_id", None)
+        if isinstance(sid, str) and sid:
+            first_time = self._session_id is None
+            self._session_id = sid
+            if first_time and self._on_session_id_cb is not None:
+                self._on_session_id_cb(sid)
+
     def _update_stats(self, msg: ResultMessage) -> None:
         """Pull per-turn totals off a ``ResultMessage`` into instance state.
 
@@ -837,13 +946,10 @@ class ClaudeBridge:
         missing — newer/older SDKs may rename fields, and we'd rather
         surface partial stats than crash the stream.
         """
-        # Extract session_id from ResultMessage
-        sid = getattr(msg, "session_id", None)
-        if isinstance(sid, str) and sid:
-            first_time = self._session_id is None
-            self._session_id = sid
-            if first_time and self._on_session_id_cb is not None:
-                self._on_session_id_cb(sid)
+        # review D2: session_id capture moved to _capture_session_id (called on
+        # every message). Kept here too for direct callers/tests — idempotent
+        # via the first_time guard.
+        self._capture_session_id(msg)
 
         cost = getattr(msg, "total_cost_usd", None)
         if isinstance(cost, (int, float)):

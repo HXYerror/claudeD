@@ -92,16 +92,20 @@ async def test_api_error_overrides_no_text_placeholder():
 
 
 @pytest.mark.asyncio
-async def test_normal_textblock_still_skipped_when_error_is_none():
-    """Pin: legitimate streamed-text duplication still skips TextBlock
-    when error is None. Without this guard the API-error fix could
-    accidentally start rendering all assistant TextBlocks twice (once
-    via streaming, once via the AssistantMessage replay)."""
-    # Two TextBlocks on a normal AssistantMessage (error=None).
-    # The renderer's TextBlock branch skips them entirely; with no
-    # tools and no streaming text, saw_text stays False, so the
-    # placeholder DOES fire — proves the API-error early-out only
-    # activates when error is not None.
+async def test_normal_textblock_no_error_renders_via_c1_fallback():
+    """error=None non-streamed TextBlock renders its text (review C1),
+    and NO ``❌ Provider error`` embed fires (the #183 early-out is gated
+    on ``error is not None``).
+
+    Behavior change (review C1): before C1 this exact scenario (error=None,
+    a TextBlock, and NO StreamEvent deltas) dropped to the
+    "(Claude returned no text response)" placeholder — the real answer was
+    lost for non-streaming providers/proxies. Now the TextBlock branch is a
+    fallback: with no stream text seen for the message, the block text is
+    rendered normally. This test still pins the #183 invariant that the
+    red provider-error embed only appears when ``error`` is set — it never
+    fires for a legitimate ``error=None`` message.
+    """
     events = [
         AssistantMessage(
             content=[TextBlock(text="Normal model output")],
@@ -119,22 +123,28 @@ async def test_normal_textblock_still_skipped_when_error_is_none():
     renderer = DiscordRenderer(target)
     await renderer.render_response(FakeBridge(events), "hello")
 
-    # No red error embed
+    # No red error embed — the #183 early-out stays gated on error != None.
     error_embeds = [
         m for m in target._sent
         if m.embeds and (m.embeds[0].title or "").startswith("❌ Provider error")
     ]
     assert not error_embeds, "Should NOT render error embed when error is None"
-    # Placeholder DOES fire (because TextBlock is skipped as a streaming
-    # duplicate and no real stream event came through in this test)
+    # review C1: the placeholder must NOT fire — the real text is rendered.
     placeholder_msgs = [
         m for m in target._sent
         if "no text response" in (m.content or "")
     ]
-    assert placeholder_msgs, (
-        "Without streamed text, the placeholder MUST still fire for "
-        "non-error AssistantMessages (existing behavior pin)"
+    assert not placeholder_msgs, (
+        "review C1: non-streamed TextBlock text must render, not fall through "
+        "to the '(no text response)' placeholder"
     )
+    # The actual answer reached Discord.
+    text_msgs = [m for m in target._sent if "Normal model output" in (m.content or "")]
+    assert text_msgs, (
+        f"Expected 'Normal model output' to reach Discord; "
+        f"got contents: {[m.content[:60] for m in target._sent if m.content]}"
+    )
+
 
 
 @pytest.mark.asyncio

@@ -188,7 +188,11 @@ async def project_add_dir(interaction: discord.Interaction, path: str) -> None:
     # thread → parent so the extra dir attaches to the bound row, not the
     # (unbound) thread id. See #209.
     try:
-        resolved = bot.project_manager.add_extra_dir(binding_id, path)
+        # review E4: pass guild_id so the extra dir is confined to the guild's
+        # root (mirror of /project bind), not the global projects_root.
+        resolved = bot.project_manager.add_extra_dir(
+            binding_id, path, guild_id=interaction.guild_id
+        )
     except ValueError as exc:
         await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
         return

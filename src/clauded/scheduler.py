@@ -701,21 +701,28 @@ class SchedulerManager:
         with.
         """
         sid = sched.get("schedule_id")
-        async with self._inflight_sem:
-            kind = sched.get("kind")
-            if kind == "message":
-                lock_id = sched.get("target_thread_id")
-            else:
-                lock_id = sched.get("target_channel_id")
-            if lock_id is None:
-                # Defensive — would already have failed validation in create().
-                log.warning(
-                    "#241 _fire_one missing lock id schedule=%s kind=%s",
-                    sched.get("schedule_id"), kind,
-                )
+        kind = sched.get("kind")
+        if kind == "message":
+            lock_id = sched.get("target_thread_id")
+        else:
+            lock_id = sched.get("target_channel_id")
+        if lock_id is None:
+            # Defensive — would already have failed validation in create().
+            log.warning(
+                "#241 _fire_one missing lock id schedule=%s kind=%s",
+                sched.get("schedule_id"), kind,
+            )
+            async with self._inflight_sem:
                 await self._fire_with_retry(sched)
-                return
-            async with self.get_lock(lock_id):
+            return
+        # review B3: acquire the per-target lock BEFORE the global inflight
+        # semaphore. The old order (sem → lock) let a fire blocked on a busy
+        # per-target lock keep holding a scarce sem slot, so N fires to busy
+        # threads could occupy every slot and starve a fire to an idle target
+        # (head-of-line blocking). Waiting on the lock first means a blocked
+        # fire holds NO global slot, so idle-target fires still proceed.
+        async with self.get_lock(lock_id):
+            async with self._inflight_sem:
                 # M1+M9: re-read state under the lock so a delete/toggle
                 # that landed between dispatch and lock-acquire wins.
                 if sid is not None:
@@ -771,11 +778,14 @@ class SchedulerManager:
                     await asyncio.sleep(backoffs[attempts - 1])
                     continue
         # Retries exhausted — disable with the last exception captured.
+        # review E3: notify=True so the user is told their schedule kept
+        # failing and was auto-disabled (this is the "3 crash-retries" path).
         await self._on_fire_terminal(
             sched,
             last_exc if last_exc is not None else RuntimeError(
                 "fire failed without exception"
             ),
+            notify=True,
         )
 
     # --------------------------------------------- success / terminal
@@ -837,18 +847,27 @@ class SchedulerManager:
         self._check_max_lifetime(sched)
 
     async def _on_fire_terminal(
-        self, sched: dict, exc: BaseException
+        self, sched: dict, exc: BaseException, *, notify: bool = False
     ) -> None:
         """Disable a schedule that hit an unrecoverable fire failure.
 
         Used for both terminal Discord exceptions (NotFound / Forbidden)
         and for exhausted retry budgets. The error string lands in
         ``state.last_error`` so ``/schedule list`` can surface it.
+
+        review E3: when ``notify`` is True (the retries-exhausted path) we also
+        fire the expire-notify callback so the user proactively learns their
+        schedule died — previously that was only discoverable via
+        /schedule list. The terminal Discord-error path passes notify=False:
+        the target thread/channel is gone (NotFound) or unpostable (Forbidden),
+        so a notification would be futile.
         """
         state = sched.setdefault("state", {})
         state["enabled"] = False
         state["last_error"] = f"{type(exc).__name__}: {exc}"
         self.store.save(sched)
+        if notify and self.expire_notify_callback is not None:
+            asyncio.create_task(self.expire_notify_callback(sched))
         log.warning(
             "#241 fire terminal disable schedule=%s exc=%s",
             sched.get("schedule_id"),

@@ -81,14 +81,18 @@ class SessionManager:
         if bridge is None:
             return False
         await bridge.stop()
-        # Reap the lock entry if no one is currently waiting on it.
-        # Without this the dict grows unbounded over the bot's lifetime,
-        # one entry per thread we've ever served. Holding the lock means
-        # there's an in-flight render — leave the entry alone in that case
-        # and let the next stop_session sweep it up.
-        lock = self._locks.get(thread_id)
-        if lock is not None and not lock.locked():
-            self._locks.pop(thread_id, None)
+        # Reap idle lock entries so the dict doesn't grow unbounded over the
+        # bot's lifetime. review E6: sweep ALL currently-unlocked entries, not
+        # just this thread_id — ``get_lock`` is also called for scheduler
+        # lock_ids that never open a session and so never reach this reaper via
+        # their own thread_id (the original leak). A held lock (``locked()``)
+        # means an in-flight render, so we leave it; the next sweep collects it.
+        # Safe because callers acquire atomically — ``async with
+        # get_lock(tid):`` has no await between create and acquire (asyncio
+        # Lock's uncontended acquire is synchronous), so an unlocked entry has
+        # no paused acquirer that could be stranded on a stale lock object.
+        for tid in [t for t, lk in self._locks.items() if not lk.locked()]:
+            self._locks.pop(tid, None)
         log.info("Stopped session thread=%s", thread_id)
         return True
 
