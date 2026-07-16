@@ -225,7 +225,7 @@ def _make_async_client(items: list[Any]) -> AsyncMock:
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
     client.query = AsyncMock()
-    client.receive_response = _iter
+    client.receive_messages = _iter
     return client
 
 

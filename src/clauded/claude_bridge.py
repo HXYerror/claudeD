@@ -557,7 +557,7 @@ class ClaudeBridge:
             tool_use_id: str | None,
             context: HookContext,
         ) -> dict[str, Any]:
-            log.info("Subagent stopped: %s", str(input_data)[:200])
+            log.info("Subagent stopped: %s", str(input_data)[:500])
             # #310: fire dedicated on_subagent_stop callback so the bot can
             # notify the user even after the main renderer has returned.
             if self._session_config.on_subagent_stop:
@@ -713,7 +713,7 @@ class ClaudeBridge:
                     }
                 await self._client.query(_stream())
 
-            async for msg in self._client.receive_response():
+            async for msg in self._client.receive_messages():
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
                 yield msg

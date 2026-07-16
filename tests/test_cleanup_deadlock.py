@@ -177,7 +177,7 @@ async def test_send_message_exception_path_disconnect_force_drops_after_timeout(
     class FakeStuckClient:
         async def query(self, *args, **kwargs):
             raise ValueError("synthetic SDK failure")
-        async def receive_response(self):
+        async def receive_messages(self):
             # If query raised before stream starts, this won't be called;
             # included for completeness.
             raise ValueError("synthetic SDK failure")
