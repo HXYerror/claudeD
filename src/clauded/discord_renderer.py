@@ -938,15 +938,37 @@ class DiscordRenderer:
                 progress, tokens, tool_uses, duration, last_tool,
             )
         else:
-            # Fallback: simple format when no workflowProgress data
+            # T1-B/T1-E: the CLI's ``workflowProgress`` payload never arrives
+            # in practice (investigation: 0 occurrences in any log), so the old
+            # fallback was a flat one-liner. Build a real per-agent panel from
+            # the hook-fed roster (bot._agent_roster — populated by
+            # SubagentStart/PreToolUse/SubagentStop, which DO fire) plus elapsed
+            # wall-clock, so the user sees live agent status regardless.
+            elapsed = int(time.time() - state.started_at) if state.started_at else 0
+            roster: dict = {}
+            try:
+                tid = getattr(self.target, "id", None)
+                if tid is not None and self._bot is not None:
+                    roster = getattr(self._bot, "_agent_roster", {}).get(tid, {}) or {}
+            except Exception:
+                roster = {}
+            lines = [
+                "━━━━━━━━━━━━━━━━━━━━━━━",
+                f"🔮 Task: {state.description[:60]}",
+                f"⏱️ {elapsed}s elapsed",
+            ]
+            agent_lines = self._format_roster_lines(roster)
+            if agent_lines:
+                lines.append(f"🤖 Agents: {len(roster)} running")
+                lines.extend(agent_lines)
+            else:
+                lines.append(f"💭 Last tool: {last_tool or '—'}")
+            lines.append(
+                f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
+            )
             embed = discord.Embed(
                 title="🔄 Dynamic Workflow Running",
-                description=(
-                    "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔮 Task: {state.description[:60]}\n"
-                    f"💭 Last tool: {last_tool or '—'}\n"
-                    f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
-                ),
+                description="\n".join(lines),
                 color=COLOR_TOOL_RUNNING,
             )
 
@@ -1027,6 +1049,36 @@ class DiscordRenderer:
         )
 
     @staticmethod
+    def _format_roster_lines(roster: dict) -> list[str]:
+        """T1-B: format the hook-fed per-agent roster into embed lines.
+
+        ``roster`` is ``bot._agent_roster[thread_id]`` — a mapping of
+        ``agent_id -> {type, tool, started}`` maintained by the
+        SubagentStart / PreToolUse / SubagentStop hooks. Unlike
+        :meth:`_format_agent_lines` (which needs the CLI's ``workflowProgress``
+        payload that never arrives), this derives entirely from hook data that
+        reliably fires. Shows type + current tool + elapsed, folded past 10.
+        """
+        lines: list[str] = []
+        now = time.time()
+        items = sorted(roster.items())
+        for i, (_aid, info) in enumerate(items, 1):
+            if i > 10:
+                remaining = len(items) - 10
+                if remaining > 0:
+                    lines.append(f"  … {remaining} more …")
+                break
+            if not isinstance(info, dict):
+                continue
+            atype = (info.get("type") or "subagent")[:24]
+            tool = info.get("tool")
+            started = info.get("started") or now
+            elapsed = int(now - started)
+            tool_seg = f"🔧 {tool}" if tool else "💭 …"
+            lines.append(f"  🔄 #{i} {atype} · {tool_seg} · ⏱️ {elapsed}s")
+        return lines
+
+    @staticmethod
     def _format_agent_lines(
         agents: list[dict], last_tool: str | None,
     ) -> list[str]:
@@ -1095,11 +1147,18 @@ class DiscordRenderer:
             color = COLOR_INFO
 
         embed = discord.Embed(title=title, description=description, color=color)
+        state = self._task_states.get(task_id)
+        # T1-D: fold total wall-clock duration into the terminal footer so the
+        # completed/failed/stopped card summarizes how long the workflow ran,
+        # alongside the SDK usage (tokens/tool-uses/SDK-time).
         usage_seg = self._fmt_task_usage(usage)
+        if state is not None and getattr(state, "started_at", 0):
+            elapsed = int(time.time() - state.started_at)
+            dur_seg = f"⏱️ {elapsed}s total"
+            usage_seg = f"{usage_seg} · {dur_seg}" if usage_seg else dur_seg
         if usage_seg:
             embed.set_footer(text=usage_seg)
 
-        state = self._task_states.get(task_id)
         edited = False
         if state and state.message is not None:
             edited = await self._safe_edit(state.message, embed=embed)

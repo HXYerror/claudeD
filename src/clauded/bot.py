@@ -391,6 +391,14 @@ class ClaudedBot(commands.Bot):
         # file so the external watchdog grants a longer grace window while a
         # turn is in flight (see _write_heartbeat_state + health-check.sh).
         self._active_turns: int = 0
+        # T1-B: live per-agent roster for the workflow/subagent UX, keyed by
+        # thread_id → agent_id → {type, tool, started}. Fed by the
+        # SubagentStart / PreToolUse / SubagentStop hooks (all of which fire
+        # reliably), so the workflow progress embed can show real per-agent
+        # status even though the CLI's ``workflowProgress`` payload never
+        # arrives in practice (investigation: 0 occurrences in any log). The
+        # renderer reads this via ``bot._agent_roster``.
+        self._agent_roster: dict[int, dict[str, dict]] = {}
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -925,6 +933,12 @@ class ClaudedBot(commands.Bot):
                 extra_dirs = self.project_manager.get_extra_dirs(channel.id)
                 mcp_servers = self.project_manager.get_mcp_servers(channel.id)
                 async def _pre_tool_notify(tool_name: str, input_data: dict) -> None:
+                    # T1-B: record the subagent's current tool in the live
+                    # roster (best-effort; only subagent tool calls carry an
+                    # agent_id via _SubagentContextMixin).
+                    aid = input_data.get("agent_id")
+                    if aid:
+                        self._roster_note_tool(thread.id, aid, tool_name)
                     try:
                         await thread.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
                     except Exception:
@@ -1134,6 +1148,11 @@ class ClaudedBot(commands.Bot):
                     _thread_target = message.channel
 
                     async def _pre_tool_notify_thread(tool_name: str, input_data: dict) -> None:
+                        # T1-B: record the subagent's current tool in the live
+                        # roster (best-effort; subagent tool calls carry agent_id).
+                        aid = input_data.get("agent_id")
+                        if aid:
+                            self._roster_note_tool(thread_id, aid, tool_name)
                         try:
                             await _thread_target.send(f"-# 🔮 Preparing: {tool_name}...", silent=True)
                         except Exception:
@@ -1488,6 +1507,35 @@ class ClaudedBot(commands.Bot):
         except Exception:
             log.debug("#310: failed to send pending-subagent warning", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # T1-B: live per-agent roster (workflow / subagent UX)
+    # ------------------------------------------------------------------
+
+    def _roster_note_start(self, thread_id: int, agent_id: str, agent_type: str | None) -> None:
+        """Record a newly-started subagent in the live roster."""
+        self._agent_roster.setdefault(thread_id, {})[agent_id] = {
+            "type": agent_type or "subagent",
+            "tool": None,
+            "started": time.time(),
+        }
+
+    def _roster_note_tool(self, thread_id: int, agent_id: str, tool: str | None) -> None:
+        """Update the current tool a subagent is running (best-effort)."""
+        bucket = self._agent_roster.get(thread_id)
+        if bucket is None:
+            return
+        entry = bucket.get(agent_id)
+        if entry is not None:
+            entry["tool"] = tool
+
+    def _roster_clear(self, thread_id: int, agent_id: str) -> None:
+        """Drop a finished subagent from the roster; prune empty threads."""
+        bucket = self._agent_roster.get(thread_id)
+        if bucket is not None:
+            bucket.pop(agent_id, None)
+            if not bucket:
+                self._agent_roster.pop(thread_id, None)
+
     def _make_subagent_start_cb(self, thread_id: int) -> Any:
         """review A4/A5: build a SubagentStart callback that records a pending
         subagent for this thread.
@@ -1506,6 +1554,9 @@ class ClaudedBot(commands.Bot):
             self._pending_subagents.setdefault(thread_id, {})[agent_id] = (
                 agent_type or "subagent"
             )
+            # T1-B: seed the live roster so the workflow embed can show this
+            # agent (type + current tool + elapsed) even without workflowProgress.
+            self._roster_note_start(thread_id, agent_id, agent_type)
 
         return _on_subagent_start
 
@@ -1539,6 +1590,9 @@ class ClaudedBot(commands.Bot):
                 bucket.pop(agent_id, None)
                 if not bucket:
                     self._pending_subagents.pop(thread_id, None)
+            # T1-B: drop from the live roster too.
+            if agent_id:
+                self._roster_clear(thread_id, agent_id)
 
             # review A6: surface the real result (Discord only).
             result_text = self._read_subagent_result(agent_transcript_path)
