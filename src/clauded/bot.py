@@ -220,6 +220,29 @@ def _touch_heartbeat() -> None:
         )
 
 
+def _write_heartbeat_state(active_turns: int) -> None:
+    """Write the in-flight-turn count to the heartbeat file (also refreshes mtime).
+
+    T2-D: the external watchdog reads this value to grant a longer grace window
+    while a turn is active, so a transient event-loop stall UNDER a turn (e.g.
+    memory-pressure thrash) doesn't hard-kill the bot mid-turn — which would
+    drop the session_id before it persisted and force a cold resume on the next
+    message (the T2 resume bug). Darwin-only; ``OSError`` swallowed like
+    :func:`_touch_heartbeat`. Content is a plain integer so the shell watchdog
+    can parse it; writing also refreshes mtime, preserving the legacy
+    liveness-by-mtime check.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        _HEARTBEAT_PATH.write_text(str(int(active_turns)))
+    except OSError as exc:
+        log.warning(
+            "_write_heartbeat_state failed; LaunchAgent health may be misled: %s",
+            exc,
+        )
+
+
 def _cleanup_tmp_dir(tmp_dir: Path | None) -> None:
     """Best-effort cleanup of an attachment temp directory.
 
@@ -364,6 +387,10 @@ class ClaudedBot(commands.Bot):
         # warning at all (graceful degradation; still strictly better than
         # the old guaranteed false positive).
         self._pending_subagents: dict[int, dict[str, str]] = {}
+        # T2-D: number of turns currently rendering. Written into the heartbeat
+        # file so the external watchdog grants a longer grace window while a
+        # turn is in flight (see _write_heartbeat_state + health-check.sh).
+        self._active_turns: int = 0
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -669,8 +696,11 @@ class ClaudedBot(commands.Bot):
         start so the healthcheck has a fresh file even before Discord login
         completes (otherwise a bad token → ``wait_until_ready`` hangs → stale
         heartbeat → kickstart loop bounded only by ``ThrottleInterval``).
+
+        T2-D: writes the in-flight-turn count as the file content so the
+        watchdog can be lenient while a turn is active.
         """
-        _touch_heartbeat()
+        _write_heartbeat_state(self._active_turns)
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -1347,6 +1377,34 @@ class ClaudedBot(commands.Bot):
             self.session_manager.save_session_state(thread_id)
         bridge._on_session_id_cb = _on_sid
 
+        # T2-B: surface a silent resume failure. When we asked the CLI to
+        # resume a stored session but it started a fresh one instead (session
+        # GC'd / cwd mismatch / prior turn killed mid-flight before it could
+        # finish), the user's context is gone. Post a subtle one-line notice so
+        # "it opened a new session and I don't know why" becomes explicit. The
+        # bridge fires this callback synchronously from inside the (async) send
+        # loop, so schedule the Discord send as a task.
+        def _on_resume_failed(requested_id: str, actual_id: str) -> None:
+            async def _notify() -> None:
+                try:
+                    channel = self.get_channel(thread_id) or await self.fetch_channel(thread_id)
+                    if channel is not None:
+                        await safe_send_message(
+                            channel,
+                            content=(
+                                "-# ⚠️ Couldn't resume the previous conversation — "
+                                "started a fresh session (the prior one may have ended "
+                                "abnormally or been cleaned up)."
+                            ),
+                        )
+                except Exception:
+                    log.debug("T2-B: resume-failed notice send failed", exc_info=True)
+            try:
+                asyncio.get_running_loop().create_task(_notify())
+            except RuntimeError:
+                log.debug("T2-B: no running loop for resume-failed notice", exc_info=True)
+        bridge._on_resume_failed_cb = _on_resume_failed
+
     @staticmethod
     def _read_subagent_result(agent_transcript_path: str | None) -> str:
         """review A6: best-effort extract the subagent's final result text.
@@ -1648,7 +1706,14 @@ class ClaudedBot(commands.Bot):
                 ),
                 guild_id=getattr(getattr(thread, "guild", None), "id", None),
             )
-            await renderer.render_response(bridge, user_text, author_id=author_id)
+            # T2-D: mark a turn in-flight so the heartbeat tells the watchdog
+            # to be lenient (a stall UNDER a turn shouldn't hard-kill the bot
+            # and drop the not-yet-persisted session_id).
+            self._active_turns += 1
+            try:
+                await renderer.render_response(bridge, user_text, author_id=author_id)
+            finally:
+                self._active_turns = max(0, self._active_turns - 1)
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # Render gave up (rare — _retry_http exhausted), but bridge is
@@ -1921,7 +1986,12 @@ class ClaudedBot(commands.Bot):
         bundle dispatch happens regardless.
         """
         try:
-            await renderer.render_response(bridge, what)
+            # T2-D: scheduled fires are turns too — count them in-flight.
+            self._active_turns += 1
+            try:
+                await renderer.render_response(bridge, what)
+            finally:
+                self._active_turns = max(0, self._active_turns - 1)
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # _retry_http exhausted at the lower layer; let the
@@ -2350,9 +2420,40 @@ def main() -> None:
     _ensure_runtime_dirs()
     _touch_heartbeat()
     _configure_logging()
+
+    # T2-A: make restart/crash causes DIAGNOSABLE. Investigation found the bot
+    # restarts far too often (crash-loops throttled to launchd's 30s
+    # ThrottleInterval), and the cause was invisible: StandardErrorPath is unset
+    # (#168) and only INFO+ logging reaches clauded.log. We now capture:
+    #   - uncaught Python exceptions (excepthook → clauded.log CRITICAL)
+    #   - C-level faults / segfaults (faulthandler → its own file that survives)
+    # plus a boot marker (pid) and a "main() exiting" marker below, so a
+    # *graceful* shutdown (SIGTERM from a watchdog kickstart, which unwinds
+    # cleanly) is distinguishable from a hard crash / OOM-kill (SIGKILL, which
+    # leaves NEITHER marker — the tell-tale of an out-of-memory death).
+    import faulthandler
+
+    def _log_uncaught(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log.critical(
+            "UNCAUGHT top-level exception — process exiting",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    sys.excepthook = _log_uncaught
+    try:
+        faulthandler.enable(open(_LOG_DIR / "faulthandler.log", "a"))
+    except Exception:
+        log.debug("faulthandler enable failed", exc_info=True)
+
     # The in-loop _heartbeat_task takes over once setup_hook fires and
     # refreshes mtime every 30 s thereafter.
-    log.info("claudeD starting (launchd label: %s)", _LAUNCHD_LABEL)
+    log.info(
+        "claudeD starting (launchd label: %s) pid=%s",
+        _LAUNCHD_LABEL, os.getpid(),
+    )
 
     # Resolve and log the operator's Claude CLI so it's visible at boot time.
     from .cli_paths import resolve_claude_cli
@@ -2389,6 +2490,17 @@ def main() -> None:
         bot2.agent_manager = bot.agent_manager
         bot2._start_time = bot._start_time
         bot2.run(config.discord_bot_token, log_handler=None)
+    except Exception:
+        # T2-A: a crash inside bot.run() (outside discord.py's own handling)
+        # now leaves a CRITICAL breadcrumb instead of a silent 30s relaunch.
+        log.critical("bot.run() terminated with an exception", exc_info=True)
+        raise
+    finally:
+        # T2-A: reaching here means an ORDERLY shutdown (SIGTERM/graceful close
+        # unwound the stack). If clauded.log ever stops WITHOUT this line, the
+        # process was hard-killed — SIGKILL / OOM — which no in-process handler
+        # can catch; correlate with memory pressure.
+        log.info("claudeD main() exiting (pid=%s)", os.getpid())
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ class SessionConfig:
     on_stop: Any = None  # callback
     on_subagent_stop: Any = None  # callback: fired when a subagent stops
     on_subagent_start: Any = None  # callback: fired when a subagent starts (#310 R2: per-subagent pending tracking)
+    on_resume_failed: Any = None  # callback(requested_id, actual_id): T2-B, fired when a requested resume silently started a fresh session
 
 
 __all__ = ["SessionConfig"]
