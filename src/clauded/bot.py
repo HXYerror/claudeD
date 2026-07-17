@@ -399,6 +399,15 @@ class ClaudedBot(commands.Bot):
         # arrives in practice (investigation: 0 occurrences in any log). The
         # renderer reads this via ``bot._agent_roster``.
         self._agent_roster: dict[int, dict[str, dict]] = {}
+        # #324: per-thread background stream reader. After a turn ends, the CLI
+        # keeps the stream open and PROACTIVELY pushes background-task
+        # completions (a standalone <task-notification> turn) + the main agent's
+        # continuation. receive_response() stopped at the turn's ResultMessage,
+        # so without this reader those never reach Discord. The reader runs
+        # BETWEEN turns and is cancelled before the next turn, so there is never
+        # more than one consumer of the SDK client's shared receive queue
+        # (the single-consumer invariant).
+        self._bg_readers: dict[int, "asyncio.Task"] = {}
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -674,8 +683,22 @@ class ClaudedBot(commands.Bot):
             if lock.locked():
                 log.debug("Auto-expire skipped (turn in flight) thread %s", tid)
                 return
+            # #323: also never reap a session with running background work. A
+            # background subagent/task runs AFTER the foreground turn ended (lock
+            # released), so the lock guard above doesn't cover it. If the thread
+            # still has pending subagents / a live agent roster, the "idle" look
+            # is a false positive — reaping would kill the background task's CLI
+            # subprocess. (_last_activity refresh in claude_bridge #323 already
+            # keeps genuinely-streaming sessions fresh; this covers the window
+            # where a background task is quiet between events.)
+            if self._pending_subagents.get(tid) or self._agent_roster.get(tid):
+                log.debug("Auto-expire skipped (background work active) thread %s", tid)
+                return
             async with lock:
                 try:
+                    # #324: stop the background reader before tearing the bridge
+                    # down (its stream is about to close).
+                    await self._cancel_bg_reader(tid)
                     self.session_manager.save_session_state(tid)
                     await self.session_manager.stop_session(tid)
                     log.info("Auto-expired session for thread %s", tid)
@@ -1536,6 +1559,98 @@ class ClaudedBot(commands.Bot):
             if not bucket:
                 self._agent_roster.pop(thread_id, None)
 
+    # ------------------------------------------------------------------
+    # #324: post-turn background stream reader (relay CLI-pushed completions)
+    # ------------------------------------------------------------------
+
+    async def _cancel_bg_reader(self, thread_id: int) -> None:
+        """Stop the per-thread background reader and wait for it to fully unwind.
+
+        MUST be awaited before a new turn calls ``send_message`` on this thread,
+        so the reader (which consumes the SDK client's shared receive queue) is
+        gone before the turn becomes the sole consumer (single-consumer
+        invariant). Safe to call when no reader is running.
+        """
+        task = self._bg_readers.pop(thread_id, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            log.debug("#324: bg reader teardown error thread=%s", thread_id, exc_info=True)
+
+    def _start_bg_reader(self, thread_id: int, bridge: "ClaudeBridge", channel: Any) -> None:
+        """Start (if not already running) a background reader for ``thread_id``.
+
+        Runs only BETWEEN turns. Relays the CLI's proactively-pushed post-turn
+        messages (a completed background task's ``<task-notification>`` + the
+        main agent's continuation) to ``channel`` in real time.
+        """
+        if self._bg_readers.get(thread_id) is not None:
+            return
+        if bridge is None or not getattr(bridge, "is_active", False):
+            return
+        self._bg_readers[thread_id] = asyncio.create_task(
+            self._bg_reader_loop(thread_id, bridge, channel)
+        )
+
+    async def _bg_reader_loop(self, thread_id: int, bridge: "ClaudeBridge", channel: Any) -> None:
+        """Consume late stream messages until idle for CLAUDED_BG_IDLE_TIMEOUT.
+
+        ``receive_pending`` yields messages as they arrive and returns once no
+        message shows up within its per-message timeout — here a long window so
+        the reader survives a quiet background task and is present when it
+        finally completes. Always cancellable; never runs concurrently with a
+        turn (the turn cancels it first via :meth:`_cancel_bg_reader`).
+        """
+        idle = float(os.environ.get("CLAUDED_BG_IDLE_TIMEOUT", "600"))
+        try:
+            async for msg in bridge.receive_pending(per_message_timeout=idle):
+                await self._relay_bg_message(channel, msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("#324: bg reader loop error thread=%s", thread_id, exc_info=True)
+        finally:
+            # Only clear if it's still us (a concurrent _cancel_bg_reader may
+            # have already popped + replaced the entry).
+            if self._bg_readers.get(thread_id) is asyncio.current_task():
+                self._bg_readers.pop(thread_id, None)
+
+    async def _relay_bg_message(self, channel: Any, msg: Any) -> None:
+        """Relay the agent's post-turn continuation TEXT to Discord.
+
+        Conservative: text only (``AssistantMessage`` ``TextBlock``s). Skips
+        UserMessage / ``<task-notification>`` echoes / stream events / tool
+        noise so the background follow-up (e.g. "here's the URL") shows up
+        without spamming. Best-effort; never raises.
+        """
+        try:
+            from .claude_bridge import AssistantMessage, TextBlock
+            if not isinstance(msg, AssistantMessage):
+                return
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                return
+            parts = [
+                b.text for b in content
+                if isinstance(b, TextBlock) and (getattr(b, "text", "") or "").strip()
+            ]
+            text = "\n".join(parts).strip()
+            if not text:
+                return
+            header = "-# 🔄 background follow-up\n"
+            first = True
+            for i in range(0, len(text), 1800):
+                chunk = text[i:i + 1800]
+                await safe_send_message(channel, content=(header + chunk) if first else chunk)
+                first = False
+        except Exception:
+            log.debug("#324: relay bg message failed", exc_info=True)
+
     def _make_subagent_start_cb(self, thread_id: int) -> Any:
         """review A4/A5: build a SubagentStart callback that records a pending
         subagent for this thread.
@@ -1760,6 +1875,13 @@ class ClaudedBot(commands.Bot):
                 ),
                 guild_id=getattr(getattr(thread, "guild", None), "id", None),
             )
+            tid = getattr(thread, "id", None)
+            # #324: stop any between-turns background reader so THIS turn is the
+            # sole consumer of the SDK client's shared receive queue
+            # (single-consumer invariant). Awaited → the reader is fully unwound
+            # before render_response calls send_message.
+            if tid is not None:
+                await self._cancel_bg_reader(tid)
             # T2-D: mark a turn in-flight so the heartbeat tells the watchdog
             # to be lenient (a stall UNDER a turn shouldn't hard-kill the bot
             # and drop the not-yet-persisted session_id).
@@ -1768,6 +1890,12 @@ class ClaudedBot(commands.Bot):
                 await renderer.render_response(bridge, user_text, author_id=author_id)
             finally:
                 self._active_turns = max(0, self._active_turns - 1)
+            # #324: turn done — resume the background reader so the CLI's
+            # proactively-pushed post-turn messages (a background task's
+            # completion + the main agent's continuation) are relayed to Discord
+            # in real time, until the next turn cancels it again.
+            if tid is not None:
+                self._start_bg_reader(tid, bridge, thread)
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # Render gave up (rare — _retry_http exhausted), but bridge is

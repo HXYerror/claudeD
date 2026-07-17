@@ -742,6 +742,12 @@ class ClaudeBridge:
                 await self._client.query(_stream())
 
             async for msg in self._client.receive_response():
+                # #323: refresh activity on EVERY streamed message so a session
+                # that is actively working — including a long/background task
+                # streaming subagent + TaskProgress events — is never seen as
+                # "idle" by the bot's idle-reaper (which would tear down the CLI
+                # subprocess and kill the background task).
+                self._last_activity = time.time()
                 # review D2: capture + persist session_id from the EARLIEST
                 # message that carries it (the CLI's init SystemMessage), not
                 # just the terminal ResultMessage. A long fresh first turn that
@@ -844,6 +850,8 @@ class ClaudeBridge:
                     return
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
+                # #323: draining late messages counts as activity too.
+                self._last_activity = time.time()
                 yield msg
         finally:
             aclose = getattr(it, "aclose", None)

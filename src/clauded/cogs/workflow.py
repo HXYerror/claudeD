@@ -170,7 +170,42 @@ async def workflow_detail(interaction: discord.Interaction, task_id: str) -> Non
     embed.add_field(name="📋 ID", value=f"`{full_id[:8]}`", inline=True)
     embed.add_field(name="🤖 Type", value=task_type, inline=True)
     embed.add_field(name="⏱️ Duration", value=duration, inline=True)
-    embed.add_field(name="🔮 Description", value=desc[:200] or "—", inline=False)
+    embed.add_field(name="🔮 Description", value=desc[:1000] or "—", inline=False)
+
+    # #322: live per-agent roster (maintained by the SubagentStart /
+    # PreToolUse / SubagentStop hooks) so detail shows what each spawned agent
+    # is actually doing. This is the real content — the aggregate "Usage"
+    # below is only the ORCHESTRATOR's own footprint, not the sum of the agents
+    # it spawned (which is why a 74-min multi-agent workflow can show "5 tool
+    # uses"). We surface both, clearly labelled.
+    thread_id = getattr(state, "thread_id", None)
+    roster = {}
+    if thread_id is not None:
+        roster = (getattr(bot, "_agent_roster", {}) or {}).get(thread_id, {}) or {}
+    if roster:
+        lines: list[str] = []
+        for i, (_aid, info) in enumerate(sorted(roster.items()), 1):
+            if not isinstance(info, dict):
+                continue
+            if i > 12:
+                lines.append(f"… {len(roster) - 12} more")
+                break
+            atype = (info.get("type") or "agent")[:24]
+            tool = info.get("tool")
+            started_a = info.get("started") or now
+            el = _format_duration(now - started_a)
+            tool_seg = f"🔧 {tool}" if tool else "💭 …"
+            lines.append(f"🔄 {atype} · {tool_seg} · ⏱️ {el}")
+        embed.add_field(
+            name=f"🤖 Agents ({len(roster)} running)",
+            value="\n".join(lines)[:1024] or "—",
+            inline=False,
+        )
+
+    last_tool = getattr(state, "last_tool_name", None)
+    if last_tool:
+        embed.add_field(name="💭 Last tool", value=str(last_tool)[:100], inline=True)
+
     usage_parts: list[str] = []
     if tokens:
         usage_parts.append(f"🪙 {tokens:,} tokens")
@@ -179,6 +214,12 @@ async def workflow_detail(interaction: discord.Interaction, task_id: str) -> Non
     if duration_ms:
         usage_parts.append(f"⏱️ {duration_ms / 1000:.1f}s SDK time")
     if usage_parts:
-        embed.add_field(name="Usage", value=" · ".join(usage_parts), inline=False)
+        # #322: label honestly — orchestrator's own usage, NOT the aggregate
+        # across spawned agents.
+        embed.add_field(
+            name="Usage (orchestrator only)",
+            value=" · ".join(usage_parts),
+            inline=False,
+        )
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
