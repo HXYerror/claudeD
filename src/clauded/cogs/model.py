@@ -145,15 +145,25 @@ async def model_switch(interaction: discord.Interaction, name: str) -> None:
         )
         return
 
-    # No active session — fall back to recreate (context starts fresh)
-    bridge = await bot._recreate_session(interaction, model_override=name)
+    # No active session — recreate. #audit(#7): pass resume_session_id so a
+    # dead/restarted session preserves prior context, matching every sibling
+    # recreate command (/effort, /max-turns, /fallback, /bare, /tools.*). Only
+    # the model choice is ephemeral (#210); the transcript is still resumed.
+    sid = bot._get_resume_session_id(thread_id)
+    bridge = await bot._recreate_session(
+        interaction, model_override=name, resume_session_id=sid
+    )
     if bridge:
+        context_note = (
+            "✅ Context preserved from the prior session."
+            if sid
+            else "⚠️ No prior context (no saved session for this thread)."
+        )
         await interaction.followup.send(
             embed=discord.Embed(
                 title=f"🔄 Switched to `{name}`",
                 description=(
-                    "✅ Model set for new session.\n"
-                    "⚠️ No prior context (session was not active).\n\n"
+                    f"✅ Model set for new session.\n{context_note}\n\n"
                     "-# ⏱️ **Per-session** — bot restart returns to CLI default."
                 ),
                 color=COLOR_INFO,

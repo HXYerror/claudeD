@@ -37,13 +37,25 @@ async def session_stop(interaction: discord.Interaction) -> None:
         )
         return
 
-    stopped = await bot.session_manager.stop_session(thread_id)
+    # #audit(#4): interrupt any in-flight turn, THEN hold the per-thread lock
+    # across the stop. A bare stop_session → bridge.stop() → client.disconnect()
+    # closes the anyio TaskGroup out from under a concurrent receive_response()
+    # and crashes the turn (the bridge documents this hazard at
+    # claude_bridge.py:794). Defer first because acquiring the lock may wait for
+    # the in-flight turn to end. Mirrors /session clear's locked teardown.
+    await interaction.response.defer(ephemeral=True)
+    bridge = bot.session_manager.get_session(thread_id)
+    if bridge is not None and bridge.is_active:
+        try:
+            await bridge.interrupt()
+        except Exception:
+            log.debug("session_stop: interrupt before stop failed; continuing", exc_info=True)
+    async with bot.session_manager.get_lock(thread_id):
+        stopped = await bot.session_manager.stop_session(thread_id)
     if stopped:
-        await interaction.response.send_message(
-            "Claude session stopped.", ephemeral=True
-        )
+        await interaction.followup.send("Claude session stopped.", ephemeral=True)
     else:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "No active Claude session in this thread.", ephemeral=True
         )
 
@@ -302,8 +314,13 @@ async def session_compact(interaction: discord.Interaction) -> None:
         return
     await interaction.response.defer()
     try:
-        async for _ in bridge.send_message("/compact"):
-            pass
+        # #audit(#2): hold the per-thread lock so /compact serializes with any
+        # in-flight user turn — otherwise both consume the single shared SDK
+        # receive stream concurrently and silently split messages (lost
+        # ResultMessage / interleaved text). Mirrors /session resume.
+        async with bot.session_manager.get_lock(thread_id):
+            async for _ in bridge.send_message("/compact"):
+                pass
         embed = discord.Embed(
             title="🗜️ Context Compacted",
             description="Session context has been compressed to save tokens.",
@@ -428,8 +445,12 @@ async def session_security_review(interaction: discord.Interaction) -> None:
         return
     await interaction.response.defer()
     try:
-        async for _ in bridge.send_message("/security-review"):
-            pass
+        # #audit(#3): same single-consumer invariant as /session compact —
+        # serialize against any in-flight turn via the per-thread lock so the
+        # two turns never split the shared SDK receive stream.
+        async with bot.session_manager.get_lock(thread_id):
+            async for _ in bridge.send_message("/security-review"):
+                pass
         embed = discord.Embed(
             title="🔒 Security Review",
             description="Security review completed.",
