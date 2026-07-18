@@ -370,6 +370,12 @@ class ClaudedBot(commands.Bot):
         # #292 S3: bot-level workflow task registry. DiscordRenderer writes
         # task lifecycle states here (via self._bot ref); /workflow cog reads.
         self._workflow_tasks: dict = {}
+        # #audit(#8): strong references to fire-and-forget background tasks
+        # (e.g. the resume-failed Discord notice). CPython keeps only a weak
+        # ref to a bare create_task result, so a task that suspends on its
+        # first await can be GC'd mid-flight and silently dropped. Each task
+        # discards itself here on completion via add_done_callback.
+        self._bg_tasks: set = set()
         # review A4/A5: per-subagent pending tracking. thread_id →
         # {agent_id: agent_type}. Populated by the SubagentStart hook
         # (_make_subagent_start_cb) and drained per-agent_id by SubagentStop.
@@ -701,6 +707,17 @@ class ClaudedBot(commands.Bot):
                     # cancel is needed here.
                     self._pending_subagents.pop(tid, None)
                     self._agent_roster.pop(tid, None)
+                    # #audit(#6): sweep this thread's workflow-task entries from
+                    # the long-lived bot registry. They're removed on terminal
+                    # events during a turn, but a task whose terminal never
+                    # arrives (killed w/o notification, crash) would otherwise
+                    # linger as a phantom "running" row in /workflow list and
+                    # grow the dict unbounded; reap is the natural GC point.
+                    for _wtid in [
+                        k for k, st in self._workflow_tasks.items()
+                        if getattr(st, "thread_id", None) == tid
+                    ]:
+                        self._workflow_tasks.pop(_wtid, None)
                     self.session_manager.save_session_state(tid)
                     await self.session_manager.stop_session(tid)
                     log.info("Auto-expired session for thread %s", tid)
@@ -733,7 +750,35 @@ class ClaudedBot(commands.Bot):
         T2-D: writes the in-flight-turn count as the file content so the
         watchdog can be lenient while a turn is active.
         """
-        _write_heartbeat_state(self._active_turns)
+        # #audit(#11): never let the heartbeat body raise — this is the ONE
+        # loop the external watchdog keys on. A crash stops the loop, the file
+        # goes stale, and the watchdog kickstarts (a self-inflicted restart).
+        # _write_heartbeat_state already swallows OSError; guard anything else.
+        try:
+            _write_heartbeat_state(self._active_turns)
+        except Exception:
+            log.exception("heartbeat write failed (loop kept alive)")
+
+    @_heartbeat_task.error
+    async def _heartbeat_task_error(self, error: BaseException) -> None:
+        # #audit(#11): a discord.py tasks.Loop stops PERMANENTLY if its body
+        # raises outside the library's _valid_exception set. Revive the
+        # watchdog-critical loop instead of letting the heartbeat freeze.
+        log.critical("heartbeat loop crashed: %r — restarting", error, exc_info=error)
+        try:
+            self._heartbeat_task.restart()
+        except Exception:
+            log.exception("heartbeat loop restart failed")
+
+    @_cleanup_task.error
+    async def _cleanup_task_error(self, error: BaseException) -> None:
+        # #audit(#11): belt-and-braces — the body already try/excepts, but if
+        # the loop ever stops on an unexpected error, revive it.
+        log.critical("cleanup loop crashed: %r — restarting", error, exc_info=error)
+        try:
+            self._cleanup_task.restart()
+        except Exception:
+            log.exception("cleanup loop restart failed")
 
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
@@ -1321,8 +1366,17 @@ class ClaudedBot(commands.Bot):
                 # path-in-text so Claude has SOMETHING to work with.
                 try:
                     import base64
-                    with open(target, "rb") as f:
-                        b64 = base64.b64encode(f.read()).decode("ascii")
+
+                    def _read_b64(p: Path) -> str:
+                        with open(p, "rb") as fh:
+                            return base64.b64encode(fh.read()).decode("ascii")
+
+                    # #audit(#5): the file read + base64 encode are blocking
+                    # (sync disk I/O + CPU-bound encode). Run them off the event
+                    # loop so a multi-MB image upload can't stall the Discord
+                    # gateway heartbeat — this path runs inside the per-thread
+                    # lock during a turn, so a stall blocks the thread too.
+                    b64 = await asyncio.to_thread(_read_b64, target)
                     image_blocks.append({
                         "type": "image",
                         "source": {
@@ -1450,7 +1504,9 @@ class ClaudedBot(commands.Bot):
                 except Exception:
                     log.debug("T2-B: resume-failed notice send failed", exc_info=True)
             try:
-                asyncio.get_running_loop().create_task(_notify())
+                t = asyncio.get_running_loop().create_task(_notify())
+                self._bg_tasks.add(t)
+                t.add_done_callback(self._bg_tasks.discard)
             except RuntimeError:
                 log.debug("T2-B: no running loop for resume-failed notice", exc_info=True)
         bridge._on_resume_failed_cb = _on_resume_failed
@@ -2101,6 +2157,16 @@ class ClaudedBot(commands.Bot):
     @_scheduler_tick.before_loop
     async def _before_scheduler_tick(self) -> None:
         await self.wait_until_ready()
+
+    @_scheduler_tick.error
+    async def _scheduler_tick_error(self, error: BaseException) -> None:
+        # #audit(#11): revive the tick loop if it ever stops on an unexpected
+        # exception (the body already try/excepts, so this is belt-and-braces).
+        log.critical("scheduler tick loop crashed: %r — restarting", error, exc_info=error)
+        try:
+            self._scheduler_tick.restart()
+        except Exception:
+            log.exception("scheduler tick loop restart failed")
 
     # ------------------------------------------------------------------
     # #241 — fire-callback shared helpers

@@ -243,6 +243,10 @@ class SchedulerManager:
         # RuntimeError at fire time). Defaults to ``None`` (no check) so
         # tests / non-Discord callers don't need a project_manager.
         self.bound_checker = bound_checker
+        # #audit(#8): strong refs for fire-and-forget notify tasks so CPython
+        # can't GC one mid-flight (it keeps only a weak ref to a bare
+        # create_task result). Each task removes itself on completion.
+        self._bg_tasks: set = set()
 
         if get_lock is None:
             # Default: per-target (thread_id or channel_id) ``asyncio.Lock``s,
@@ -867,7 +871,9 @@ class SchedulerManager:
         state["last_error"] = f"{type(exc).__name__}: {exc}"
         self.store.save(sched)
         if notify and self.expire_notify_callback is not None:
-            asyncio.create_task(self.expire_notify_callback(sched))
+            _t = asyncio.create_task(self.expire_notify_callback(sched))
+            self._bg_tasks.add(_t)
+            _t.add_done_callback(self._bg_tasks.discard)
         log.warning(
             "#241 fire terminal disable schedule=%s exc=%s",
             sched.get("schedule_id"),
@@ -903,7 +909,9 @@ class SchedulerManager:
         state["last_error"] = "max_lifetime reached"
         self.store.save(sched)
         if self.expire_notify_callback is not None:
-            asyncio.create_task(self.expire_notify_callback(sched))
+            _t = asyncio.create_task(self.expire_notify_callback(sched))
+            self._bg_tasks.add(_t)
+            _t.add_done_callback(self._bg_tasks.discard)
         log.info(
             "#241 max_lifetime expired schedule=%s lived=%.0fs",
             sched.get("schedule_id"),
