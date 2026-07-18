@@ -330,13 +330,17 @@ async def test_model_switch_sdk_rejection_shows_error():
 
 
 @pytest.mark.asyncio
-async def test_model_switch_fallback_embed_does_not_claim_preserved():
-    """#273 R2: fallback path (no active session) must NOT say 'Context preserved'."""
+async def test_model_switch_fallback_resumes_stored_session():
+    """#audit(#7): with a stored session, the no-active-session fallback must
+    RESUME it (thread resume_session_id) and honestly say context is preserved,
+    matching every sibling recreate command. Supersedes the #273 R2 test that
+    pinned the old cold-start-drops-context behavior."""
     from clauded.cogs.model import model_switch
     from clauded.bot import ClaudedBot
     bot = MagicMock(spec=ClaudedBot)
     bot.session_manager = MagicMock()
     bot.session_manager.get_session = MagicMock(return_value=None)
+    bot._get_resume_session_id = MagicMock(return_value="sess-abc123")
     bot._recreate_session = AsyncMock(return_value=MagicMock())
     interaction = MagicMock()
     interaction.client = bot
@@ -345,7 +349,34 @@ async def test_model_switch_fallback_embed_does_not_claim_preserved():
     interaction.response.defer = AsyncMock()
     interaction.followup.send = AsyncMock()
     await model_switch.callback(interaction, "opus")
-    embed = interaction.followup.send.await_args.kwargs["embed"]
-    assert "Context preserved" not in embed.description, (
-        f"Fallback path should not claim context preserved: {embed.description!r}"
+    # The stored session id is threaded into the recreate so context survives.
+    assert (
+        bot._recreate_session.await_args.kwargs.get("resume_session_id")
+        == "sess-abc123"
     )
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "Context preserved" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_model_switch_fallback_no_stored_session_is_honest():
+    """#audit(#7): with NO stored session, the fallback starts genuinely fresh
+    (resume_session_id=None) and says so — no false 'context preserved' claim."""
+    from clauded.cogs.model import model_switch
+    from clauded.bot import ClaudedBot
+    bot = MagicMock(spec=ClaudedBot)
+    bot.session_manager = MagicMock()
+    bot.session_manager.get_session = MagicMock(return_value=None)
+    bot._get_resume_session_id = MagicMock(return_value=None)
+    bot._recreate_session = AsyncMock(return_value=MagicMock())
+    interaction = MagicMock()
+    interaction.client = bot
+    interaction.channel = MagicMock(spec=discord.Thread)
+    interaction.channel.id = 42
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    await model_switch.callback(interaction, "opus")
+    assert bot._recreate_session.await_args.kwargs.get("resume_session_id") is None
+    embed = interaction.followup.send.await_args.kwargs["embed"]
+    assert "Context preserved" not in embed.description
+    assert "No prior context" in embed.description
