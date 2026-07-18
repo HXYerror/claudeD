@@ -123,6 +123,12 @@ class ClaudeBridge:
         self._session_name = sc.session_name
         self._client: ClaudeSDKClient | None = None
         self._active = False
+        # #324 (review fix): the bot's post-turn background stream reader is
+        # registered here so EVERY path that consumes or closes this bridge's
+        # SDK stream (send_message from any of the ~9 turn entry points, and
+        # stop()) cancels it first — enforcing the single-consumer invariant in
+        # ONE place instead of relying on each caller to remember.
+        self._bg_reader_task: "asyncio.Task | None" = None
         self._session_id: str | None = None
         self._on_session_id_cb: Callable[[str], None] | None = None
         # T2-B: set True when a resume was REQUESTED but the CLI handed back a
@@ -696,6 +702,27 @@ class ClaudeBridge:
             self._user,
         )
 
+    async def cancel_bg_reader(self) -> None:
+        """#324 (review fix): cancel the registered post-turn background reader.
+
+        Called from :meth:`send_message` (before this turn consumes the stream)
+        and :meth:`stop` (before the stream closes). Idempotent and safe when no
+        reader is registered. The reader's own teardown (``receive_pending``'s
+        cancel/aclose discipline) is cancellation-safe, so awaiting the cancelled
+        task cannot hang the caller.
+        """
+        task = self._bg_reader_task
+        self._bg_reader_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - defensive
+            log.debug("cancel_bg_reader: reader teardown error", exc_info=True)
+
     async def send_message(self, content: str | list[dict]) -> AsyncIterator[object]:
         """Send a user message and stream back response messages.
 
@@ -723,6 +750,12 @@ class ClaudeBridge:
             raise RuntimeError("ClaudeBridge.send_message called before start()")
 
         self._last_activity = time.time()
+        # #324 (review fix): enforce the single-consumer invariant HERE — before
+        # this turn consumes the SDK stream, cancel any post-turn background
+        # reader still parked on the same client. This covers ALL turn entry
+        # points (render_response, scheduled fire, /session compact, /btw,
+        # /schedule, …) so no caller can race the reader.
+        await self.cancel_bg_reader()
 
         try:
             if isinstance(content, str):
@@ -742,6 +775,12 @@ class ClaudeBridge:
                 await self._client.query(_stream())
 
             async for msg in self._client.receive_response():
+                # #323: refresh activity on EVERY streamed message so a session
+                # that is actively working — including a long/background task
+                # streaming subagent + TaskProgress events — is never seen as
+                # "idle" by the bot's idle-reaper (which would tear down the CLI
+                # subprocess and kill the background task).
+                self._last_activity = time.time()
                 # review D2: capture + persist session_id from the EARLIEST
                 # message that carries it (the CLI's init SystemMessage), not
                 # just the terminal ResultMessage. A long fresh first turn that
@@ -844,6 +883,8 @@ class ClaudeBridge:
                     return
                 if isinstance(msg, ResultMessage):
                     self._update_stats(msg)
+                # #323: draining late messages counts as activity too.
+                self._last_activity = time.time()
                 yield msg
         finally:
             aclose = getattr(it, "aclose", None)
@@ -882,6 +923,10 @@ class ClaudeBridge:
         """
         if self._client is None:
             return
+        # #324 (review fix): cancel the background reader before closing the
+        # stream, so a reaped / stopped / recreated session never leaves an
+        # orphaned reader parked on a dead client.
+        await self.cancel_bg_reader()
         timeout = float(os.environ.get("CLAUDED_BRIDGE_STOP_TIMEOUT", "30"))
         try:
             await asyncio.wait_for(self._client.disconnect(), timeout=timeout)

@@ -399,6 +399,16 @@ class ClaudedBot(commands.Bot):
         # arrives in practice (investigation: 0 occurrences in any log). The
         # renderer reads this via ``bot._agent_roster``.
         self._agent_roster: dict[int, dict[str, dict]] = {}
+        # #324: post-turn background stream reader. After a turn ends, the CLI
+        # keeps the stream open and PROACTIVELY pushes background-task
+        # completions (a standalone <task-notification> turn) + the main agent's
+        # continuation. receive_response() stopped at the turn's ResultMessage,
+        # so without this reader those never reach Discord. The reader task is
+        # OWNED BY EACH BRIDGE (``bridge._bg_reader_task``) and cancelled inside
+        # ``bridge.send_message`` / ``bridge.stop`` — so every stream-consuming
+        # path enforces the single-consumer invariant, not just the turn loop
+        # (#324 review fix). _start_bg_reader/_bg_reader_loop live on the bot
+        # only because relaying needs Discord + the renderer.
 
         # ---------------------------------------------------------------- #241
         # Scheduler core (PRD v1.18 §3.7 / §8 Subtask 4): persistent timer
@@ -674,8 +684,23 @@ class ClaudedBot(commands.Bot):
             if lock.locked():
                 log.debug("Auto-expire skipped (turn in flight) thread %s", tid)
                 return
+            # #323 (review fix): the earlier "veto reap if _pending_subagents /
+            # _agent_roster non-empty" guard was REMOVED — it leaked. A session
+            # only reaches this reaper after ``timeout`` seconds of ZERO stream
+            # activity, and _last_activity is now refreshed on every streamed /
+            # drained message (claude_bridge #323), so an actively-working
+            # background task stays fresh and never lands here. Any roster /
+            # pending entry on a session that IS this idle is therefore a stale
+            # orphan (e.g. a dropped SubagentStop) — vetoing on it would block
+            # cleanup forever (bridge + CLI subprocess leak). So we reap, and
+            # clear the stale bookkeeping below.
             async with lock:
                 try:
+                    # #324 (review fix): the background reader is cancelled inside
+                    # bridge.stop() (invoked by stop_session below), so no explicit
+                    # cancel is needed here.
+                    self._pending_subagents.pop(tid, None)
+                    self._agent_roster.pop(tid, None)
                     self.session_manager.save_session_state(tid)
                     await self.session_manager.stop_session(tid)
                     log.info("Auto-expired session for thread %s", tid)
@@ -1391,6 +1416,12 @@ class ClaudedBot(commands.Bot):
         # SubagentStop) would produce a stale "N subagent(s) still running"
         # warning on a later turn's stop.
         self._pending_subagents.pop(thread_id, None)
+        # #323 (review fix): mirror the reset for _agent_roster. It is otherwise
+        # cleared ONLY by the SubagentStop hook, so a single dropped SubagentStop
+        # would orphan an entry that makes the idle-reaper's #323 guard veto
+        # cleanup FOREVER (bridge + CLI subprocess leak). A fresh bridge means
+        # any roster entry belongs to a dead prior session — drop it here.
+        self._agent_roster.pop(thread_id, None)
 
         def _on_sid(sid: str) -> None:
             self.session_manager.save_session_state(thread_id)
@@ -1535,6 +1566,104 @@ class ClaudedBot(commands.Bot):
             bucket.pop(agent_id, None)
             if not bucket:
                 self._agent_roster.pop(thread_id, None)
+
+    # ------------------------------------------------------------------
+    # #324: post-turn background stream reader (relay CLI-pushed completions)
+    # ------------------------------------------------------------------
+
+    def _start_bg_reader(
+        self,
+        thread_id: int,
+        bridge: "ClaudeBridge",
+        channel: Any,
+        renderer: "DiscordRenderer",
+    ) -> None:
+        """Start (if not already running) a between-turns background reader.
+
+        OWNED BY THE BRIDGE (``bridge._bg_reader_task``): every stream-consuming
+        path — send_message from ANY turn entry point, and bridge.stop() —
+        cancels it first, so the single-consumer invariant is enforced in the
+        bridge, not per-caller (#324 review fix for the ~6 unguarded paths).
+
+        Relays the CLI's proactively-pushed post-turn messages: a completed
+        background task's continuation text AND its Task* terminal — routed
+        through the SAME ``renderer`` that started the task, so its "Running"
+        embed finalizes instead of leaking (#324 review fix — text-only relay
+        used to swallow Task* terminals and re-open #292).
+        """
+        if bridge is None or not getattr(bridge, "is_active", False):
+            return
+        existing = getattr(bridge, "_bg_reader_task", None)
+        if existing is not None and not existing.done():
+            return
+        bridge._bg_reader_task = asyncio.create_task(
+            self._bg_reader_loop(thread_id, bridge, channel, renderer)
+        )
+
+    async def _bg_reader_loop(
+        self,
+        thread_id: int,
+        bridge: "ClaudeBridge",
+        channel: Any,
+        renderer: "DiscordRenderer",
+    ) -> None:
+        """Consume late stream messages until idle for CLAUDED_BG_IDLE_TIMEOUT.
+
+        Always cancellable; never runs concurrently with a turn (the bridge
+        cancels it at the start of the next send_message and on stop).
+        """
+        idle = float(os.environ.get("CLAUDED_BG_IDLE_TIMEOUT", "600"))
+        try:
+            async for msg in bridge.receive_pending(per_message_timeout=idle):
+                # #324 review fix: route Task* through the turn's renderer so a
+                # background task's terminal (✅/❌) finalizes the embed it
+                # started (its task_id lives in this renderer's _task_states);
+                # only non-Task* messages fall through to the text relay.
+                try:
+                    handled = await renderer._dispatch_task_event(msg, {})
+                except Exception:
+                    handled = False
+                    log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
+                if not handled:
+                    await self._relay_bg_message(channel, msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("#324: bg reader loop error thread=%s", thread_id, exc_info=True)
+        finally:
+            if getattr(bridge, "_bg_reader_task", None) is asyncio.current_task():
+                bridge._bg_reader_task = None
+
+    async def _relay_bg_message(self, channel: Any, msg: Any) -> None:
+        """Relay the agent's post-turn continuation TEXT to Discord.
+
+        Conservative: text only (``AssistantMessage`` ``TextBlock``s). Skips
+        UserMessage / ``<task-notification>`` echoes / stream events / tool
+        noise so the background follow-up (e.g. "here's the URL") shows up
+        without spamming. Best-effort; never raises.
+        """
+        try:
+            from .claude_bridge import AssistantMessage, TextBlock
+            if not isinstance(msg, AssistantMessage):
+                return
+            content = getattr(msg, "content", None)
+            if not isinstance(content, list):
+                return
+            parts = [
+                b.text for b in content
+                if isinstance(b, TextBlock) and (getattr(b, "text", "") or "").strip()
+            ]
+            text = "\n".join(parts).strip()
+            if not text:
+                return
+            header = "-# 🔄 background follow-up\n"
+            first = True
+            for i in range(0, len(text), 1800):
+                chunk = text[i:i + 1800]
+                await safe_send_message(channel, content=(header + chunk) if first else chunk)
+                first = False
+        except Exception:
+            log.debug("#324: relay bg message failed", exc_info=True)
 
     def _make_subagent_start_cb(self, thread_id: int) -> Any:
         """review A4/A5: build a SubagentStart callback that records a pending
@@ -1760,14 +1889,24 @@ class ClaudedBot(commands.Bot):
                 ),
                 guild_id=getattr(getattr(thread, "guild", None), "id", None),
             )
+            tid = getattr(thread, "id", None)
             # T2-D: mark a turn in-flight so the heartbeat tells the watchdog
             # to be lenient (a stall UNDER a turn shouldn't hard-kill the bot
             # and drop the not-yet-persisted session_id).
+            # (#324 review fix: no explicit reader-cancel needed here — the
+            # bridge cancels any reader inside send_message before this turn
+            # consumes the stream, covering every entry point.)
             self._active_turns += 1
             try:
                 await renderer.render_response(bridge, user_text, author_id=author_id)
             finally:
                 self._active_turns = max(0, self._active_turns - 1)
+            # #324: turn done — resume the background reader (owned by the bridge)
+            # so the CLI's proactively-pushed post-turn messages (a background
+            # task's completion + the main agent's continuation, incl. its Task*
+            # terminal) are relayed to this thread until the next turn cancels it.
+            if tid is not None:
+                self._start_bg_reader(tid, bridge, thread, renderer)
         except Exception as exc:
             if is_transient_discord_error(exc):
                 # Render gave up (rare — _retry_http exhausted), but bridge is

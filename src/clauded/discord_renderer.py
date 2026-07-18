@@ -220,6 +220,15 @@ class _TaskState:
         Snapshot of the most recent ``TaskUsage`` payload — kept so the
         terminal embed (TaskNotification without ``usage``, or TaskUpdated
         killed) can still render a footer.
+    thread_id
+        #322: Discord channel/thread id this task is rendered into (the
+        renderer's ``target.id``). ``/workflow detail`` uses it to look up the
+        live per-agent roster (``bot._agent_roster[thread_id]``) that the
+        SubagentStart / PreToolUse / SubagentStop hooks maintain. ``None``
+        when the target exposes no ``id``.
+    last_tool_name
+        #322: most recent ``last_tool_name`` seen on a ``TaskProgress`` event,
+        surfaced by ``/workflow detail`` when the roster is empty.
     """
 
     description: str
@@ -229,6 +238,8 @@ class _TaskState:
     started_at: float = 0.0
     last_edit_at: float = 0.0
     last_usage: dict[str, Any] | None = None
+    thread_id: int | None = None
+    last_tool_name: str | None = None
 
 # ---------------------------------------------------------------------------
 # Color scheme for embeds
@@ -837,12 +848,35 @@ class DiscordRenderer:
             dur_seg = f"{duration_ms}ms"
         return f"🪙 {_fmt_tokens(tokens)} · 🔧 {tool_uses} · ⏱️ {dur_seg}"
 
+    @staticmethod
+    def _task_type_label(task_type: str | None) -> str:
+        """#321: human label for a Task* event keyed on the real task_type.
+
+        Real background tasks use task_type ``local_bash`` / ``local_agent`` /
+        ``local_workflow`` (only the last contains the substring "workflow").
+        Map each to a distinct banner so the user can tell a background bash
+        task from a background agent from a dynamic workflow. Unknown /
+        missing types fall back to a generic label.
+        """
+        t = (task_type or "").lower()
+        if "bash" in t:
+            return "🖥️ Background Task"
+        if "agent" in t:
+            return "🤖 Background Agent"
+        if "workflow" in t:
+            return "⚡ Dynamic Workflow"
+        return "📦 Background Task"
+
     async def _handle_task_started(
         self,
         event: Any,
         subagent_renderers: dict[str, "DiscordRenderer"],
     ) -> None:
-        """Render a 🚀 embed for a newly-launched Dynamic Workflow subtask.
+        """Render a 🚀 embed for a newly-launched background subtask.
+
+        #321: tracks EVERY task_type (local_bash / local_agent /
+        local_workflow), labelling the embed by the real type so background
+        bash tasks and background agents get progress too — not just workflows.
 
         Routes the embed to the sub-agent thread when the parent tool_use_id
         matches one we've already spun a thread for (keeps the workflow's
@@ -858,8 +892,10 @@ class DiscordRenderer:
         task_type = getattr(event, "task_type", None)
         tool_use_id = getattr(event, "tool_use_id", None)
 
+        # #321: label by real task_type instead of always "Dynamic Workflow".
+        label = self._task_type_label(task_type)
         embed = discord.Embed(
-            title="⚡ Dynamic Workflow Started",
+            title=f"{label} Started",
             description=(
                 "━━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔮 Task: {description[:60]}\n"
@@ -884,6 +920,11 @@ class DiscordRenderer:
             started_at=time.time(),
             last_edit_at=0.0,
             last_usage=None,
+            # #322 (review fix): key by the MAIN renderer's target id, NOT
+            # target_renderer.target (which can be a sub-thread) — bot._agent_roster
+            # is keyed by the main thread id, so /workflow detail's roster lookup
+            # must use the same key or it silently finds nothing.
+            thread_id=getattr(self.target, "id", None),
         )
         self._task_states[task_id] = state
         self._sync_task_to_bot(task_id, state)
@@ -915,6 +956,10 @@ class DiscordRenderer:
         if isinstance(usage, dict):
             state.last_usage = usage
         last_tool = getattr(event, "last_tool_name", None)
+        # #322: persist the latest tool so /workflow detail can show it even
+        # when the live per-agent roster is empty.
+        if last_tool:
+            state.last_tool_name = last_tool
 
         now = time.time()
         if now - state.last_edit_at < EDIT_INTERVAL_SECONDS:
@@ -967,7 +1012,7 @@ class DiscordRenderer:
                 f"🪙 {tokens} tokens · 🔧 {tool_uses} tools · ⏱️ {duration}s"
             )
             embed = discord.Embed(
-                title="🔄 Dynamic Workflow Running",
+                title=f"🔄 {self._task_type_label(state.task_type).split(' ', 1)[-1]} Running",
                 description="\n".join(lines),
                 color=COLOR_TOOL_RUNNING,
             )
@@ -1251,11 +1296,13 @@ class DiscordRenderer:
         Returns ``True`` iff ``event`` was one of the four SDK ``Task*``
         message types AND we handled it (i.e. the caller should treat it as
         consumed and ``continue``). Returns ``False`` for any non-Task* event,
-        and also for Task* events we intentionally leave for the sub-thread
-        path (a ``TaskStartedMessage`` whose ``task_type`` is not a workflow —
-        that's a plain sub-agent, handled by the live ``parent_tool_use_id``
-        routing in the main loop) or that we aren't tracking (Progress /
-        Notification / Updated for a ``task_id`` not in ``_task_states``).
+        and also for Task* events we aren't tracking (Progress / Notification /
+        Updated for a ``task_id`` not in ``_task_states``).
+
+        #321: ``TaskStarted`` is now tracked for EVERY ``task_type`` (local_bash
+        / local_agent / local_workflow), not only workflows — the old
+        ``"workflow" in task_type`` gate dropped background bash / agent
+        progress. Follow-up events still gate on ``task_id in _task_states``.
 
         review A1: extracted verbatim from the inline block that used to live
         in :meth:`render_response`'s main loop (the four ``isinstance(event,
@@ -1268,12 +1315,16 @@ class DiscordRenderer:
         it (same rationale as the original inline block).
         """
         if _SdkTaskStartedMessage is not None and isinstance(event, _SdkTaskStartedMessage):
-            task_type = getattr(event, "task_type", "") or ""
-            if "workflow" in task_type.lower():
-                await self._handle_task_started(event, subagent_renderers)
-                return True
-            # Normal subagent — fall through to sub-thread path (not handled here)
-            return False
+            # #321: track EVERY task_type, not just workflows. Real background
+            # tasks use task_type local_bash / local_agent / local_workflow;
+            # only local_workflow contains the substring "workflow", so the old
+            # `"workflow" in task_type` gate silently dropped background bash
+            # tasks and background agents — the user saw no progress at all.
+            # Started now tracks all types into _task_states, so the
+            # Progress/Notification/Updated handlers (which gate on
+            # `task_id in self._task_states`) render for all of them too.
+            await self._handle_task_started(event, subagent_renderers)
+            return True
 
         if _SdkTaskProgressMessage is not None and isinstance(event, _SdkTaskProgressMessage):
             task_id = getattr(event, "task_id", "")
