@@ -322,3 +322,133 @@ async def mcp_remove(interaction: discord.Interaction, name: str) -> None:
         await interaction.response.send_message(
             f"\u274c MCP server `{name}` not found.", ephemeral=True
         )
+
+
+# ---------------------------------------------------------------------------
+# #audit(#14): in-place reconnect / toggle of a single MCP server via the SDK
+# control-plane \u2014 no session restart (which would lose conversation context).
+# Both operate on the LIVE bridge, so they require an active session (an active
+# session already implies a bound channel); the "no active session" guard is
+# the meaningful precondition, mirroring /mcp list's Path A.
+# ---------------------------------------------------------------------------
+
+
+async def _mcp_name_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest server names from the live session's ``get_mcp_status``."""
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        return []
+    sid = interaction.channel_id
+    bridge = bot.session_manager.get_session(sid) if sid is not None else None
+    if bridge is None or not getattr(bridge, "is_active", False):
+        return []
+    try:
+        status = await asyncio.wait_for(bridge.get_mcp_status(), timeout=5)
+    except Exception:
+        return []
+    servers = (status or {}).get("mcpServers") or []
+    cur = (current or "").lower()
+    out: list[app_commands.Choice[str]] = []
+    for s in servers:
+        if not isinstance(s, dict):
+            continue
+        nm = str(s.get("name") or "")
+        if nm and cur in nm.lower():
+            out.append(app_commands.Choice(name=nm, value=nm))
+        if len(out) >= 25:
+            break
+    return out
+
+
+def _resolve_live_bridge(interaction: discord.Interaction):
+    """Return the active bridge for this channel, or ``None``."""
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        return None
+    sid = interaction.channel_id
+    bridge = bot.session_manager.get_session(sid) if sid is not None else None
+    if bridge is None or not getattr(bridge, "is_active", False):
+        return None
+    return bridge
+
+
+@mcp_group.command(
+    name="reconnect",
+    description="Re-dial a failed/needs-auth MCP server without restarting the session",
+)
+@app_commands.describe(name="Server name (see /mcp list)")
+@app_commands.autocomplete(name=_mcp_name_autocomplete)
+async def mcp_reconnect(interaction: discord.Interaction, name: str) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bridge = _resolve_live_bridge(interaction)
+    if bridge is None:
+        await interaction.response.send_message(
+            "\u274c No active session in this channel \u2014 send a message to start "
+            "one, then the CLI can re-dial the server in place.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await asyncio.wait_for(bridge.reconnect_mcp_server(name), timeout=30)
+    except Exception as exc:
+        log.warning("/mcp reconnect failed for %s: %r", name, exc)
+        await interaction.followup.send(
+            f"\u274c Reconnect failed: `{exc}`", ephemeral=True
+        )
+        return
+    embed = discord.Embed(
+        title=f"\U0001f501 Reconnecting `{name}`",
+        description="Asked the CLI to re-dial this MCP server. "
+        "Run `/mcp list` to confirm its status.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@mcp_group.command(
+    name="toggle",
+    description="Enable or disable an MCP server in place (reversible; keeps .mcp.json)",
+)
+@app_commands.describe(name="Server name", enabled="True to enable, False to disable")
+@app_commands.autocomplete(name=_mcp_name_autocomplete)
+async def mcp_toggle(
+    interaction: discord.Interaction, name: str, enabled: bool
+) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    bridge = _resolve_live_bridge(interaction)
+    if bridge is None:
+        await interaction.response.send_message(
+            "\u274c No active session in this channel \u2014 send a message to start one first.",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await asyncio.wait_for(bridge.toggle_mcp_server(name, enabled), timeout=30)
+    except Exception as exc:
+        log.warning("/mcp toggle failed for %s (enabled=%s): %r", name, enabled, exc)
+        await interaction.followup.send(
+            f"\u274c Toggle failed: `{exc}`", ephemeral=True
+        )
+        return
+    state = "enabled" if enabled else "disabled"
+    icon = "\u2705" if enabled else "\u26aa"
+    embed = discord.Embed(
+        title=f"{icon} MCP server `{name}` {state}",
+        description="Reversible \u2014 run `/mcp toggle` again to flip it back.",
+        color=COLOR_INFO,
+    )
+    await interaction.followup.send(embed=embed, ephemeral=True)
