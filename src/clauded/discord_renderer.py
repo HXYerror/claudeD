@@ -920,10 +920,11 @@ class DiscordRenderer:
             started_at=time.time(),
             last_edit_at=0.0,
             last_usage=None,
-            # #322: remember which Discord thread this task renders into so
-            # /workflow detail can look up the live per-agent roster
-            # (bot._agent_roster[thread_id]).
-            thread_id=getattr(target_renderer.target, "id", None),
+            # #322 (review fix): key by the MAIN renderer's target id, NOT
+            # target_renderer.target (which can be a sub-thread) — bot._agent_roster
+            # is keyed by the main thread id, so /workflow detail's roster lookup
+            # must use the same key or it silently finds nothing.
+            thread_id=getattr(self.target, "id", None),
         )
         self._task_states[task_id] = state
         self._sync_task_to_bot(task_id, state)
