@@ -913,6 +913,28 @@ class ClaudeBridge:
             raise RuntimeError("bridge not active")
         await self._client.stop_task(task_id)
 
+    async def reconnect_mcp_server(self, server_name: str) -> None:
+        """Re-dial a single MCP server in place (no session restart).
+
+        #audit(#14): surfaces ``ClaudeSDKClient.reconnect_mcp_server`` so a
+        failed / needs-auth server (visible in ``/mcp list``) can be retried
+        without recreating the bridge — which would lose conversation context.
+        """
+        if self._client is None or not self._active:
+            raise RuntimeError("bridge not active")
+        await self._client.reconnect_mcp_server(server_name)
+
+    async def toggle_mcp_server(self, server_name: str, enabled: bool) -> None:
+        """Enable/disable a single MCP server in place (reversible mute).
+
+        #audit(#14): surfaces ``ClaudeSDKClient.toggle_mcp_server``. Unlike
+        ``/mcp remove`` (which deletes the entry from ``.mcp.json``) this is a
+        reversible runtime toggle that leaves the stored config intact.
+        """
+        if self._client is None or not self._active:
+            raise RuntimeError("bridge not active")
+        await self._client.toggle_mcp_server(server_name, enabled)
+
     async def stop(self) -> None:
         """Stop the bridge, force-dropping after CLAUDED_BRIDGE_STOP_TIMEOUT (default 30s).
 
