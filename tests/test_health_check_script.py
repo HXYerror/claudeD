@@ -23,11 +23,46 @@ pytestmark = pytest.mark.skipif(
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "health-check.sh"
 
 
+def _install_launchctl_shim(home: Path) -> Path:
+    """Put a fake ``launchctl`` on PATH so the script's ``kickstart -k`` is a
+    recorded no-op instead of hard-killing the developer's LIVE bot.
+
+    The launchd GUI domain (``gui/<uid>/...``) is keyed by uid, NOT by $HOME,
+    so pointing HOME at tmp_path does NOT stop ``launchctl kickstart -k
+    gui/$(id -u)/com.hxy.clauded`` from restarting the real running service.
+    Shadowing the ``launchctl`` binary on PATH is what actually makes these
+    tests safe on a box where clauded is active. Returns the call-log path the
+    shim appends each invocation's args to.
+    """
+    shim_dir = home / "shimbin"
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    calls_log = home / "launchctl-calls.log"
+    shim = shim_dir / "launchctl"
+    shim.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$*" >> "{calls_log}"\n'
+        "exit 0\n"
+    )
+    shim.chmod(0o755)
+    return calls_log
+
+
 def _run_script(home: Path) -> tuple[int, str, str]:
-    """Run the healthcheck script with HOME pointed at tmp_path."""
+    """Run the healthcheck script with HOME pointed at tmp_path.
+
+    Always installs the ``launchctl`` shim (see :func:`_install_launchctl_shim`)
+    and prepends its dir to the subprocess PATH, so no invocation of the script
+    can touch the live LaunchAgent.
+    """
+    _install_launchctl_shim(home)
+    shim_dir = home / "shimbin"
     proc = subprocess.run(
         ["bash", str(SCRIPT)],
-        env={**os.environ, "HOME": str(home)},
+        env={
+            **os.environ,
+            "HOME": str(home),
+            "PATH": f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        },
         capture_output=True,
         text=True,
     )
@@ -68,11 +103,18 @@ def test_healthy_run_emits_ok_log_line(tmp_path: Path) -> None:
     assert "heartbeat age" in content
 
 
+@pytest.mark.live_host
 def test_stale_heartbeat_triggers_kickstart_log(tmp_path: Path) -> None:
-    """Stale heartbeat (>120s) → 'heartbeat stale … kickstarting' log line
-    in BOTH healthcheck.log AND alerts.log. Kickstart itself silently fails
-    in this test env (gui/$(id -u)/com.hxy.clauded not loaded under our
-    tmp HOME), which is fine — we only assert log shape, not real recovery.
+    """Stale heartbeat (>120s) → 'heartbeat stale … kickstarting' log line in
+    BOTH healthcheck.log AND alerts.log, plus a ``launchctl kickstart`` call.
+
+    Marked ``live_host`` (excluded from the default ``pytest`` run) AND run
+    against a shimmed ``launchctl`` (see ``_run_script``): the kickstart is
+    recorded to ``launchctl-calls.log`` as a no-op, exercising the stale-branch
+    logic WITHOUT restarting the developer's live bot. The old version of this
+    test claimed the kickstart "silently fails … not loaded under our tmp HOME"
+    — that was FALSE: the ``gui/<uid>`` launchd domain ignores $HOME, so it
+    hard-killed the running service. This marker + shim is the fix.
     """
     heartbeat = tmp_path / "Library" / "Caches" / "clauded" / "heartbeat"
     heartbeat.parent.mkdir(parents=True)
@@ -90,16 +132,29 @@ def test_stale_heartbeat_triggers_kickstart_log(tmp_path: Path) -> None:
     assert alerts_log.exists()
     assert "heartbeat stale" in health_log.read_text()
     assert "kickstarting com.hxy.clauded" in alerts_log.read_text()
+    # The kickstart hit the shim, NOT the real launchctl — proof the live
+    # service was never touched by this test.
+    calls = (tmp_path / "launchctl-calls.log").read_text()
+    assert "kickstart -k gui/" in calls
+    assert "com.hxy.clauded" in calls
 
 
+@pytest.mark.live_host
 def test_missing_heartbeat_treated_as_stale(tmp_path: Path) -> None:
-    """No heartbeat file at all → AGE=99999 → kickstart branch fires."""
+    """No heartbeat file at all → AGE=99999 → kickstart branch fires.
+
+    ``live_host`` + shimmed launchctl (see ``_run_script``) so the fired
+    kickstart is a recorded no-op, never a restart of the live bot.
+    """
     # Don't create the heartbeat file
     rc, _, _ = _run_script(tmp_path)
     assert rc == 0
     health_log = tmp_path / "Library" / "Logs" / "clauded" / "healthcheck.log"
     content = health_log.read_text()
-    assert "heartbeat stale (99999 s)" in content
+    # Script formats the age as "99999s" (T2-D appended "> <threshold>s, ...").
+    assert "heartbeat stale (99999s" in content
+    # Kickstart went to the shim, not the real service.
+    assert "kickstart -k gui/" in (tmp_path / "launchctl-calls.log").read_text()
 
 
 # ---------------------------------------------------------------------------

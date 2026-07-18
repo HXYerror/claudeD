@@ -31,3 +31,14 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.pytest.ini_options]
+markers = [
+    "live_host: test mutates real host state (e.g. launchctl kickstart of the live LaunchAgent). Excluded by default so a plain `pytest` run can never restart a running clauded bot. Run explicitly with `-m live_host` (still safe — such tests shim the host binary).",
+]
+# Never touch the live host by default. The health-check kickstart tests are
+# marked `live_host`; excluding that marker keeps a plain `pytest` run from
+# hard-killing a running clauded — its `launchctl kickstart -k
+# gui/<uid>/com.hxy.clauded` targets a uid-scoped launchd domain that HOME
+# isolation cannot redirect. See tests/test_health_check_script.py.
+addopts = "-m 'not live_host'"

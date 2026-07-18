@@ -13,6 +13,11 @@ STALE_THRESHOLD_SECS=120
 # session_id and force a cold resume next message (the T2 resume bug).
 ACTIVE_TURN_THRESHOLD_SECS=300
 
+# Label of the LaunchAgent to kickstart when the heartbeat goes stale.
+# Overridable via env so tests / dry-run harnesses can target a dummy label
+# instead of the live service; the default preserves production behavior.
+LAUNCHD_LABEL="${CLAUDED_LAUNCHD_LABEL:-com.hxy.clauded}"
+
 mkdir -p "$(dirname "$HEARTBEAT")" "$(dirname "$ALERTS_LOG")"
 
 # #168 acceptance: every script invocation produces at least one log line
@@ -68,9 +73,9 @@ if [ "$ACTIVE_TURNS" -gt 0 ]; then
 fi
 
 if [ "$AGE" -gt "$THRESHOLD" ]; then
-    log_line "heartbeat stale (${AGE}s > ${THRESHOLD}s, active_turns=${ACTIVE_TURNS}); kickstarting com.hxy.clauded"
-    echo "$(date '+%F %T') heartbeat stale (${AGE}s, active_turns=${ACTIVE_TURNS}); kickstarting com.hxy.clauded" >> "$ALERTS_LOG"
-    launchctl kickstart -k "gui/$(id -u)/com.hxy.clauded" 2>/dev/null || true
+    log_line "heartbeat stale (${AGE}s > ${THRESHOLD}s, active_turns=${ACTIVE_TURNS}); kickstarting ${LAUNCHD_LABEL}"
+    echo "$(date '+%F %T') heartbeat stale (${AGE}s, active_turns=${ACTIVE_TURNS}); kickstarting ${LAUNCHD_LABEL}" >> "$ALERTS_LOG"
+    launchctl kickstart -k "gui/$(id -u)/${LAUNCHD_LABEL}" 2>/dev/null || true
 
     # Track restart count in rolling 5-min window via /tmp file (per-day rotating)
     DAY=$(date +%Y%m%d)
