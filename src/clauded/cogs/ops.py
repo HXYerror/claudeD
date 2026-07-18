@@ -140,6 +140,31 @@ async def health_check(interaction: discord.Interaction) -> None:
             inline=False,
         )
 
+    # #audit(#20): gateway health so an operator can tell a steady bot from a
+    # flapping/reconnecting one (the user's "restarts often" symptom). Shown on
+    # the in-thread success path alongside the other health fields.
+    _lat = getattr(bot, "latency", float("nan"))
+    _latency_str = (
+        f"{_lat * 1000:.0f} ms" if isinstance(_lat, float) and _lat == _lat else "—"
+    )
+    try:
+        _gw_state = (
+            "🟢 ready" if bot.is_ready()
+            else ("🔴 closed" if bot.is_closed() else "🟡 connecting")
+        )
+    except Exception:
+        _gw_state = "—"
+    embed.add_field(name="Gateway", value=_gw_state, inline=True)
+    embed.add_field(name="Latency", value=_latency_str, inline=True)
+    embed.add_field(
+        name="Reconnects",
+        value=(
+            f"{getattr(bot, '_gw_disconnects', 0)} drop / "
+            f"{getattr(bot, '_gw_resumes', 0)} resume"
+        ),
+        inline=True,
+    )
+
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 

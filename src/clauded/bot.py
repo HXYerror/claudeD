@@ -397,6 +397,14 @@ class ClaudedBot(commands.Bot):
         # file so the external watchdog grants a longer grace window while a
         # turn is in flight (see _write_heartbeat_state + health-check.sh).
         self._active_turns: int = 0
+        # #audit(#20): gateway lifecycle observability. discord.py's internal
+        # reconnect loop is otherwise entirely silent; these counters +
+        # timestamps (updated by on_disconnect / on_resumed) let /health show
+        # whether the bot is flapping vs steady and give the logs a breadcrumb.
+        self._gw_disconnects: int = 0
+        self._gw_resumes: int = 0
+        self._gw_last_disconnect_at: float | None = None
+        self._gw_last_resumed_at: float | None = None
         # T1-B: live per-agent roster for the workflow/subagent UX, keyed by
         # thread_id → agent_id → {type, tool, started}. Fed by the
         # SubagentStart / PreToolUse / SubagentStop hooks (all of which fire
@@ -804,6 +812,20 @@ class ClaudedBot(commands.Bot):
                 log.exception("Per-guild slash sync failed for %s", guild.id)
         if guilds_synced:
             log.info("Per-guild slash sync done: %s", ", ".join(guilds_synced))
+
+    async def on_disconnect(self) -> None:  # type: ignore[override]
+        # #audit(#20): discord.py auto-reconnects were entirely silent. Record a
+        # counter + timestamp + WARNING so gateway churn is visible in /health
+        # and the logs (the user's "restarts often / gateway drops" symptom).
+        self._gw_disconnects += 1
+        self._gw_last_disconnect_at = time.time()
+        log.warning("Gateway disconnected (#%d this run)", self._gw_disconnects)
+
+    async def on_resumed(self) -> None:  # type: ignore[override]
+        # Session RESUMED (not a full re-identify) — the good recovery path.
+        self._gw_resumes += 1
+        self._gw_last_resumed_at = time.time()
+        log.info("Gateway session resumed (#%d this run)", self._gw_resumes)
 
     async def on_message(self, message: discord.Message) -> None:  # type: ignore[override]
         # Always ignore self.

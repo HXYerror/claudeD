@@ -1647,6 +1647,12 @@ class DiscordRenderer:
                         'num_turns': int(getattr(event, 'num_turns', 0) or 0),
                         'model': getattr(event, 'model', '') or '',
                         'stop_reason': _last_stop_reason,
+                        # #audit(#13): end-of-turn error signals that were
+                        # previously dropped, so a rate-limit / max-turns /
+                        # API-error turn looked like a normal stop to the user.
+                        'is_error': bool(getattr(event, 'is_error', False)),
+                        'subtype': getattr(event, 'subtype', None),
+                        'api_error_status': getattr(event, 'api_error_status', None),
                     }
                     # #182 + #220: pull context-window usage and fold
                     # percentage into stats so the footer can render
@@ -2754,6 +2760,15 @@ class DiscordRenderer:
                     footer_text += ctx_seg
                 if _last_stop_reason and _last_stop_reason != "end_turn":
                     footer_text += f" │ ⚠️ {_last_stop_reason}"
+                # #audit(#13): surface a ResultMessage error terminal so the
+                # user learns WHY a turn ended abnormally instead of seeing "it
+                # just stopped" (rate-limit, error_max_turns, API error, …).
+                # Trigger ONLY on is_error or an ``error*`` subtype — a normal
+                # turn's subtype ("result"/"success") must NOT show 🛑.
+                _subtype = stats.get("subtype") or ""
+                if stats.get("is_error") or _subtype.startswith("error"):
+                    _err_seg = stats.get("api_error_status") or _subtype or "error"
+                    footer_text += f" │ 🛑 {_err_seg}"
 
                 # #211: append a second footer line showing the current
                 # effective permission mode — but ONLY when it's not the
