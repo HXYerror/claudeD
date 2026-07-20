@@ -1630,6 +1630,25 @@ class DiscordRenderer:
                 if await self._dispatch_task_event(event, subagent_renderers):
                     continue
 
+                # #audit(subagent-leak): a subagent-attributed event
+                # (parent_tool_use_id set) that reaches HERE has NO registered
+                # sub-thread — the `ptid in subagent_renderers` branch above
+                # already `continue`d the ones that do. Background/parallel
+                # subagents dispatched via the Task* control-plane never emit a
+                # Task/Agent ToolUseBlock in the parent stream, so their
+                # sub-thread is never created and their raw step chatter
+                # (AssistantMessage / StreamEvent) would otherwise fall through
+                # to the MAIN rendering below — the observed leak (61 content
+                # events in one turn, per stream-debug). Drop it from MAIN; the
+                # compact Task* status embeds + terminal summary still render.
+                if ptid:
+                    log.debug(
+                        "subagent-leak guard: dropped %s (parent_tool_use_id=%s) "
+                        "with no sub-thread from the main channel",
+                        type(event).__name__, ptid,
+                    )
+                    continue
+
                 if isinstance(event, ResultMessage):
                     # Capture stats from the result.
                     # #v1.18-footer: ``total_cost_usd`` on ResultMessage is
