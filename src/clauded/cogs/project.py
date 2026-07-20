@@ -39,13 +39,17 @@ async def project_bind(interaction: discord.Interaction, path: str) -> None:
         )
         return
 
+    # #audit(live-log): ACK within the 3s interaction window BEFORE the bind
+    # disk write, so a busy event loop can't let the token expire (10062)
+    # between here and the reply.
+    await interaction.response.defer(ephemeral=True)
     try:
         stored = bot.project_manager.bind(binding_id, path, guild_id=interaction.guild_id)
     except ValueError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
         return
 
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Bound this channel to `{stored}`", ephemeral=True
     )
 
