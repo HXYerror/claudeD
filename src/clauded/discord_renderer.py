@@ -240,6 +240,9 @@ class _TaskState:
     last_usage: dict[str, Any] | None = None
     thread_id: int | None = None
     last_tool_name: str | None = None
+    # #panel: the specific agent kind (Explore / general-purpose / …) when the
+    # SDK surfaces it, so progress/terminal panels can say WHICH agent ran.
+    subagent_type: str | None = None
 
 # ---------------------------------------------------------------------------
 # Color scheme for embeds
@@ -888,19 +891,28 @@ class DiscordRenderer:
         task_id = getattr(event, "task_id", None)
         if not task_id:
             return
-        description = (getattr(event, "description", "") or "")[:60] or "Task"
+        data = getattr(event, "data", None) or {}
+        # #panel: the one-line "what is this doing" — draw from the richest
+        # source (the Task* description = the Agent tool's short summary), then
+        # data.description / data.prompt. Keep it a real sentence, not [:60].
+        description = (
+            (getattr(event, "description", "") or "")
+            or data.get("description") or data.get("prompt") or ""
+        ).strip()[:220] or "(no description provided)"
         task_type = getattr(event, "task_type", None)
         tool_use_id = getattr(event, "tool_use_id", None)
+        # #panel: the specific agent kind (Explore / general-purpose / …), so the
+        # card says WHICH agent, not just "task".
+        subagent_type = data.get("subagent_type") or data.get("agent_type")
 
         # #321: label by real task_type instead of always "Dynamic Workflow".
         label = self._task_type_label(task_type)
+        kind = subagent_type or task_type or "task"
         embed = discord.Embed(
-            title=f"{label} Started",
+            title=f"{label} · {kind}",
             description=(
-                "━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔮 Task: {description[:60]}\n"
-                f"🤖 Type: {task_type or 'workflow'}\n"
-                f"📋 ID: `{task_id[:8]}`"
+                f"🔮 **{description}**\n"
+                f"-# 📋 `{task_id[:8]}` · {task_type or 'task'}"
             ),
             color=COLOR_WORKFLOW,
         )
@@ -914,6 +926,7 @@ class DiscordRenderer:
         msg = await target_renderer._safe_send(embed=embed)
         state = _TaskState(
             description=description,
+            subagent_type=subagent_type,
             task_type=task_type,
             tool_use_id=tool_use_id,
             message=msg,
@@ -998,9 +1011,8 @@ class DiscordRenderer:
             except Exception:
                 roster = {}
             lines = [
-                "━━━━━━━━━━━━━━━━━━━━━━━",
-                f"🔮 Task: {state.description[:60]}",
-                f"⏱️ {elapsed}s elapsed",
+                f"🔮 **{state.description[:200]}**",
+                f"-# {state.subagent_type or state.task_type or 'task'} · ⏱️ {elapsed}s elapsed",
             ]
             agent_lines = self._format_roster_lines(roster)
             if agent_lines:
@@ -1191,8 +1203,16 @@ class DiscordRenderer:
             title = f"ℹ️ Task ({status or 'unknown'})"
             color = COLOR_INFO
 
-        embed = discord.Embed(title=title, description=description, color=color)
         state = self._task_states.get(task_id)
+        # #panel: prepend the task's one-line description so the terminal card
+        # says WHAT finished, not only its result summary.
+        _task_desc = getattr(state, "description", None) if state else None
+        if _task_desc and _task_desc != "(no description provided)":
+            description = (
+                f"🔮 **{_task_desc}**\n\n{description}" if description
+                else f"🔮 **{_task_desc}**"
+            )
+        embed = discord.Embed(title=title, description=description, color=color)
         # T1-D: fold total wall-clock duration into the terminal footer so the
         # completed/failed/stopped card summarizes how long the workflow ran,
         # alongside the SDK usage (tokens/tool-uses/SDK-time).
