@@ -663,6 +663,14 @@ class ClaudeBridge:
             hooks=hooks,
             # Feature #61: partial message streaming for token-level deltas
             include_partial_messages=True,
+            # #audit(live-log): the SDK frames stdout JSON line-by-line with a
+            # 1MB default buffer; a single large frame (a big tool_result or an
+            # aggregated partial-message event) overflows it and the framing
+            # error tears the whole turn down (observed 2026-07-17). Raise to
+            # 10MB (env CLAUDED_MAX_BUFFER_SIZE), matching stream_logger's cap.
+            max_buffer_size=int(
+                os.environ.get("CLAUDED_MAX_BUFFER_SIZE", str(10 * 1024 * 1024))
+            ),
             settings=self._settings,
             # R4 (#117): setting_sources defaults to [] in v1.10 SDK (no
             # auto-load); pass all three explicitly to preserve v1.x
