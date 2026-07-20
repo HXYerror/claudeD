@@ -631,6 +631,10 @@ class ClaudedBot(commands.Bot):
         # #292 S3: /workflow group (list/kill/detail).
         from .cogs.workflow import workflow_group
 
+        # #audit(live-log): register a tree-wide error handler so an expired
+        # interaction (10062) or any command raise is handled gracefully
+        # instead of escalating to a CommandInvokeError traceback in the logs.
+        self.tree.error(self._on_app_command_error)
         self.tree.add_command(project_group)
         self.tree.add_command(session_group)
         self.tree.add_command(cost_group)
@@ -826,6 +830,33 @@ class ClaudedBot(commands.Bot):
         self._gw_resumes += 1
         self._gw_last_resumed_at = time.time()
         log.info("Gateway session resumed (#%d this run)", self._gw_resumes)
+
+    async def _on_app_command_error(
+        self, interaction: discord.Interaction, error: Exception
+    ) -> None:
+        # #audit(live-log): without a tree-wide error handler, any slash command
+        # that raises — most commonly an EXPIRED interaction (discord.NotFound
+        # code 10062, when a busy event loop misses the 3s ACK window) —
+        # escalates to a full CommandInvokeError traceback in the logs (13 seen).
+        # Swallow the expired case at WARNING; surface anything else as a
+        # friendly ephemeral message instead of a stack trace.
+        orig = getattr(error, "original", error)
+        cmd = getattr(getattr(interaction, "command", None), "qualified_name", "?")
+        if isinstance(orig, discord.NotFound) and getattr(orig, "code", None) == 10062:
+            log.warning("Slash interaction expired before response (10062); ignoring: /%s", cmd)
+            return
+        log.error("Slash command /%s failed", cmd, exc_info=error)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    "❌ Command failed — please try again.", ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Command failed — please try again.", ephemeral=True
+                )
+        except Exception:
+            log.debug("failed to send app-command error notice", exc_info=True)
 
     async def on_message(self, message: discord.Message) -> None:  # type: ignore[override]
         # Always ignore self.
