@@ -935,10 +935,17 @@ class _NotifyBot:
         from clauded.bot import ClaudedBot as _CB
 
         self._pending_subagents: dict[int, dict[str, str]] = {}
+        # #319 T1-B: the real subagent stop callback prunes the live roster via
+        # self._roster_clear (bot.py:1733). Bind it + its backing dict so this
+        # stub matches the production surface (stale-mock fix — the callback
+        # gained _roster_clear after this stub was written).
+        self._agent_roster: dict[int, dict[str, str]] = {}
         self._chan: dict[int, _NotifyChannel] = {}
         self._make_subagent_start_cb = _CB._make_subagent_start_cb.__get__(self)
         self._make_subagent_stop_cb = _CB._make_subagent_stop_cb.__get__(self)
         self._warn_pending_subagents = _CB._warn_pending_subagents.__get__(self)
+        self._roster_note_start = _CB._roster_note_start.__get__(self)
+        self._roster_clear = _CB._roster_clear.__get__(self)
         # _read_subagent_result is a @staticmethod — bind it as a plain
         # callable attribute so ``self._read_subagent_result(...)`` works.
         self._read_subagent_result = _CB._read_subagent_result
