@@ -330,6 +330,35 @@ async def test_setting_sources_includes_user_project_local(monkeypatch, cfg):
     assert captured_kwargs[-1].get("setting_sources") == ["user", "project", "local"]
 
 
+@pytest.mark.asyncio
+async def test_max_buffer_size_is_raised_from_1mb_default(monkeypatch, cfg):
+    """#audit(live-log): the bridge must override the SDK's 1MB default stdout
+    buffer, or a single large JSON frame (big tool_result / aggregated
+    partial-message event) overflows and tears the whole turn down."""
+    captured: list[dict[str, Any]] = []
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+            self.__dict__.update(kwargs)
+
+    class FakeClient:
+        def __init__(self, options=None):
+            pass
+
+        async def connect(self, prompt=None):
+            pass
+
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr("clauded.claude_bridge.ClaudeSDKClient", FakeClient)
+
+    bridge = ClaudeBridge(project_path="/tmp/p", config=cfg)
+    await bridge.start()
+
+    assert captured, "ClaudeAgentOptions was not constructed"
+    assert captured[-1].get("max_buffer_size") == 10 * 1024 * 1024
+
+
 # ---------------------------------------------------------------------------
 # Explicit cli_path resolution (#119, R6)
 # ---------------------------------------------------------------------------

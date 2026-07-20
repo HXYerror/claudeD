@@ -2689,7 +2689,20 @@ class DiscordRenderer:
                     log.debug("C3 partial-delivery notice failed", exc_info=True)
                 # Don't re-raise — caller (_render_with_retry) won't stop_session.
                 return
-            log.exception("Renderer fatal error; tearing down bridge")
+            if "buffer size" in str(exc) or "exceeded maximum buffer" in str(exc):
+                # #audit(live-log): a single SDK stdout JSON frame exceeded
+                # max_buffer_size. The bridge is already torn down by
+                # send_message's except path, so log this distinctly (NOT a
+                # generic "fatal") for diagnosability, then fall through to the
+                # normal retry flow. Raising CLAUDED_MAX_BUFFER_SIZE (now 10MB)
+                # prevents the vast majority of these.
+                log.warning(
+                    "Renderer: SDK buffer overflow on a single JSON frame (%s); "
+                    "turn interrupted — bridge recreates on retry",
+                    type(exc).__name__,
+                )
+            else:
+                log.exception("Renderer fatal error; tearing down bridge")
             # Best-effort: clean up the live cursor. Don't try to surface a
             # plain-text error here — callers (bot.py) wrap render_response
             # in the crash-notification flow which posts a richer embed
