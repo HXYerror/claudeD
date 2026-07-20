@@ -128,3 +128,47 @@ async def test_health_embed_shows_gateway_fields():
     assert fields.get("Gateway") == "🟢 ready"
     assert fields.get("Latency") == "42 ms"
     assert fields.get("Reconnects") == "3 drop / 2 resume"
+
+
+# ---------------------------------------------------------------------------
+# #9 — _gw_down_since wiring (the gateway-connectivity watchdog gate)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gw_down_since_anchors_first_disconnect_then_clears_on_resume():
+    from clauded.bot import ClaudedBot
+
+    self_ = MagicMock()
+    self_._gw_disconnects = 0
+    self_._gw_resumes = 0
+    self_._gw_last_disconnect_at = None
+    self_._gw_last_resumed_at = None
+    self_._gw_down_since = None
+
+    await ClaudedBot.on_disconnect(self_)
+    first = self_._gw_down_since
+    assert first is not None
+    # A 2nd disconnect (reconnect-storm iteration) must NOT re-anchor the clock —
+    # else the budget never elapses.
+    await ClaudedBot.on_disconnect(self_)
+    assert self_._gw_down_since == first
+    # RESUME clears the gate.
+    await ClaudedBot.on_resumed(self_)
+    assert self_._gw_down_since is None
+
+
+@pytest.mark.asyncio
+async def test_on_ready_clears_gw_down_since_fresh_identify_recovery():
+    from clauded.bot import ClaudedBot
+
+    self_ = MagicMock()
+    self_._gw_down_since = 123.0
+    self_._gw_last_resumed_at = None
+    self_.guilds = []          # empty → per-guild slash-sync loop no-ops
+    self_._slash_synced = set()
+    self_.user = MagicMock()
+
+    await ClaudedBot.on_ready(self_)
+    assert self_._gw_down_since is None
+    assert self_._gw_last_resumed_at is not None
