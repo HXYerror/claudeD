@@ -8,6 +8,10 @@ import discord
 from discord import app_commands
 
 from ._unbound import reject_if_unbound
+from ._sessions_disk import (
+    _resolve_project_dir, _list_sessions, _get_info, _rename, _tag, _delete,
+    _resolve_session_id, _fmt_session_label, _session_id_autocomplete,
+)
 from ..discord_renderer import COLOR_INFO, COLOR_TOOL_FAILURE
 from ..interaction_handler import InteractionHandler
 from ..session_config import SessionConfig
@@ -524,6 +528,244 @@ async def session_export(interaction: discord.Interaction) -> None:
     import io
     file = discord.File(io.BytesIO(md.encode()), filename=f"{thread_name[:50]}.md")
     await interaction.followup.send("📄 Session exported:", file=file, ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# #audit(#15): browse / open / rename / tag / delete PAST on-disk sessions.
+# /session list shows only LIVE in-memory bridges; these surface the SDK's
+# on-disk session store (keyed by project directory). Every SDK call routes
+# through cogs/_sessions_disk (asyncio.to_thread) so a directory scan / jsonl
+# edit / unlink never blocks the live bot's event loop.
+# ---------------------------------------------------------------------------
+
+
+class DeleteConfirmView(discord.ui.View):
+    """Author-gated confirm for the irreversible ``/session delete``."""
+
+    def __init__(self, directory: str, sid: str, author_id: int) -> None:
+        super().__init__(timeout=30)
+        self._dir = directory
+        self._sid = sid
+        self._author = author_id
+
+    async def interaction_check(self, itx: discord.Interaction) -> bool:
+        # #audit(#15) BLOCKER-2: a bare `return False` leaves the other user's
+        # client showing "This interaction failed" with no reason — send an
+        # explicit ephemeral rejection instead.
+        if itx.user.id != self._author:
+            await itx.response.send_message(
+                "Only the person who ran `/session delete` can use these buttons.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger)
+    async def _confirm(self, itx: discord.Interaction, _btn: discord.ui.Button) -> None:
+        try:
+            await _delete(self._dir, self._sid)
+        except Exception as exc:
+            await itx.response.edit_message(
+                embed=discord.Embed(
+                    title="❌ Delete failed", description=f"`{exc}`",
+                    color=COLOR_TOOL_FAILURE,
+                ),
+                view=None,
+            )
+            return
+        await itx.response.edit_message(
+            embed=discord.Embed(
+                title="🗑️ Deleted", description=f"`{self._sid[:8]}` removed.",
+                color=COLOR_INFO,
+            ),
+            view=None,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def _cancel(self, itx: discord.Interaction, _btn: discord.ui.Button) -> None:
+        await itx.response.edit_message(
+            embed=discord.Embed(title="Cancelled", color=COLOR_INFO), view=None
+        )
+
+
+@session_group.command(name="history", description="Browse past on-disk Claude sessions for this project.")
+@app_commands.describe(limit="How many to show (1-25, default 10)")
+async def session_history(interaction: discord.Interaction, limit: int = 10) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    directory = _resolve_project_dir(interaction, bot)
+    if not directory:
+        # #audit(#15) polish: don't tell a DM user to "run /project bind" — just
+        # state the requirement neutrally.
+        await interaction.response.send_message(
+            "This channel isn't bound to a project — `/session history` needs one.",
+            ephemeral=True,
+        )
+        return
+    limit = max(1, min(25, limit))
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sessions = await _list_sessions(directory, limit=limit)
+    except Exception as exc:
+        await interaction.followup.send(
+            f"❌ Could not read session history: `{exc}`", ephemeral=True
+        )
+        return
+    if not sessions:
+        await interaction.followup.send(
+            "No past sessions on disk for this project.", ephemeral=True
+        )
+        return
+    cur_id = bot._get_resume_session_id(interaction.channel_id)
+    embed = discord.Embed(title="🗂️ Past sessions", description=f"`{directory}`", color=COLOR_INFO)
+    for x in sessions:
+        mark = "▶ " if x.session_id == cur_id else ""
+        meta = [f"`{x.session_id[:8]}`", f"<t:{x.last_modified}:R>"]
+        if getattr(x, "tag", None):
+            meta.append(f"#{x.tag}")
+        embed.add_field(
+            name=f"{mark}{_fmt_session_label(x)}"[:256],
+            value=" • ".join(meta)[:1024],
+            inline=False,
+        )
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@session_group.command(name="open", description="Resume a specific past session into this thread.")
+@app_commands.describe(session_id="Pick from history (autocomplete)")
+@app_commands.autocomplete(session_id=_session_id_autocomplete)
+async def session_open(interaction: discord.Interaction, session_id: str) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
+        return
+    directory = _resolve_project_dir(interaction, bot)
+    # #audit(#15) BLOCKER-1: validate with a single cheap get_session_info (NOT a
+    # full list_sessions scan) so we don't blow Discord's 3s ack window before
+    # _recreate_session (which defers first). Autocomplete delivers the full UUID.
+    try:
+        info = await _get_info(directory, session_id)
+    except Exception as exc:
+        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        return
+    if info is None:
+        await interaction.response.send_message(
+            "❌ No such session in this project — pick one from the autocomplete.",
+            ephemeral=True,
+        )
+        return
+    bridge = await bot._recreate_session(interaction, resume_session_id=session_id)
+    if bridge:
+        await interaction.followup.send(embed=discord.Embed(
+            title="📂 Session opened",
+            description=f"Resumed `{session_id[:12]}…` — context restored.",
+            color=COLOR_INFO,
+        ))
+
+
+@session_group.command(name="rename", description="Set a past session's custom title (distinct from /session name).")
+@app_commands.describe(session_id="Pick from history (autocomplete)", title="New custom title for the session")
+@app_commands.autocomplete(session_id=_session_id_autocomplete)
+async def session_rename(interaction: discord.Interaction, session_id: str, title: str) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
+        return
+    directory = _resolve_project_dir(interaction, bot)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sessions = await _list_sessions(directory, limit=50)
+        full = _resolve_session_id(sessions, session_id)
+        await _rename(directory, full, title)
+    except (ValueError, FileNotFoundError) as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+        return
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="✏️ Renamed", description=f"`{full[:8]}` → **{title[:80]}**",
+            color=COLOR_INFO,
+        ),
+        ephemeral=True,
+    )
+
+
+@session_group.command(name="tag", description="Set or clear a past session's tag (empty or '-' clears).")
+@app_commands.describe(session_id="Pick from history (autocomplete)", tag="Tag text; empty or '-' clears it")
+@app_commands.autocomplete(session_id=_session_id_autocomplete)
+async def session_tag(interaction: discord.Interaction, session_id: str, tag: str = "") -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
+        return
+    directory = _resolve_project_dir(interaction, bot)
+    tag_val = None if tag.strip() in ("", "-") else tag.strip()
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sessions = await _list_sessions(directory, limit=50)
+        full = _resolve_session_id(sessions, session_id)
+        await _tag(directory, full, tag_val)
+    except (ValueError, FileNotFoundError) as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+        return
+    msg = f"`{full[:8]}` tagged **#{tag_val}**" if tag_val else f"`{full[:8]}` tag cleared"
+    await interaction.followup.send(
+        embed=discord.Embed(title="🏷️ Tag updated", description=msg, color=COLOR_INFO),
+        ephemeral=True,
+    )
+
+
+@session_group.command(name="delete", description="Permanently delete a past session (jsonl + subagent transcripts).")
+@app_commands.describe(session_id="Pick from history (autocomplete)")
+@app_commands.autocomplete(session_id=_session_id_autocomplete)
+async def session_delete(interaction: discord.Interaction, session_id: str) -> None:
+    from ..bot import ClaudedBot
+    bot = interaction.client
+    if not isinstance(bot, ClaudedBot):
+        await interaction.response.send_message("Bot not ready.", ephemeral=True)
+        return
+    if await reject_if_unbound(interaction, bot):
+        return
+    directory = _resolve_project_dir(interaction, bot)
+    await interaction.response.defer(ephemeral=True)
+    try:
+        sessions = await _list_sessions(directory, limit=50)
+        full = _resolve_session_id(sessions, session_id)
+    except ValueError as exc:
+        await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+        return
+    if full == bot._get_resume_session_id(interaction.channel_id):
+        await interaction.followup.send(
+            "❌ That's this thread's active/stored session — `/session clear` "
+            "or `/session stop` first.",
+            ephemeral=True,
+        )
+        return
+    label = next((_fmt_session_label(x) for x in sessions if x.session_id == full), full[:12])
+    view = DeleteConfirmView(directory, full, interaction.user.id)
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="⚠️ Confirm delete",
+            description=(
+                f"Permanently delete **{label}** (`{full[:8]}`)?\n"
+                "Also removes subagent transcripts. This cannot be undone."
+            ),
+            color=COLOR_TOOL_FAILURE,
+        ),
+        view=view,
+        ephemeral=True,
+    )
 
 
 
