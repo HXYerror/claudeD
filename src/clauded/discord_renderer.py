@@ -2448,13 +2448,23 @@ class DiscordRenderer:
                                     # ("branch forgot to set flag").
                                     matched = True
                                     break
-                                if not matched:
+                                if not matched and tool_id not in tool_msgs:
                                     # #226: rolling-log line for this tool
                                     # was evicted (kept only last 15) or
                                     # the event arrived out of order.
                                     # Logged for #223 / #224 diagnostic
                                     # epic; downstream guards on `is_medium
                                     # = False` make this a safe no-op.
+                                    # #audit(live-log): gate on `tool_id not in
+                                    # tool_msgs`. Tools rendered as their OWN
+                                    # standalone embed (TodoWrite / WebSearch /
+                                    # WebFetch / Grep / Glob / …, tracked in
+                                    # tool_msgs) never append a 🔄 rolling-log
+                                    # line by design, so their result no-matching
+                                    # here is EXPECTED, not a diagnostic — this
+                                    # was ~264/274 of these warnings (pure log
+                                    # spam, no lost data). Only a GENUINE
+                                    # eviction / out-of-order event still warns.
                                     log.warning(
                                         "ToolResultBlock no-matched rolling-log line; "
                                         "tool_id=%s name=%s alias=%r rolling_log_len=%d "
