@@ -192,6 +192,23 @@ AUTO_CRASH_COOLDOWN_S = 300
 _HEARTBEAT_PATH = _CACHE_DIR / "heartbeat"
 
 
+def _gateway_budget_secs() -> float:
+    """#audit(#9): how long the gateway may stay CONTINUOUSLY down before the
+    heartbeat is allowed to go stale so the external watchdog restarts us.
+
+    Must exceed discord.py's ExponentialBackoff single-sleep for common
+    reconnect storms (observed up to ~384s; theoretical 2^10=1024s) so brief
+    storms that self-heal are NOT killed, while a permanently-wedged reconnect
+    IS. 600s is a conservative middle; overridable for tuning/tests.
+    """
+    raw = os.environ.get("CLAUDED_GATEWAY_BUDGET_SECS", "600")
+    try:
+        v = float(raw)
+        return v if v > 0 else 600.0
+    except ValueError:
+        return 600.0
+
+
 def _touch_heartbeat() -> None:
     """Refresh ``_HEARTBEAT_PATH`` mtime so the external healthcheck sees us alive.
 
@@ -405,6 +422,12 @@ class ClaudedBot(commands.Bot):
         self._gw_resumes: int = 0
         self._gw_last_disconnect_at: float | None = None
         self._gw_last_resumed_at: float | None = None
+        # #audit(#9): wall time of the FIRST disconnect not yet followed by a
+        # resume/ready; None means "gateway believed up". _heartbeat_task stops
+        # refreshing the heartbeat once we've been off-gateway longer than
+        # _gateway_budget_secs() so a reconnect-storm wedge (a false-alive to
+        # the event-loop-only heartbeat) finally gets restarted.
+        self._gw_down_since: float | None = None
         # T1-B: live per-agent roster for the workflow/subagent UX, keyed by
         # thread_id → agent_id → {type, tool, started}. Fed by the
         # SubagentStart / PreToolUse / SubagentStop hooks (all of which fire
@@ -767,7 +790,32 @@ class ClaudedBot(commands.Bot):
         # goes stale, and the watchdog kickstarts (a self-inflicted restart).
         # _write_heartbeat_state already swallows OSError; guard anything else.
         try:
-            _write_heartbeat_state(self._active_turns)
+            # #audit(#9): FREEZE the heartbeat (return without writing → mtime
+            # ages past health-check.sh's STALE_THRESHOLD → watchdog restarts)
+            # ONLY when the gateway has been continuously down past the reconnect
+            # budget AND no turn is in flight. Pre-login (_gw_down_since is None)
+            # and brief blips (within budget) refresh exactly as before, so the
+            # pre-login window and healthy RESUMEs are never false-killed.
+            # Scope: catches a reconnect-STORM wedge (where on_disconnect fired),
+            # NOT a silent poll_event hang (no disconnect → _gw_down_since None).
+            # While a turn is in flight we keep writing (T2-D resume-bug safety),
+            # so a dead-gateway + stuck-turn defers restart until _active_turns
+            # returns to 0 — an accepted trade-off.
+            off = self._gw_down_since
+            budget = _gateway_budget_secs()
+            if (
+                off is not None
+                and (time.time() - off) > budget
+                and self._active_turns <= 0
+            ):
+                log.warning(
+                    "gateway down %.0fs > budget %.0fs and no active turn; "
+                    "freezing heartbeat so the watchdog restarts (disc=%d resume=%d)",
+                    time.time() - off, budget,
+                    self._gw_disconnects, self._gw_resumes,
+                )
+            else:
+                _write_heartbeat_state(self._active_turns)
         except Exception:
             log.exception("heartbeat write failed (loop kept alive)")
 
@@ -795,6 +843,13 @@ class ClaudedBot(commands.Bot):
     async def on_ready(self) -> None:  # type: ignore[override]
         user = self.user
         log.info("Bot online as %s (id=%s)", user, getattr(user, "id", "?"))
+        # #audit(#9): on_ready fires after a fresh IDENTIFY (session invalidated
+        # → reconnect — the observed recovery path for the 2026-07-19 DNS storm,
+        # NOT on_resumed). Without clearing the gate here, a re-identify recovery
+        # would look like a permanent outage and self-kill. Record recovery
+        # FIRST — before the per-guild slash-sync loop below, which can raise.
+        self._gw_last_resumed_at = time.time()
+        self._gw_down_since = None
         # #185: sync slash commands per-guild on first on_ready. Guarded
         # idempotency (``self._slash_synced``) so reconnect-driven
         # re-fires don't waste Discord rate-limit budget. Global sync
@@ -823,12 +878,19 @@ class ClaudedBot(commands.Bot):
         # and the logs (the user's "restarts often / gateway drops" symptom).
         self._gw_disconnects += 1
         self._gw_last_disconnect_at = time.time()
+        # #audit(#9): anchor to the FIRST unrecovered disconnect. on_disconnect
+        # fires on EVERY failed reconnect iteration, so the `is None` guard is
+        # load-bearing — without it each backoff step resets the clock and the
+        # budget never elapses.
+        if self._gw_down_since is None:
+            self._gw_down_since = self._gw_last_disconnect_at
         log.warning("Gateway disconnected (#%d this run)", self._gw_disconnects)
 
     async def on_resumed(self) -> None:  # type: ignore[override]
         # Session RESUMED (not a full re-identify) — the good recovery path.
         self._gw_resumes += 1
         self._gw_last_resumed_at = time.time()
+        self._gw_down_since = None  # #audit(#9): recovered via RESUME
         log.info("Gateway session resumed (#%d this run)", self._gw_resumes)
 
     async def _on_app_command_error(

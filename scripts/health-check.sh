@@ -6,6 +6,14 @@ RESTART_COUNTER="$HOME/Library/Caches/clauded/restart-count"
 ALERTS_LOG="$HOME/Library/Logs/clauded/alerts.log"
 HEALTHCHECK_LOG="$HOME/Library/Logs/clauded/healthcheck.log"
 STALE_THRESHOLD_SECS=120
+# NOTE(#9): the bot ALSO freezes this heartbeat (stops refreshing mtime) when it
+# has been continuously off the Discord gateway longer than
+# CLAUDED_GATEWAY_BUDGET_SECS (default 600s) with no turn in flight — a wedged
+# reconnect loop keeps the event loop alive (so mtime would otherwise stay
+# fresh) but is functionally dead. That case reaches the stale branch below and
+# kickstarts, same as a wedged loop / OOM. Active-turn leniency
+# (ACTIVE_TURN_THRESHOLD_SECS) still applies because the bot keeps writing while
+# a turn is in flight.
 # T2-D: longer grace window while a turn is in flight. The bot writes the
 # in-flight-turn count as the heartbeat file CONTENT; a transient event-loop
 # stall UNDER a turn (memory-pressure thrash) then gets this bigger budget
