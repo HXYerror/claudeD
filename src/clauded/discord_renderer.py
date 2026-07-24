@@ -284,6 +284,16 @@ FAST_PATH_SECONDS = 3.0
 # Discord rate-limits edits aggressively; ~1.2s keeps us well under the cap.
 EDIT_INTERVAL_SECONDS = 1.2
 
+# Minimum delay between successive edits of a workflow/task PROGRESS CARD.
+# The card is a status embed, not a typewriter — it doesn't need 1.2s
+# smoothness, and a single card edited continuously through a long multi-agent
+# workflow hits Discord's per-message edit ceiling at 1.2s (2026-07-24: 29x 429
+# on one progress card). A slower cadence stays comfortably under the limit and
+# is imperceptible for a status panel. Env-overridable for tuning.
+TASK_PROGRESS_EDIT_INTERVAL_SECONDS = float(
+    os.environ.get("CLAUDED_TASK_PROGRESS_EDIT_INTERVAL", "4.0")
+)
+
 # Up to 5 retries with 0.5/1/2/4/8s backoff covers ~15s of transient HTTP badness.
 MAX_HTTP_RETRIES = 5
 _BACKOFF = (0.5, 1.0, 2.0, 4.0, 8.0)  # seconds, indexed by attempt
@@ -975,7 +985,7 @@ class DiscordRenderer:
             state.last_tool_name = last_tool
 
         now = time.time()
-        if now - state.last_edit_at < EDIT_INTERVAL_SECONDS:
+        if now - state.last_edit_at < TASK_PROGRESS_EDIT_INTERVAL_SECONDS:
             return
         if state.message is None:
             return
@@ -1031,7 +1041,10 @@ class DiscordRenderer:
 
         ok = await self._safe_edit(state.message, embed=embed)
         if ok:
-            state.last_edit_at = now
+            # Measure the next interval from when this edit actually COMPLETED
+            # (not the pre-edit `now`), so a slow / 429-retried edit can't be
+            # immediately followed by a burst that re-triggers the rate limit.
+            state.last_edit_at = time.time()
 
     def _build_workflow_progress_embed(
         self,
