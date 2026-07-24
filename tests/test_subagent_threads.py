@@ -935,6 +935,10 @@ class _NotifyBot:
         from clauded.bot import ClaudedBot as _CB
 
         self._pending_subagents: dict[int, dict[str, str]] = {}
+        # #audit(#9): the start/stop callbacks now keep an in-flight bg counter
+        # in lockstep with _pending_subagents (heartbeat wedge-defer signal), so
+        # the stub must carry it too (same stale-mock class as _roster_clear).
+        self._inflight_bg: int = 0
         # #319 T1-B: the real subagent stop callback prunes the live roster via
         # self._roster_clear (bot.py:1733). Bind it + its backing dict so this
         # stub matches the production surface (stale-mock fix — the callback
@@ -972,10 +976,17 @@ async def test_subagent_routing_survives_first_stop():
     await start({"agent_id": "s1", "agent_type": "general-purpose"})
     await start({"agent_id": "s2", "agent_type": "Explore"})
     assert len(bot._pending_subagents[thread_id]) == 2
+    # #audit(#9): the in-flight bg counter (heartbeat wedge-defer signal) tracks
+    # in lockstep with the pending map.
+    assert bot._inflight_bg == 2
+    # A duplicate start must NOT double-count.
+    await start({"agent_id": "s1", "agent_type": "general-purpose"})
+    assert bot._inflight_bg == 2
 
     await stop({"agent_id": "s1", "agent_type": "general-purpose"})
     # Routing/count for s2 is intact — this is the core of the old bug.
     assert list(bot._pending_subagents[thread_id]) == ["s2"]
+    assert bot._inflight_bg == 1
     # And a warning at this point reports exactly the 1 remaining subagent.
     await bot._warn_pending_subagents(thread_id)
     warn_embeds = [e for e in ch.embeds if "still running" in (e.description or "")]
@@ -986,7 +997,11 @@ async def test_subagent_routing_survives_first_stop():
     n_before = len(ch.embeds)
     await stop({"agent_id": "s2", "agent_type": "Explore"})
     assert bot._pending_subagents.get(thread_id, {}) == {}
+    assert bot._inflight_bg == 0
     assert len(ch.embeds) == n_before + 1  # the s2 completion embed
+    # A stop with no prior start must not drive the counter negative.
+    await stop({"agent_id": "ghost", "agent_type": "x"})
+    assert bot._inflight_bg == 0
 
 
 @pytest.mark.asyncio

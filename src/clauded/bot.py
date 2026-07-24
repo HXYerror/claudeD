@@ -209,6 +209,27 @@ def _gateway_budget_secs() -> float:
         return 600.0
 
 
+def _gateway_hard_ceiling_secs() -> float:
+    """#audit(#9) fail-safe: the ABSOLUTE cap on how long the wedge-restart may
+    be DEFERRED by in-flight work.
+
+    Past ``_gateway_budget_secs()`` we normally keep writing the heartbeat while
+    a turn OR a background subagent is still running (so a reconnect wedge does
+    not kill work that runs in the CLI child and can still post via REST). But a
+    dropped SubagentStop can orphan the in-flight counter, and a genuinely dead
+    gateway makes the bot useless — so once we've been off-gateway longer than
+    THIS ceiling we freeze regardless of in-flight count. Must be >= budget;
+    default 1800s (= 3x the 600s budget, well past the observed ~384s backoff).
+    Overridable for tuning/tests.
+    """
+    raw = os.environ.get("CLAUDED_GATEWAY_HARD_CEILING_SECS", "1800")
+    try:
+        v = float(raw)
+        return v if v > 0 else 1800.0
+    except ValueError:
+        return 1800.0
+
+
 def _touch_heartbeat() -> None:
     """Refresh ``_HEARTBEAT_PATH`` mtime so the external healthcheck sees us alive.
 
@@ -410,6 +431,16 @@ class ClaudedBot(commands.Bot):
         # warning at all (graceful degradation; still strictly better than
         # the old guaranteed false positive).
         self._pending_subagents: dict[int, dict[str, str]] = {}
+        # #audit(#9): live count of in-flight BACKGROUND subagents across all
+        # threads. Separate from _pending_subagents (a per-thread notification
+        # dict) on purpose: this is a single self-cleaning integer the heartbeat
+        # gate reads so a reconnect-wedge restart is DEFERRED while background
+        # work is running (the CLI child keeps working + can still post via
+        # REST). Kept in lockstep with _pending_subagents inc/dec + the same
+        # reaper / fresh-bridge resets, so a dropped SubagentStop self-heals on
+        # the next idle-reap instead of latching the watchdog off forever. A
+        # hard ceiling (_gateway_hard_ceiling_secs) is the ultimate backstop.
+        self._inflight_bg: int = 0
         # T2-D: number of turns currently rendering. Written into the heartbeat
         # file so the external watchdog grants a longer grace window while a
         # turn is in flight (see _write_heartbeat_state + health-check.sh).
@@ -740,7 +771,12 @@ class ClaudedBot(commands.Bot):
                     # #324 (review fix): the background reader is cancelled inside
                     # bridge.stop() (invoked by stop_session below), so no explicit
                     # cancel is needed here.
-                    self._pending_subagents.pop(tid, None)
+                    # #audit(#9): this is the GC point for orphaned in-flight bg
+                    # entries (dropped SubagentStop) — subtract whatever we reap so
+                    # the heartbeat gate's counter self-heals here.
+                    _reaped = self._pending_subagents.pop(tid, None)
+                    if _reaped:
+                        self._inflight_bg = max(0, self._inflight_bg - len(_reaped))
                     self._agent_roster.pop(tid, None)
                     # #audit(#6): sweep this thread's workflow-task entries from
                     # the long-lived bot registry. They're removed on terminal
@@ -793,29 +829,41 @@ class ClaudedBot(commands.Bot):
             # #audit(#9): FREEZE the heartbeat (return without writing → mtime
             # ages past health-check.sh's STALE_THRESHOLD → watchdog restarts)
             # ONLY when the gateway has been continuously down past the reconnect
-            # budget AND no turn is in flight. Pre-login (_gw_down_since is None)
+            # budget AND nothing is in flight. Pre-login (_gw_down_since is None)
             # and brief blips (within budget) refresh exactly as before, so the
             # pre-login window and healthy RESUMEs are never false-killed.
             # Scope: catches a reconnect-STORM wedge (where on_disconnect fired),
             # NOT a silent poll_event hang (no disconnect → _gw_down_since None).
-            # While a turn is in flight we keep writing (T2-D resume-bug safety),
-            # so a dead-gateway + stuck-turn defers restart until _active_turns
-            # returns to 0 — an accepted trade-off.
+            #
+            # "In flight" = foreground turns (_active_turns) OR background
+            # subagents (_inflight_bg). Both keep writing so a wedge does NOT
+            # kill work that runs in the CLI child and can still post via REST —
+            # the restart would be pure loss (see 2026-07-24 R5 workflow). The
+            # hard ceiling is the backstop: past it we freeze regardless, so a
+            # dropped-SubagentStop orphan or a truly dead gateway can't defer
+            # recovery forever.
             off = self._gw_down_since
             budget = _gateway_budget_secs()
+            # clamp so a mis-set ceiling can never fire before the budget.
+            hard_ceiling = max(_gateway_hard_ceiling_secs(), budget)
+            down_for = (time.time() - off) if off is not None else 0.0
+            inflight = self._active_turns + max(0, self._inflight_bg)
+            past_ceiling = off is not None and down_for > hard_ceiling
             if (
                 off is not None
-                and (time.time() - off) > budget
-                and self._active_turns <= 0
+                and down_for > budget
+                and (inflight <= 0 or past_ceiling)
             ):
                 log.warning(
-                    "gateway down %.0fs > budget %.0fs and no active turn; "
-                    "freezing heartbeat so the watchdog restarts (disc=%d resume=%d)",
-                    time.time() - off, budget,
+                    "gateway down %.0fs > budget %.0fs; freezing heartbeat so the "
+                    "watchdog restarts (inflight=%d turns=%d bg=%d past_ceiling=%s "
+                    "disc=%d resume=%d)",
+                    down_for, budget, inflight, self._active_turns,
+                    self._inflight_bg, past_ceiling,
                     self._gw_disconnects, self._gw_resumes,
                 )
             else:
-                _write_heartbeat_state(self._active_turns)
+                _write_heartbeat_state(inflight)
         except Exception:
             log.exception("heartbeat write failed (loop kept alive)")
 
@@ -1584,7 +1632,11 @@ class ClaudedBot(commands.Bot):
         # orphaned entry (SubagentStart fired, session killed before
         # SubagentStop) would produce a stale "N subagent(s) still running"
         # warning on a later turn's stop.
-        self._pending_subagents.pop(thread_id, None)
+        # #audit(#9): also decrement the in-flight bg counter for these orphans
+        # so a fresh session heals the heartbeat gate's count too.
+        _orphaned = self._pending_subagents.pop(thread_id, None)
+        if _orphaned:
+            self._inflight_bg = max(0, self._inflight_bg - len(_orphaned))
         # #323 (review fix): mirror the reset for _agent_roster. It is otherwise
         # cleared ONLY by the SubagentStop hook, so a single dropped SubagentStop
         # would orphan an entry that makes the idle-reaper's #323 guard veto
@@ -1851,9 +1903,13 @@ class ClaudedBot(commands.Bot):
             agent_type = input_data.get("agent_type")
             if not agent_id:
                 return
-            self._pending_subagents.setdefault(thread_id, {})[agent_id] = (
-                agent_type or "subagent"
-            )
+            bucket = self._pending_subagents.setdefault(thread_id, {})
+            # #audit(#9): count each distinct agent_id once so the heartbeat gate
+            # defers the wedge-restart while this bg work runs. Guard on newness
+            # so a duplicate SubagentStart can't double-count.
+            if agent_id not in bucket:
+                self._inflight_bg += 1
+            bucket[agent_id] = agent_type or "subagent"
             # T1-B: seed the live roster so the workflow embed can show this
             # agent (type + current tool + elapsed) even without workflowProgress.
             self._roster_note_start(thread_id, agent_id, agent_type)
@@ -1887,7 +1943,11 @@ class ClaudedBot(commands.Bot):
             # thread bucket and the id — SubagentStart may not have fired).
             bucket = self._pending_subagents.get(thread_id)
             if bucket is not None:
-                bucket.pop(agent_id, None)
+                # #audit(#9): decrement the in-flight bg counter only when a
+                # tracked entry is actually removed (mirrors the newness guard
+                # in _on_subagent_start).
+                if bucket.pop(agent_id, None) is not None:
+                    self._inflight_bg = max(0, self._inflight_bg - 1)
                 if not bucket:
                     self._pending_subagents.pop(thread_id, None)
             # T1-B: drop from the live roster too.
