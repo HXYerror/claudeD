@@ -99,17 +99,19 @@ def _updated_event(
 
 
 @pytest.mark.asyncio
-async def test_task_started_sends_purple_banner():
-    """TaskStarted → embed with COLOR_WORKFLOW, ⚡ title, 🔮 description."""
+async def test_task_started_opens_panel():
+    """TaskStarted → ONE rolling panel message with the task as a ⚡ row."""
     renderer, target = _make_renderer()
     event = _started_event()
     await renderer._handle_task_started(event, subagent_renderers={})
 
-    assert len(target._sent) == 1
+    assert len(target._sent) == 1  # one consolidated panel, not a per-task card
     embed = target._sent[0].embeds[0]
+    assert "Tasks" in embed.title
+    assert "running" in embed.title
+    assert "test task" in embed.description  # the row
+    assert "⚡" in embed.description
     assert embed.color.value == COLOR_WORKFLOW
-    assert "⚡" in embed.title
-    assert "🔮" in embed.description
 
 
 @pytest.mark.asyncio
@@ -132,56 +134,44 @@ async def test_task_started_stores_state():
 
 
 @pytest.mark.asyncio
-async def test_task_progress_edits_message():
-    """TaskProgress edits existing message instead of sending a new one."""
+async def test_task_progress_edits_panel_in_place():
+    """TaskProgress edits the panel message in place (no new message) and
+    surfaces the row's current tool."""
     renderer, target = _make_renderer()
-
-    # First, start a task to populate state
-    event_start = _started_event()
-    await renderer._handle_task_started(event_start, subagent_renderers={})
+    await renderer._handle_task_started(_started_event(), subagent_renderers={})
     assert len(target._sent) == 1
 
-    # Force last_edit_at far in the past to bypass throttle
-    renderer._task_states["t1"].last_edit_at = 0.0
+    renderer._task_panel.last_edit_at = 0.0  # bypass throttle
+    await renderer._handle_task_progress(_progress_event(last_tool_name="Bash"))
 
-    event_progress = _progress_event()
-    await renderer._handle_task_progress(event_progress)
-
-    # No new message should have been sent — only the existing one edited
-    assert len(target._sent) == 1
-    # The existing message should have been edited (embed updated)
-    msg = target._sent[0]
-    assert len(msg.embeds) == 1
-    embed = msg.embeds[0]
-    assert "Running" in embed.title or "🔄" in embed.title
+    assert len(target._sent) == 1  # edited, not a new message
+    embed = target._sent[0].embeds[0]
+    assert "test task" in embed.description
+    assert "Bash" in embed.description  # tool surfaced on the running row
 
 
 @pytest.mark.asyncio
 async def test_task_progress_throttle():
-    """Two rapid progress events — second one is throttled (skipped)."""
+    """A too-soon progress event does NOT re-edit the panel (throttled), but the
+    usage is still stored in state."""
     renderer, target = _make_renderer()
+    await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    event_start = _started_event()
-    await renderer._handle_task_started(event_start, subagent_renderers={})
+    renderer._task_panel.last_edit_at = time.time()  # recent → next is throttled
+    desc_before = target._sent[0].embeds[0].description
 
-    # First progress: set last_edit_at to 0 so it passes
-    renderer._task_states["t1"].last_edit_at = 0.0
-    event_p1 = _progress_event(usage={"total_tokens": 100, "tool_uses": 1, "duration_ms": 1000})
-    await renderer._handle_task_progress(event_p1)
+    await renderer._handle_task_progress(
+        _progress_event(
+            usage={"total_tokens": 999, "tool_uses": 99, "duration_ms": 9999},
+            last_tool_name="Zzz",
+        )
+    )
 
-    # Capture embed after first progress
-    embed_after_first = target._sent[0].embeds[0]
-
-    # Second progress immediately — should be throttled
-    event_p2 = _progress_event(usage={"total_tokens": 999, "tool_uses": 99, "duration_ms": 9999})
-    await renderer._handle_task_progress(event_p2)
-
-    # The embed should NOT have been updated (still shows first progress values)
-    embed_after_second = target._sent[0].embeds[0]
-    assert embed_after_first.description == embed_after_second.description
-
-    # But last_usage in state SHOULD have been updated (always stored)
+    assert target._sent[0].embeds[0].description == desc_before  # not re-edited
     assert renderer._task_states["t1"].last_usage["total_tokens"] == 999
+    # tidy: drop any pending trailing-flush task
+    if renderer._task_panel.flush_task:
+        renderer._task_panel.flush_task.cancel()
 
 
 def test_task_progress_interval_decoupled_and_larger():
@@ -192,39 +182,34 @@ def test_task_progress_interval_decoupled_and_larger():
 
 
 @pytest.mark.asyncio
-async def test_task_progress_gate_reads_card_interval(monkeypatch):
-    """The card throttle uses TASK_PROGRESS_EDIT_INTERVAL_SECONDS (not the 1.2s
-    typewriter constant): lowering it to 0 lets back-to-back events both edit."""
+async def test_task_progress_gate_reads_panel_interval(monkeypatch):
+    """The panel throttle uses TASK_PROGRESS_EDIT_INTERVAL_SECONDS: lowering it
+    to 0 lets back-to-back progress events both edit the panel."""
     import clauded.discord_renderer as dr
 
     monkeypatch.setattr(dr, "TASK_PROGRESS_EDIT_INTERVAL_SECONDS", 0.0)
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    renderer._task_states["t1"].last_edit_at = 0.0
-    await renderer._handle_task_progress(
-        _progress_event(usage={"total_tokens": 1, "tool_uses": 1, "duration_ms": 1})
-    )
+    await renderer._handle_task_progress(_progress_event(last_tool_name="ReadTool"))
     desc_after_first = target._sent[0].embeds[0].description
 
     # Second, immediate — with a 0s interval it must NOT be throttled.
-    await renderer._handle_task_progress(
-        _progress_event(usage={"total_tokens": 777, "tool_uses": 9, "duration_ms": 9})
-    )
+    await renderer._handle_task_progress(_progress_event(last_tool_name="WriteTool"))
     desc_after_second = target._sent[0].embeds[0].description
     assert desc_after_first != desc_after_second
-    assert "777" in desc_after_second
+    assert "WriteTool" in desc_after_second
 
 
 @pytest.mark.asyncio
-async def test_task_progress_last_edit_at_from_completion(monkeypatch):
-    """last_edit_at is stamped AFTER the edit completes, not from the pre-edit
-    timestamp — so a slow/429-retried edit can't be followed by an immediate
-    burst. Simulated with a _safe_edit that takes measurable wall time."""
+async def test_panel_last_edit_at_from_completion(monkeypatch):
+    """panel.last_edit_at is stamped AFTER the edit completes, not from the
+    pre-edit timestamp — so a slow/429-retried edit can't be followed by an
+    immediate burst. Simulated with a _safe_edit that takes measurable time."""
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
-    state = renderer._task_states["t1"]
-    state.last_edit_at = 0.0
+    panel = renderer._task_panel
+    panel.last_edit_at = 0.0  # bypass throttle so progress edits
 
     async def _slow_edit(*_a, **_k):
         await asyncio.sleep(0.05)
@@ -233,8 +218,7 @@ async def test_task_progress_last_edit_at_from_completion(monkeypatch):
     monkeypatch.setattr(renderer, "_safe_edit", _slow_edit)
     t_before = time.time()
     await renderer._handle_task_progress(_progress_event())
-    # Stamped from completion: at least the edit's duration after we started.
-    assert state.last_edit_at >= t_before + 0.05
+    assert panel.last_edit_at >= t_before + 0.05
 
 
 @pytest.mark.asyncio
@@ -252,45 +236,51 @@ async def test_task_progress_unknown_task_ignored():
 
 
 @pytest.mark.asyncio
-async def test_task_notification_completed_green():
-    """status=completed → COLOR_TOOL_SUCCESS, ✅ title."""
+async def test_task_notification_completed_marks_row_done():
+    """status=completed → the panel row becomes ✅ with a duration; panel green."""
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    event = _notification_event(status="completed")
-    await renderer._handle_task_notification(event)
+    await renderer._handle_task_notification(_notification_event(status="completed"))
+    await renderer._flush_panel_now()  # finalize (as render_response does)
 
-    embed = target._sent[0].embeds[0]  # edited in place
+    embed = target._sent[0].embeds[0]
     assert embed.color.value == COLOR_TOOL_SUCCESS
-    assert "✅" in embed.title
+    assert "✅" in embed.description
+    assert "done" in embed.title
 
 
 @pytest.mark.asyncio
-async def test_task_notification_failed_red():
-    """status=failed → COLOR_TOOL_FAILURE, ❌ title."""
+async def test_task_notification_failed_marks_row_failed():
+    """status=failed → ❌ row with the reason; panel red; title counts failed."""
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    event = _notification_event(status="failed")
-    await renderer._handle_task_notification(event)
+    await renderer._handle_task_notification(
+        _notification_event(status="failed", summary="boom happened")
+    )
+    await renderer._flush_panel_now()
 
     embed = target._sent[0].embeds[0]
     assert embed.color.value == COLOR_TOOL_FAILURE
-    assert "❌" in embed.title
+    assert "❌" in embed.description
+    assert "failed" in embed.title
+    assert "boom happened" in embed.description  # reason surfaced on the row
 
 
 @pytest.mark.asyncio
-async def test_task_notification_stopped_gray():
-    """status=stopped → COLOR_THINKING (gray), ⏹️ title."""
+async def test_task_notification_stopped_marks_row_stopped():
+    """status=stopped → ⏹️ row; a lone stopped task colors the panel gray."""
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    event = _notification_event(status="stopped")
-    await renderer._handle_task_notification(event)
+    await renderer._handle_task_notification(_notification_event(status="stopped"))
+    await renderer._flush_panel_now()
 
     embed = target._sent[0].embeds[0]
     assert embed.color.value == COLOR_THINKING
-    assert "⏹️" in embed.title
+    assert "⏹️" in embed.description
+    assert "stopped" in embed.title
 
 
 @pytest.mark.asyncio
@@ -312,18 +302,124 @@ async def test_task_notification_cleans_state():
 
 
 @pytest.mark.asyncio
-async def test_task_updated_killed():
-    """TaskUpdated with status=killed → terminal embed."""
+async def test_task_updated_killed_marks_row():
+    """TaskUpdated status=killed → ⏹️ row, state cleaned, panel gray."""
     renderer, target = _make_renderer()
     await renderer._handle_task_started(_started_event(), subagent_renderers={})
 
-    event = _updated_event(status="killed")
-    await renderer._handle_task_updated(event)
+    await renderer._handle_task_updated(_updated_event(status="killed"))
+    await renderer._flush_panel_now()
 
     embed = target._sent[0].embeds[0]
+    assert "⏹️" in embed.description
     assert embed.color.value == COLOR_THINKING
-    assert "⏹️" in embed.title
     assert "t1" not in renderer._task_states
+
+
+# ---------------------------------------------------------------------------
+# Panel consolidation: rollover / windowing / trailing flush
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_panel_consolidates_multiple_tasks_into_one_message():
+    """Several tasks in one run share ONE panel message (no per-task spam)."""
+    renderer, target = _make_renderer()
+    for i in range(4):
+        await renderer._handle_task_started(
+            _started_event(task_id=f"t{i}", description=f"shot {i}"),
+            subagent_renderers={},
+        )
+    await renderer._flush_panel_now()
+    assert len(target._sent) == 1  # one consolidated panel for all four
+    desc = target._sent[0].embeds[0].description
+    for i in range(4):
+        assert f"shot {i}" in desc
+
+
+@pytest.mark.asyncio
+async def test_panel_rolls_over_at_max_rows(monkeypatch):
+    """Past TASK_PANEL_MAX_ROWS a fresh panel message is opened."""
+    import clauded.discord_renderer as dr
+
+    monkeypatch.setattr(dr, "TASK_PANEL_MAX_ROWS", 3)
+    renderer, target = _make_renderer()
+    for i in range(4):
+        await renderer._handle_task_started(
+            _started_event(task_id=f"t{i}"), subagent_renderers={}
+        )
+    # 3 rows fill panel 1; the 4th rolls over to a second message.
+    assert len(target._sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_panel_rolls_over_after_quiet_gap(monkeypatch):
+    """A new task after a quiet gap starts a fresh panel (a new 'run')."""
+    import clauded.discord_renderer as dr
+
+    monkeypatch.setattr(dr, "TASK_PANEL_ROLLOVER_GAP_SECONDS", 5.0)
+    renderer, target = _make_renderer()
+    await renderer._handle_task_started(_started_event(task_id="a"), subagent_renderers={})
+    # Pretend the last activity was long ago.
+    renderer._task_panel.last_activity_at = time.time() - 100
+    await renderer._handle_task_started(_started_event(task_id="b"), subagent_renderers={})
+    assert len(target._sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_panel_folds_old_rows(monkeypatch):
+    """Past TASK_PANEL_VISIBLE_ROWS the oldest rows collapse to '… N earlier …'."""
+    import clauded.discord_renderer as dr
+
+    monkeypatch.setattr(dr, "TASK_PANEL_MAX_ROWS", 100)  # keep them in one panel
+    monkeypatch.setattr(dr, "TASK_PANEL_VISIBLE_ROWS", 5)
+    renderer, target = _make_renderer()
+    for i in range(8):
+        await renderer._handle_task_started(
+            _started_event(task_id=f"t{i}", description=f"task {i}"),
+            subagent_renderers={},
+        )
+    await renderer._flush_panel_now()
+    desc = target._sent[0].embeds[0].description
+    assert "earlier" in desc       # fold marker
+    assert "task 7" in desc        # most recent stays visible
+    assert "task 0" not in desc    # oldest folded away
+
+
+@pytest.mark.asyncio
+async def test_panel_trailing_flush_renders_latest():
+    """A throttled-away terminal still lands once the panel is flushed."""
+    renderer, target = _make_renderer()
+    await renderer._handle_task_started(
+        _started_event(task_id="x", description="do x"), subagent_renderers={}
+    )
+    renderer._task_panel.last_edit_at = time.time()  # recent → completion throttled
+
+    await renderer._handle_task_notification(
+        _notification_event(task_id="x", status="completed")
+    )
+    # Force the final flush (as render_response / the bg reader end do).
+    await renderer._flush_panel_now()
+    assert "✅" in target._sent[0].embeds[0].description
+
+
+@pytest.mark.asyncio
+async def test_panel_description_capped_at_discord_limit(monkeypatch):
+    """A very long task list is truncated to Discord's 4096 embed-description
+    limit (never raises)."""
+    import clauded.discord_renderer as dr
+
+    monkeypatch.setattr(dr, "TASK_PANEL_MAX_ROWS", 10_000)
+    monkeypatch.setattr(dr, "TASK_PANEL_VISIBLE_ROWS", 10_000)
+    renderer, target = _make_renderer()
+    for i in range(200):
+        await renderer._handle_task_started(
+            _started_event(task_id=f"t{i}", description="x" * 60),
+            subagent_renderers={},
+        )
+    await renderer._flush_panel_now()
+    desc = target._sent[0].embeds[0].description
+    assert len(desc) <= 4000
 
 
 @pytest.mark.asyncio

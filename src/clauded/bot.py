@@ -1849,6 +1849,13 @@ class ClaudedBot(commands.Bot):
                     log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
                 if not handled:
                     await self._relay_bg_message(channel, msg)
+            # #panel-consolidation: background task stream went idle — finalize
+            # the rolling task panel so its last rows land. (On cancellation we
+            # skip this; the panel's own trailing-flush task still fires.)
+            try:
+                await renderer._flush_panel_now()
+            except Exception:
+                log.debug("#panel: bg panel flush failed thread=%s", thread_id, exc_info=True)
         except asyncio.CancelledError:
             raise
         except Exception:
