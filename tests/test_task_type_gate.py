@@ -67,8 +67,11 @@ async def test_local_bash_started_is_tracked():
     state = renderer._task_states["bash1"]
     assert state.task_type == "local_bash"
     assert state.message is not None
-    # Labelled as a background task, not "Dynamic Workflow".
-    assert "🖥️" in target._sent[0].embeds[0].title
+    # #panel-consolidation: rendered as a row in the consolidated task panel
+    # (the point of #321 is that a local_bash task is NOT dropped).
+    embed = target._sent[0].embeds[0]
+    assert "Tasks" in embed.title
+    assert "run build" in embed.description
 
 
 @pytest.mark.asyncio

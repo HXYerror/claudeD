@@ -34,7 +34,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -243,6 +243,42 @@ class _TaskState:
     # #panel: the specific agent kind (Explore / general-purpose / …) when the
     # SDK surfaces it, so progress/terminal panels can say WHICH agent ran.
     subagent_type: str | None = None
+    # #panel-consolidation: when this (main-channel) task is folded into a
+    # rolling panel, the panel it belongs to. ``None`` for sub-agent-thread
+    # tasks, which keep the legacy one-message-per-task rendering.
+    panel: "_TaskPanel | None" = None
+
+
+@dataclass
+class _TaskRow:
+    """One task's line inside a consolidated :class:`_TaskPanel`."""
+
+    task_id: str
+    name: str
+    status: str = "running"  # running | completed | failed | stopped | killed
+    started_at: float = 0.0
+    duration_s: int | None = None
+    reason: str | None = None       # brief summary for a failed/stopped task
+    last_tool: str | None = None
+    kind: str | None = None         # agent/task kind (Explore / local_bash / …)
+
+
+@dataclass
+class _TaskPanel:
+    """A single rolling Discord message that consolidates many task rows.
+
+    Replaces the one-message-per-task spam for main-channel tasks: each task
+    is a row; the message is edited in place as rows start/progress/finish.
+    Rolls over to a fresh message past ``TASK_PANEL_MAX_ROWS`` or after a
+    quiet gap (see ``_ensure_open_panel``).
+    """
+
+    message: "discord.Message | None" = None
+    rows: dict[str, _TaskRow] = field(default_factory=dict)
+    started_at: float = 0.0
+    last_activity_at: float = 0.0
+    last_edit_at: float = 0.0
+    flush_task: "asyncio.Task | None" = None
 
 # ---------------------------------------------------------------------------
 # Color scheme for embeds
@@ -292,6 +328,18 @@ EDIT_INTERVAL_SECONDS = 1.2
 # is imperceptible for a status panel. Env-overridable for tuning.
 TASK_PROGRESS_EDIT_INTERVAL_SECONDS = float(
     os.environ.get("CLAUDED_TASK_PROGRESS_EDIT_INTERVAL", "4.0")
+)
+
+# #panel-consolidation: multiple main-channel Task cards are folded into ONE
+# rolling "Tasks" panel message (a live checklist) instead of one message per
+# task. A panel rolls over to a fresh message once it holds MAX_ROWS tasks or a
+# new task arrives more than ROLLOVER_GAP seconds after the last one (a new
+# "run"); rows past VISIBLE_ROWS collapse into a "… N earlier …" line. All
+# env-overridable.
+TASK_PANEL_MAX_ROWS = int(os.environ.get("CLAUDED_TASK_PANEL_MAX_ROWS", "12"))
+TASK_PANEL_VISIBLE_ROWS = int(os.environ.get("CLAUDED_TASK_PANEL_VISIBLE_ROWS", "10"))
+TASK_PANEL_ROLLOVER_GAP_SECONDS = float(
+    os.environ.get("CLAUDED_TASK_PANEL_ROLLOVER_GAP", "60")
 )
 
 # Up to 5 retries with 0.5/1/2/4/8s backoff covers ~15s of transient HTTP badness.
@@ -771,6 +819,11 @@ class DiscordRenderer:
         # #292 Dynamic Workflow: per-task lifecycle state keyed by task_id.
         # Instance-level so /workflow commands can inspect across turns.
         self._task_states: dict[str, _TaskState] = {}
+        # #panel-consolidation: the CURRENT open rolling panel for THIS
+        # renderer's target (main channel). New main-channel tasks append a row
+        # to it; it rolls over to a fresh message per _ensure_open_panel. Sub-
+        # agent-thread renderers each keep their own.
+        self._task_panel: "_TaskPanel | None" = None
 
     # ------------------------------------------------------------------
     # #292 S3: sync task lifecycle state to bot-level registry
@@ -880,12 +933,156 @@ class DiscordRenderer:
             return "⚡ Dynamic Workflow"
         return "📦 Background Task"
 
+    # ------------------------------------------------------------------
+    # #panel-consolidation: rolling task panel (one message, many rows)
+    # ------------------------------------------------------------------
+
+    def _ensure_open_panel(self) -> "_TaskPanel":
+        """Return the current open panel, rolling over to a fresh one when the
+        current is full (``TASK_PANEL_MAX_ROWS``) or a new task arrives after a
+        quiet gap (``TASK_PANEL_ROLLOVER_GAP_SECONDS``) — a new "run"."""
+        panel = self._task_panel
+        now = time.time()
+        if (
+            panel is None
+            or len(panel.rows) >= TASK_PANEL_MAX_ROWS
+            or (
+                panel.last_activity_at
+                and now - panel.last_activity_at > TASK_PANEL_ROLLOVER_GAP_SECONDS
+            )
+        ):
+            panel = _TaskPanel(started_at=now, last_activity_at=now)
+            self._task_panel = panel
+        return panel
+
+    def _fmt_panel_row(self, row: "_TaskRow") -> str:
+        # Keep the description headline generous (#338) — it's the task's whole
+        # point; only guard against pathological lengths.
+        name = (row.name or "task")[:120]
+        if row.status == "completed":
+            dur = f" — {row.duration_s}s" if row.duration_s is not None else ""
+            return f"✅ {name}{dur}"
+        if row.status == "failed":
+            return f"❌ {name}" + (f" — {row.reason[:80]}" if row.reason else "")
+        if row.status in ("stopped", "killed"):
+            return f"⏹️ {name} — {row.status}"
+        # running — surface WHICH agent (#338) and its current tool.
+        kind = f" · {row.kind}" if row.kind else ""
+        tool = f" ({row.last_tool})" if row.last_tool else ""
+        return f"⚡ {name}{kind}{tool}"
+
+    def _build_panel_embed(self, panel: "_TaskPanel") -> "discord.Embed":
+        rows = list(panel.rows.values())
+        done = sum(1 for r in rows if r.status == "completed")
+        running = sum(1 for r in rows if r.status == "running")
+        failed = sum(1 for r in rows if r.status == "failed")
+        ended = sum(1 for r in rows if r.status in ("stopped", "killed"))
+        # Window: keep the most recent VISIBLE_ROWS, collapse older into a count
+        # (reuses the fold idiom from _format_roster_lines).
+        if len(rows) > TASK_PANEL_VISIBLE_ROWS:
+            hidden = len(rows) - (TASK_PANEL_VISIBLE_ROWS - 1)
+            shown = rows[hidden:]
+            lines = [f"-# … {hidden} earlier …"] + [self._fmt_panel_row(r) for r in shown]
+        else:
+            lines = [self._fmt_panel_row(r) for r in rows]
+        desc = "\n".join(lines) or "(no tasks)"
+        if len(desc) > 4000:
+            desc = desc[:3997] + "…"
+        bits = []
+        if done:
+            bits.append(f"{done} done")
+        if running:
+            bits.append(f"{running} running")
+        if failed:
+            bits.append(f"{failed} failed")
+        if ended:
+            bits.append(f"{ended} stopped")
+        title = "🔮 Tasks" + (" · " + " · ".join(bits) if bits else "")
+        if failed:
+            color = COLOR_TOOL_FAILURE
+        elif running:
+            color = COLOR_WORKFLOW
+        elif ended and not done:
+            color = COLOR_THINKING
+        else:
+            color = COLOR_TOOL_SUCCESS
+        return discord.Embed(title=title[:256], description=desc, color=color)
+
+    async def _render_panel(
+        self, panel: "_TaskPanel | None", *, throttled: bool = True,
+        force: bool = False,
+    ) -> None:
+        """Send (first time) or edit the panel message with its current rows.
+
+        Throttled by ``TASK_PROGRESS_EDIT_INTERVAL_SECONDS`` (the #340 cadence);
+        a throttled-away render schedules a trailing flush so the latest state
+        still lands. ``force`` bypasses the throttle (used by the final flush)."""
+        if panel is None:
+            return
+        now = time.time()
+        if (
+            throttled and not force and panel.message is not None
+            and now - panel.last_edit_at < TASK_PROGRESS_EDIT_INTERVAL_SECONDS
+        ):
+            self._schedule_panel_flush(panel)
+            return
+        embed = self._build_panel_embed(panel)
+        if panel.message is None:
+            panel.message = await self._safe_send(embed=embed)
+            if panel.message is not None:
+                panel.last_edit_at = time.time()
+        else:
+            ok = await self._safe_edit(panel.message, embed=embed)
+            if ok:
+                # Stamp from completion (see #340) so a slow/429'd edit can't be
+                # immediately followed by a burst.
+                panel.last_edit_at = time.time()
+
+    def _schedule_panel_flush(self, panel: "_TaskPanel") -> None:
+        """Ensure a single pending trailing flush that fires ~one interval after
+        the last edit, so a throttled-away final state still renders even if the
+        event stream then goes quiet."""
+        existing = panel.flush_task
+        if existing is not None and not existing.done():
+            return
+
+        async def _later() -> None:
+            try:
+                delay = max(
+                    0.0,
+                    (panel.last_edit_at + TASK_PROGRESS_EDIT_INTERVAL_SECONDS)
+                    - time.time(),
+                )
+                await asyncio.sleep(delay)
+                await self._render_panel(panel, throttled=False, force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("panel trailing flush failed", exc_info=True)
+
+        try:
+            panel.flush_task = asyncio.create_task(_later())
+        except RuntimeError:
+            panel.flush_task = None  # no running loop (defensive; e.g. sync test)
+
+    async def _flush_panel_now(self, panel: "_TaskPanel | None" = None) -> None:
+        """Cancel any pending trailing flush and render the panel immediately.
+        Called at turn/drain/background-reader end to finalize the panel."""
+        panel = panel if panel is not None else self._task_panel
+        if panel is None:
+            return
+        t = panel.flush_task
+        if t is not None and not t.done():
+            t.cancel()
+        panel.flush_task = None
+        await self._render_panel(panel, throttled=False, force=True)
+
     async def _handle_task_started(
         self,
         event: Any,
         subagent_renderers: dict[str, "DiscordRenderer"],
     ) -> None:
-        """Render a 🚀 embed for a newly-launched background subtask.
+        """Render a newly-launched background subtask.
 
         #321: tracks EVERY task_type (local_bash / local_agent /
         local_workflow), labelling the embed by the real type so background
@@ -927,20 +1124,39 @@ class DiscordRenderer:
             color=COLOR_WORKFLOW,
         )
 
-        # Route to sub-agent thread if this task belongs to one; otherwise
-        # main target. Preserves the existing #172 grouping discipline.
+        # Route to sub-agent thread if this task belongs to one; otherwise the
+        # main channel. Preserves the existing #172 grouping discipline.
         target_renderer: "DiscordRenderer" = self
         if tool_use_id and tool_use_id in subagent_renderers:
             target_renderer = subagent_renderers[tool_use_id]
 
-        msg = await target_renderer._safe_send(embed=embed)
+        now = time.time()
+        panel: "_TaskPanel | None" = None
+        msg: "discord.Message | None" = None
+        if target_renderer is self:
+            # #panel-consolidation: main-channel tasks fold into ONE rolling
+            # panel message (a live checklist) instead of one message per task.
+            panel = self._ensure_open_panel()
+            panel.rows[task_id] = _TaskRow(
+                task_id=task_id, name=description, status="running",
+                started_at=now, kind=subagent_type or task_type,
+            )
+            panel.last_activity_at = now
+            await self._render_panel(panel, throttled=True)
+            msg = panel.message
+        else:
+            # Sub-agent-thread tasks keep the legacy one-message-per-task card
+            # (already grouped inside their own thread), so nothing spams there.
+            msg = await target_renderer._safe_send(embed=embed)
+
         state = _TaskState(
             description=description,
             subagent_type=subagent_type,
             task_type=task_type,
             tool_use_id=tool_use_id,
             message=msg,
-            started_at=time.time(),
+            panel=panel,
+            started_at=now,
             last_edit_at=0.0,
             last_usage=None,
             # #322 (review fix): key by the MAIN renderer's target id, NOT
@@ -983,6 +1199,17 @@ class DiscordRenderer:
         # when the live per-agent roster is empty.
         if last_tool:
             state.last_tool_name = last_tool
+
+        # #panel-consolidation: main-channel tasks live as a row in the rolling
+        # panel — update the row's tool and re-render the panel (throttled). The
+        # legacy per-task-message path below is only for sub-agent-thread tasks.
+        if state.panel is not None:
+            row = state.panel.rows.get(task_id)
+            if row is not None and last_tool:
+                row.last_tool = last_tool
+            state.panel.last_activity_at = time.time()
+            await self._render_panel(state.panel, throttled=True)
+            return
 
         now = time.time()
         if now - state.last_edit_at < TASK_PROGRESS_EDIT_INTERVAL_SECONDS:
@@ -1217,6 +1444,28 @@ class DiscordRenderer:
             color = COLOR_INFO
 
         state = self._task_states.get(task_id)
+
+        # #panel-consolidation: main-channel tasks are rows in the rolling
+        # panel — mark the row terminal (status + duration + brief reason) and
+        # re-render the panel in place (throttled; a trailing flush lands the
+        # final state). No separate terminal message.
+        if state is not None and state.panel is not None:
+            row = state.panel.rows.get(task_id)
+            if row is not None:
+                row.status = (
+                    status if status in ("completed", "failed", "stopped", "killed")
+                    else "completed"
+                )
+                if getattr(state, "started_at", 0):
+                    row.duration_s = int(time.time() - state.started_at)
+                if row.status != "completed" and description and description.strip():
+                    row.reason = description.strip().splitlines()[0][:80]
+            state.panel.last_activity_at = time.time()
+            await self._render_panel(state.panel, throttled=True)
+            self._task_states.pop(task_id, None)
+            self._sync_task_to_bot(task_id, None)
+            return
+
         # #panel: prepend the task's one-line description so the terminal card
         # says WHAT finished, not only its result summary.
         _task_desc = getattr(state, "description", None) if state else None
@@ -2803,6 +3052,10 @@ class DiscordRenderer:
                         len(self._task_states),
                     )
                     break
+
+        # #panel-consolidation: finalize the rolling task panel so the last
+        # (throttled-away) row states land before the turn ends.
+        await self._flush_panel_now()
 
         # Stream finished cleanly. Flush whatever is left.
         await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
