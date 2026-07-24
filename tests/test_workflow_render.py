@@ -6,6 +6,7 @@ in isolation (no full render_response loop required).
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -22,6 +23,7 @@ from clauded.discord_renderer import (
     COLOR_TOOL_SUCCESS,
     COLOR_WORKFLOW,
     EDIT_INTERVAL_SECONDS,
+    TASK_PROGRESS_EDIT_INTERVAL_SECONDS,
     DiscordRenderer,
 )
 
@@ -180,6 +182,59 @@ async def test_task_progress_throttle():
 
     # But last_usage in state SHOULD have been updated (always stored)
     assert renderer._task_states["t1"].last_usage["total_tokens"] == 999
+
+
+def test_task_progress_interval_decoupled_and_larger():
+    """The progress card has its OWN interval, larger than the typewriter's, so
+    lowering the card's edit frequency doesn't make streaming text laggy."""
+    assert TASK_PROGRESS_EDIT_INTERVAL_SECONDS > EDIT_INTERVAL_SECONDS
+    assert TASK_PROGRESS_EDIT_INTERVAL_SECONDS >= 3.0
+
+
+@pytest.mark.asyncio
+async def test_task_progress_gate_reads_card_interval(monkeypatch):
+    """The card throttle uses TASK_PROGRESS_EDIT_INTERVAL_SECONDS (not the 1.2s
+    typewriter constant): lowering it to 0 lets back-to-back events both edit."""
+    import clauded.discord_renderer as dr
+
+    monkeypatch.setattr(dr, "TASK_PROGRESS_EDIT_INTERVAL_SECONDS", 0.0)
+    renderer, target = _make_renderer()
+    await renderer._handle_task_started(_started_event(), subagent_renderers={})
+
+    renderer._task_states["t1"].last_edit_at = 0.0
+    await renderer._handle_task_progress(
+        _progress_event(usage={"total_tokens": 1, "tool_uses": 1, "duration_ms": 1})
+    )
+    desc_after_first = target._sent[0].embeds[0].description
+
+    # Second, immediate — with a 0s interval it must NOT be throttled.
+    await renderer._handle_task_progress(
+        _progress_event(usage={"total_tokens": 777, "tool_uses": 9, "duration_ms": 9})
+    )
+    desc_after_second = target._sent[0].embeds[0].description
+    assert desc_after_first != desc_after_second
+    assert "777" in desc_after_second
+
+
+@pytest.mark.asyncio
+async def test_task_progress_last_edit_at_from_completion(monkeypatch):
+    """last_edit_at is stamped AFTER the edit completes, not from the pre-edit
+    timestamp — so a slow/429-retried edit can't be followed by an immediate
+    burst. Simulated with a _safe_edit that takes measurable wall time."""
+    renderer, target = _make_renderer()
+    await renderer._handle_task_started(_started_event(), subagent_renderers={})
+    state = renderer._task_states["t1"]
+    state.last_edit_at = 0.0
+
+    async def _slow_edit(*_a, **_k):
+        await asyncio.sleep(0.05)
+        return True
+
+    monkeypatch.setattr(renderer, "_safe_edit", _slow_edit)
+    t_before = time.time()
+    await renderer._handle_task_progress(_progress_event())
+    # Stamped from completion: at least the edit's duration after we started.
+    assert state.last_edit_at >= t_before + 0.05
 
 
 @pytest.mark.asyncio
