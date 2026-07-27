@@ -21,6 +21,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import deque
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from claude_agent_sdk import (
@@ -62,6 +63,41 @@ OnPostToolUse = Callable[[str, dict[str, Any]], Awaitable[None]]
 # Type alias for the Stop hook callback. Receives the raw input data when
 # Claude stops.
 OnStop = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+# Rolling tail of the CLI subprocess's stderr, captured via the SDK's
+# ``stderr`` callback. Two SDK quirks make this necessary: the SDK only pipes
+# stderr at all when a callback is registered, and its ``ProcessError`` never
+# carries the real output — it hardcodes the placeholder "Check stderr output
+# for details". Without capturing it ourselves, a startup crash surfaces to the
+# user as a bare "Failed to resume: exit code 1" with zero diagnostic signal.
+# Bounded so a chatty CLI can't grow it without limit; only the last handful of
+# lines around a failure ever matter.
+_STDERR_TAIL_LINES = 80
+
+
+class ClaudeStartupError(RuntimeError):
+    """SDK client failed to connect/initialize, enriched with real stderr.
+
+    The SDK raises an opaque ``ProcessError`` whose message ends with the
+    useless ``Error output: Check stderr output for details`` placeholder. We
+    strip that placeholder and append the actual stderr tail captured from the
+    failed CLI process, so the failure is diagnosable straight from the message
+    surfaced to the user (e.g. ``/session resume``'s error). ``original`` and
+    ``stderr_tail`` are kept as attributes for callers that want them split.
+    """
+
+    _PLACEHOLDER = "\nError output: Check stderr output for details"
+
+    def __init__(self, original: str, stderr_tail: str) -> None:
+        self.original = original
+        self.stderr_tail = stderr_tail
+        base = original
+        if base.endswith(self._PLACEHOLDER):
+            base = base[: -len(self._PLACEHOLDER)]
+        super().__init__(
+            f"{base}\nError output:\n{stderr_tail}" if stderr_tail else original
+        )
 
 
 _CHANNEL_MGMT_PROMPT = """
@@ -122,6 +158,11 @@ class ClaudeBridge:
         self._bare = sc.bare
         self._session_name = sc.session_name
         self._client: ClaudeSDKClient | None = None
+        # Rolling tail of CLI stderr (see ``_STDERR_TAIL_LINES``). Populated by
+        # the SDK ``stderr`` callback wired in :meth:`start`; read by
+        # :meth:`recent_stderr` to turn an otherwise-opaque startup failure into
+        # something actionable.
+        self._stderr_tail: deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._active = False
         # #324 (review fix): the bot's post-turn background stream reader is
         # registered here so EVERY path that consumes or closes this bridge's
@@ -694,9 +735,37 @@ class ClaudeBridge:
                 if self._plugin_dirs
                 else None
             ),
+            # Capture the CLI subprocess's stderr into a rolling tail so a
+            # startup crash is diagnosable. The SDK only pipes stderr when this
+            # callback is set, and its ProcessError otherwise reports the
+            # useless "Check stderr output for details" placeholder instead of
+            # the real error. See _capture_stderr / recent_stderr /
+            # ClaudeStartupError.
+            stderr=self._capture_stderr,
         )
         client = ClaudeSDKClient(options=options)
-        await client.connect()
+        try:
+            await client.connect()
+        except Exception as exc:
+            # Enrich the SDK's opaque failure with the real stderr the CLI
+            # wrote before exiting. The SDK's stderr reader is a detached task,
+            # so give it a beat to drain first. CancelledError is a
+            # BaseException (not caught here) and so still propagates untouched.
+            await self._drain_stderr_briefly()
+            tail = self.recent_stderr()
+            if tail:
+                log.error(
+                    "ClaudeBridge start failed for cwd=%s resume=%s: %s\n"
+                    "--- CLI stderr (tail) ---\n%s",
+                    self.project_path, self._resume_session_id, exc, tail,
+                )
+                raise ClaudeStartupError(str(exc), tail) from exc
+            log.error(
+                "ClaudeBridge start failed for cwd=%s resume=%s: %s "
+                "(no CLI stderr captured)",
+                self.project_path, self._resume_session_id, exc,
+            )
+            raise
         self._client = client
         self._active = True
         log.info(
@@ -709,6 +778,46 @@ class ClaudeBridge:
             bool(self._env),
             self._user,
         )
+
+    def _capture_stderr(self, line: str) -> None:
+        """SDK ``stderr`` callback: append one framed line to the rolling tail.
+
+        Synchronous and cheap by contract — the SDK invokes it inline while
+        framing the stderr stream. Also mirrored to the debug log so live CLI
+        stderr stays observable without raising default log volume.
+        """
+        self._stderr_tail.append(line)
+        log.debug("claude-cli stderr [%s]: %s", self.project_path, line)
+
+    def recent_stderr(self, *, max_chars: int = 1500) -> str:
+        """Return the captured tail of CLI stderr, trimmed for display.
+
+        Empty string when nothing was captured. Keeps the most recent
+        ``max_chars`` (the output closest to the failure) so it fits inside a
+        Discord message.
+        """
+        text = "\n".join(self._stderr_tail).strip()
+        if len(text) > max_chars:
+            text = "…\n" + text[-max_chars:]
+        return text
+
+    async def _drain_stderr_briefly(self) -> None:
+        """Let the detached SDK stderr reader catch up after a connect failure.
+
+        When connect() fails the CLI has already exited (the SDK awaits
+        ``process.wait()`` before raising ProcessError), so its stderr is fully
+        buffered and only needs a few event-loop turns to reach
+        :meth:`_capture_stderr`. Poll until the tail stops growing, capped so a
+        wedged reader can't hang startup. Best-effort — returns quietly if no
+        stderr ever arrives.
+        """
+        prev = -1
+        for _ in range(8):  # ~0.24s ceiling; returns early once the tail is stable
+            cur = len(self._stderr_tail)
+            if cur and cur == prev:
+                return
+            prev = cur
+            await asyncio.sleep(0.03)
 
     async def cancel_bg_reader(self) -> None:
         """#324 (review fix): cancel the registered post-turn background reader.
@@ -1072,6 +1181,7 @@ class ClaudeBridge:
 
 __all__ = [
     "ClaudeBridge",
+    "ClaudeStartupError",
     "OnPreToolUse",
     "OnPostToolUse",
     "OnStop",

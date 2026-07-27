@@ -271,7 +271,12 @@ async def session_resume(interaction: discord.Interaction) -> None:
                 thread_id, project_path, bot.config, sc,
             )
         except Exception as exc:
-            await interaction.followup.send(f"❌ Failed to resume: `{exc}`", ephemeral=True)
+            # exc is often a ClaudeStartupError carrying the CLI's real stderr
+            # tail (multi-line) — render in a fenced block so it stays readable
+            # instead of collapsing into unreadable inline code.
+            await interaction.followup.send(
+                f"❌ Failed to resume:\n```\n{exc}\n```", ephemeral=True
+            )
             return
     await interaction.followup.send("🔄 Session resumed with previous context.")
 
