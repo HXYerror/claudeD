@@ -93,18 +93,23 @@ async def test_bg_reader_exits_when_idle() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_bg_message_renders_tools_and_text() -> None:
+async def test_relay_bg_message_is_text_only_no_tool_spam() -> None:
+    """Regression: the bg relay must NOT post a line per tool-use (that spammed
+    the channel with '🔧 Read'/'🔧 Bash' — post-#346 fix). Only text relays."""
     target = FakeTarget()
     msg = AssistantMessage(
         content=[ToolUseBlock(id="tu1", name="Bash", input={"command": "ls"}),
+                 ToolUseBlock(id="tu2", name="Read", input={"file_path": "/x"}),
                  TextBlock(text="ran the command")],
         model="claude-x", parent_tool_use_id=None,
     )
     await ClaudedBot._relay_bg_message(MagicMock(), target, msg, renderer=None)
 
     blob = "\n".join(m.content for m in target._sent if m.content)
-    assert "🔧 Bash" in blob, "#324 G3: continuation tool-use should be surfaced"
+    assert "🔧" not in blob, "#324: no per-tool spam lines in the background relay"
     assert "background follow-up" in blob and "ran the command" in blob
+    # one message (the text), not one-per-tool
+    assert len([m for m in target._sent if m.content]) == 1
 
 
 @pytest.mark.asyncio
