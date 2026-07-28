@@ -467,10 +467,13 @@ class ClaudedBot(commands.Bot):
         # arrives in practice (investigation: 0 occurrences in any log). The
         # renderer reads this via ``bot._agent_roster``.
         self._agent_roster: dict[int, dict[str, dict]] = {}
-        # #goal: threads with an active /goal (thread_id → condition). Keeps the
-        # post-turn bg reader warm across the goal loop's inter-turn gaps (goal
-        # turns aren't Task*/subagents, so they'd otherwise look idle) and backs
-        # `/goal status`. Cleared by `/goal clear` or the reader's max-lifetime.
+        # #goal: threads with an active /goal marker (thread_id → condition).
+        # Backs `/goal status` and is set only for the DURATION of the goal's
+        # (synchronous) set-turn. Verified: the /goal loop completes inside that
+        # one render turn — the evaluator injects continue-turns into the stream
+        # and there's a single terminal ResultMessage — so it does NOT drive the
+        # background reader. The reader's pending-check consults this only as a
+        # defensive guard. Cleared when the loop resolves (or by `/goal clear`).
         self._active_goals: dict[int, str] = {}
         # #324: post-turn background stream reader. After a turn ends, the CLI
         # keeps the stream open and PROACTIVELY pushes background-task
@@ -1856,9 +1859,11 @@ class ClaudedBot(commands.Bot):
         deadline = time.monotonic() + max_life
 
         def _pending() -> bool:
-            # #goal: an active /goal keeps the reader warm across the loop's
-            # inter-turn gaps — goal turns aren't Task*/subagents, so they'd
-            # otherwise look idle and the reader would wind down mid-loop.
+            # #goal (defensive): a thread with an active-goal marker counts as
+            # pending. Verified that the /goal loop completes inside its render
+            # turn (nothing reaches this reader), so the marker is normally
+            # cleared before the reader's first check — this only guards the
+            # brief post-turn window and any goal that spawns background work.
             return (
                 bool(getattr(renderer, "_task_states", None))
                 or bool(self._pending_subagents.get(thread_id))

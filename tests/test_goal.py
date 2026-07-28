@@ -85,3 +85,52 @@ async def test_bg_reader_no_goal_exits_immediately() -> None:
     bridge = _GoalBridge(bot, 9)
     await ClaudedBot._bg_reader_loop(bot, 9, bridge, FakeTarget(), _RendererStub())
     assert bridge.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_set_marks_during_and_clears_after(monkeypatch) -> None:
+    """`/goal set` marks the goal active for the DURATION of the (synchronous)
+    loop turn and clears it once the loop resolves — verified behavior: the whole
+    /goal loop completes inside the one render turn."""
+    import asyncio
+
+    from clauded.cogs import goal as goalmod
+
+    bot = MagicMock()
+    bot._active_goals = {}
+    bridge = MagicMock()
+    bridge.is_active = True
+    bot.session_manager.get_session.return_value = bridge
+    bot.project_manager.get_path.return_value = "/tmp/proj"
+    bot.session_manager.get_lock.return_value = asyncio.Lock()
+
+    captured: dict = {}
+
+    async def _render(**kw):
+        captured.update(kw)
+        captured["marker_during"] = dict(bot._active_goals)  # snapshot mid-turn
+
+    bot._render_with_retry = AsyncMock(side_effect=_render)
+
+    monkeypatch.setattr(goalmod, "_resolve", lambda inter: (bot, 111, 111))
+
+    async def _no_reject(inter, b):
+        return False
+
+    monkeypatch.setattr(goalmod, "reject_if_unbound", _no_reject)
+    monkeypatch.setattr(goalmod, "DiscordRenderer", lambda *a, **k: MagicMock())
+
+    interaction = MagicMock()
+    interaction.response.defer = AsyncMock()
+    interaction.followup.send = AsyncMock()
+    interaction.user.id = 5
+    interaction.channel = MagicMock()
+
+    await goalmod.goal_set.callback(interaction, "all tests in test/auth pass")
+
+    assert captured.get("user_text") == "/goal all tests in test/auth pass"
+    assert captured.get("marker_during") == {111: "all tests in test/auth pass"}, (
+        "goal must be marked active DURING the turn (for concurrent /goal status)"
+    )
+    assert bot._active_goals == {}, "marker must be cleared once the loop resolves"
+

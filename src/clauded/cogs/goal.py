@@ -3,17 +3,25 @@
 Set a measurable condition and let Claude keep working across turns until an
 evaluator (the CLI's small fast model, default Haiku) judges it met. Claude
 Code's native ``/goal`` (>= v2.1.139) is a session-scoped feature; the CLI
-processes ``/goal <condition>`` as a slash command even in headless/``-p`` mode,
-so we forward it through the bridge as a turn. Between goal-loop turns the bot's
-post-turn background reader stays warm (``bot._active_goals`` keeps it from
-winding down) so the loop's later turns render.
+processes ``/goal <condition>`` as a slash command even through the SDK, so we
+forward it through the bridge as a turn.
+
+Verified against the real CLI/SDK (not just unit tests): the whole goal loop
+runs INSIDE one ``send_message``/``receive_response`` — the evaluator injects
+its "continue" turns into the stream as UserMessages and there is ONE terminal
+ResultMessage (a forced 2-turn goal reports ``turns=2`` in a single call;
+``receive_pending`` sees nothing). So the normal render path shows every loop
+turn live and nothing is handed to the post-turn background reader. claudeD's
+own Stop hook coexists with the evaluator on the streaming path (both fire, no
+stop-hook error — unlike a raw ``claude -p`` invocation).
+
+``bot._active_goals[thread_id]`` therefore marks a goal as running only for the
+DURATION of the set turn (backing a concurrent ``/goal status``) and is cleared
+once the loop resolves. To stop a running goal use ``/session interrupt`` — the
+loop holds the per-thread lock, so ``/goal clear`` can't preempt it (clear only
+drops the status marker).
 
 Commands: ``/goal set``, ``/goal status``, ``/goal clear``.
-
-Limitation (pending live verification): the CLI clears the goal internally when
-it's met, but the exact SDK stream signal for "goal met" is unconfirmed, so the
-bot-side ``_active_goals`` entry is cleared by ``/goal clear`` or the reader's
-max-lifetime backstop — not yet auto-detected on completion.
 """
 from __future__ import annotations
 
@@ -45,7 +53,8 @@ def _goal_panel(condition: str) -> discord.Embed:
             "Claude keeps working across turns until this holds:\n\n"
             f"> {condition[:1500]}\n\n"
             "A fast model checks after each turn; it clears automatically once "
-            "met. Clear early with `/goal clear`.\n"
+            "met. It runs to completion in this turn — stop it early with "
+            "`/session interrupt`.\n"
             "-# Tip: pair with auto-mode so goal turns run unattended, and write "
             "a *measurable* condition (e.g. `npm test exits 0`)."
         ),
@@ -96,17 +105,24 @@ async def goal_set(interaction: discord.Interaction, condition: str) -> None:
         return
     project_path = bot.project_manager.get_path(parent_id)
     await interaction.response.defer()
-    # Register BEFORE the turn so the bg reader (started at the end of
-    # _render_with_retry) already sees the goal as active and stays warm.
-    bot._active_goals[thread_id] = condition
     log.info("/goal set thread=%s len=%d", thread_id, len(condition))
+    # Verified against the real CLI/SDK: the /goal loop runs to completion
+    # (met or stopped) WITHIN this single turn — the evaluator injects its
+    # "continue" turns INTO the stream as UserMessages, and receive_response()
+    # returns only at the ONE terminal ResultMessage (a 2-turn goal yields
+    # turns=2 in a single send_message; nothing lands on the bg reader). So we
+    # mark the goal active only for the DURATION of the turn (backs a concurrent
+    # `/goal status`) and clear it once the loop resolves. The bridge renders
+    # every loop turn live via the normal path — no bg-reader handoff involved.
+    bot._active_goals[thread_id] = condition
+    await interaction.followup.send(embed=_goal_panel(condition))
     lock = bot.session_manager.get_lock(thread_id)
-    async with lock:
-        renderer = DiscordRenderer(
-            interaction.channel, bot=bot,
-            project_path=Path(project_path) if project_path else None,
-        )
-        try:
+    try:
+        async with lock:
+            renderer = DiscordRenderer(
+                interaction.channel, bot=bot,
+                project_path=Path(project_path) if project_path else None,
+            )
             await bot._render_with_retry(
                 renderer=renderer,
                 bridge=bridge,
@@ -115,12 +131,16 @@ async def goal_set(interaction: discord.Interaction, condition: str) -> None:
                 project_path=project_path,
                 author_id=interaction.user.id,
             )
+    except Exception:
+        log.exception("/goal set render failed thread=%s", thread_id)
+        try:
+            await interaction.followup.send("❌ The goal turn failed.", ephemeral=True)
         except Exception:
-            log.exception("/goal set render failed thread=%s", thread_id)
-            bot._active_goals.pop(thread_id, None)
-            await interaction.followup.send("❌ Failed to set the goal.", ephemeral=True)
-            return
-    await interaction.followup.send(embed=_goal_panel(condition))
+            pass
+    finally:
+        # The loop is done (met / stopped / failed); drop the active marker so
+        # `/goal status` doesn't lie and the post-turn bg reader winds down.
+        bot._active_goals.pop(thread_id, None)
 
 
 @goal_group.command(name="status", description="Show the active goal for this thread.")
@@ -136,37 +156,26 @@ async def goal_status(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(embed=_goal_panel(condition), ephemeral=True)
 
 
-@goal_group.command(name="clear", description="Clear the active goal.")
+@goal_group.command(name="clear", description="Clear the active-goal marker (see notes for stopping a running goal).")
 async def goal_clear(interaction: discord.Interaction) -> None:
-    bot, thread_id, parent_id = _resolve(interaction)
+    bot, thread_id, _ = _resolve(interaction)
     if bot is None or thread_id is None:
         await interaction.response.send_message("Use this inside a thread.", ephemeral=True)
         return
+    # A /goal loop runs synchronously in the turn that set it (holding the
+    # per-thread lock), so we deliberately do NOT inject a `/goal clear` turn
+    # here — it would just queue behind the running goal, useless for aborting.
+    # This only drops the status marker; to actually stop a running goal use
+    # `/session interrupt`.
     had = bot._active_goals.pop(thread_id, None) is not None
-    bridge = bot.session_manager.get_session(thread_id)
-    if bridge is not None and getattr(bridge, "is_active", False):
-        # Best-effort: tell the CLI to drop its own session goal too.
-        await interaction.response.defer()
-        project_path = bot.project_manager.get_path(parent_id)
-        lock = bot.session_manager.get_lock(thread_id)
-        async with lock:
-            renderer = DiscordRenderer(
-                interaction.channel, bot=bot,
-                project_path=Path(project_path) if project_path else None,
-            )
-            try:
-                await bot._render_with_retry(
-                    renderer=renderer, bridge=bridge, user_text="/goal clear",
-                    thread=interaction.channel, project_path=project_path,
-                    author_id=interaction.user.id,
-                )
-            except Exception:
-                log.debug("/goal clear render failed thread=%s", thread_id, exc_info=True)
-        await interaction.followup.send("🧹 Goal cleared." if had else "No active goal (CLI cleared anyway).")
-        return
-    await interaction.response.send_message(
-        "🧹 Goal cleared." if had else "No active goal to clear.", ephemeral=True
-    )
+    if had:
+        msg = (
+            "🧹 Cleared the goal marker. If a goal is **currently running**, stop "
+            "it with `/session interrupt` — this only clears the status."
+        )
+    else:
+        msg = "No active goal marker here. (Running goal? Use `/session interrupt`.)"
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 __all__ = ["goal_group"]
