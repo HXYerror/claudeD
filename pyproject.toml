@@ -18,6 +18,12 @@ dependencies = [
     "python-dotenv>=1.0",
     "Pillow>=10",
     "croniter>=2.0",
+    # #320: zoneinfo.ZoneInfo raises ZoneInfoNotFoundError on any host without a
+    # system IANA tz database (Windows always; minimal Linux containers), which
+    # surfaced as "invalid timezone" for every schedule_* MCP call. tzdata is
+    # CPython's documented fallback — only consulted when the system DB is
+    # absent, so it's inert on macOS/Linux and fixes Windows outright.
+    "tzdata",
 ]
 
 [project.optional-dependencies]
