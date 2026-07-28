@@ -1631,6 +1631,34 @@ class DiscordRenderer:
 
         return False
 
+    @staticmethod
+    def _result_stats(
+        event: Any, *, cost_before: float, stream_start: float, stop_reason: Any
+    ) -> dict:
+        """Build the footer stats dict from a ``ResultMessage``.
+
+        #316: extracted so the post-turn drain can rebuild the footer from a
+        workflow's SECOND ``ResultMessage`` the same way the main loop builds it
+        from the first. Deliberately does NOT set ``context_percentage`` — that
+        needs an async control-plane fetch the caller owns; the drain reuses the
+        value the main loop already fetched (no second settle delay).
+        """
+        cumulative_cost = float(getattr(event, "total_cost_usd", 0) or 0)
+        usage = getattr(event, "usage", None) or {}
+        return {
+            "cost": max(0.0, cumulative_cost - cost_before),
+            "cost_cumulative": cumulative_cost,
+            "input_tokens": int(usage.get("input_tokens", 0) or 0),
+            "output_tokens": int(usage.get("output_tokens", 0) or 0),
+            "duration_ms": (time.time() - stream_start) * 1000,
+            "num_turns": int(getattr(event, "num_turns", 0) or 0),
+            "model": getattr(event, "model", "") or "",
+            "stop_reason": stop_reason,
+            "is_error": bool(getattr(event, "is_error", False)),
+            "subtype": getattr(event, "subtype", None),
+            "api_error_status": getattr(event, "api_error_status", None),
+        }
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -3042,8 +3070,35 @@ class DiscordRenderer:
         # below — does not disturb the assistant-text ordering.
         if result_received and self._task_states:
             drain_deadline = time.monotonic() + DRAIN_TOTAL_SECONDS
+            _ctx_pct = stats.get("context_percentage") if stats else None
             async for event in bridge.receive_pending():
-                await self._dispatch_task_event(event, subagent_renderers)
+                if await self._dispatch_task_event(event, subagent_renderers):
+                    pass  # a Task* terminal — panel already updated
+                elif isinstance(event, AssistantMessage) and not getattr(
+                    event, "parent_tool_use_id", None
+                ):
+                    # #316 (G1): the SAME drain window also carries a workflow's
+                    # trailing SUMMARY text. ``_dispatch_task_event`` ignores
+                    # non-Task* events, so the old code DROPPED it and the turn
+                    # rendered "(Claude returned no text response)" despite the
+                    # summary existing in the transcript. Capture it here. No
+                    # StreamEvent dedup needed: partial-message deltas only fire
+                    # in the main loop, so this TextBlock is the sole copy.
+                    for block in getattr(event, "content", None) or []:
+                        if isinstance(block, TextBlock) and block.text.strip():
+                            saw_text = True
+                            buffer += block.text
+                elif isinstance(event, ResultMessage):
+                    # #316 (G2): the continuation has its OWN ResultMessage;
+                    # rebuild the footer from it so it isn't stuck on the
+                    # dispatch result's empty/zero usage. Reuse the already-
+                    # fetched context percentage (no second settle delay).
+                    stats = self._result_stats(
+                        event, cost_before=cost_before,
+                        stream_start=stream_start, stop_reason=_last_stop_reason,
+                    )
+                    if _ctx_pct is not None:
+                        stats["context_percentage"] = _ctx_pct
                 if not self._task_states:
                     break
                 if time.monotonic() > drain_deadline:
@@ -3058,7 +3113,19 @@ class DiscordRenderer:
         await self._flush_panel_now()
 
         # Stream finished cleanly. Flush whatever is left.
-        await self._flush(live_msg, buffer, typewriter, saw_text, tool_msgs)
+        # #316 (G2): if the drain ended with a workflow still pending and no text
+        # arrived, don't tell the user "(Claude returned no text response)" — the
+        # post-turn bg reader relays the summary when it lands. Post a subtle
+        # heads-up instead of the misleading placeholder.
+        _bg_pending = bool(self._task_states) and not saw_text and not tool_msgs
+        await self._flush(
+            live_msg, buffer, typewriter, saw_text, tool_msgs,
+            suppress_placeholder=_bg_pending,
+        )
+        if _bg_pending:
+            await self._safe_send(
+                content="-# ⏳ a background workflow is still running — results will follow"
+            )
 
         # Append cost/stats footer to the last sent message.
         # #160 Fix B: split the prior 3-way AND so each condition gets a sane
@@ -3680,8 +3747,15 @@ class DiscordRenderer:
         typewriter: bool,
         saw_text: bool,
         tool_msgs: dict[str, discord.Message],
+        *,
+        suppress_placeholder: bool = False,
     ) -> None:
-        """Send any remaining text once the stream completes."""
+        """Send any remaining text once the stream completes.
+
+        #316: ``suppress_placeholder`` skips the "(no text response)" note when a
+        background workflow is still running (its summary hasn't landed within
+        the drain window) — the bot's post-turn reader relays it when it arrives.
+        """
         _log_stream(None, buffer_len=len(buffer), extra={"action": "flush", "typewriter": typewriter})
         # Process channel/thread management markers before sending.
         if buffer:
@@ -3776,7 +3850,7 @@ class DiscordRenderer:
 
         # No text buffered. If we never showed *anything* (no text, no tools),
         # leave a placeholder so the user knows the round-trip finished.
-        if not saw_text and not tool_msgs:
+        if not saw_text and not tool_msgs and not suppress_placeholder:
             sent = await self._safe_send(content="(Claude returned no text response)")
             if sent is not None:
                 self._last_msg = sent
