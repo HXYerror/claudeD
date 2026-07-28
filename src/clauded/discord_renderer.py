@@ -2169,6 +2169,20 @@ class DiscordRenderer:
                             # case. Idempotency: gating on ``not
                             # stream_text_seen`` is what prevents the streaming
                             # case from rendering text twice.
+                            #
+                            # #goal (live-verified): a TextBlock on a UserMessage
+                            # is INJECTED context, not assistant output — the CLI
+                            # feeds a Stop-hook / goal-evaluator "continue" prompt
+                            # (and skill-file context) back into the turn this way.
+                            # Rendering it leaked "Stop hook feedback: …" into the
+                            # reply and mashed multi-turn /goal replies together.
+                            # Skip it; when it marks a goal turn boundary with
+                            # text already buffered, drop in a paragraph break so
+                            # the next turn's text is separated, not concatenated.
+                            if not isinstance(event, AssistantMessage):
+                                if buffer and not buffer.endswith("\n"):
+                                    buffer += "\n\n"
+                                continue
                             if not stream_text_seen and block.text.strip():
                                 saw_text = True
                                 buffer += block.text
