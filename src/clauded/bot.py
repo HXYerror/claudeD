@@ -467,6 +467,11 @@ class ClaudedBot(commands.Bot):
         # arrives in practice (investigation: 0 occurrences in any log). The
         # renderer reads this via ``bot._agent_roster``.
         self._agent_roster: dict[int, dict[str, dict]] = {}
+        # #goal: threads with an active /goal (thread_id → condition). Keeps the
+        # post-turn bg reader warm across the goal loop's inter-turn gaps (goal
+        # turns aren't Task*/subagents, so they'd otherwise look idle) and backs
+        # `/goal status`. Cleared by `/goal clear` or the reader's max-lifetime.
+        self._active_goals: dict[int, str] = {}
         # #324: post-turn background stream reader. After a turn ends, the CLI
         # keeps the stream open and PROACTIVELY pushes background-task
         # completions (a standalone <task-notification> turn) + the main agent's
@@ -684,6 +689,8 @@ class ClaudedBot(commands.Bot):
         from .cogs.schedule import schedule_group
         # #292 S3: /workflow group (list/kill/detail).
         from .cogs.workflow import workflow_group
+        # /goal group (set/status/clear) — session-level completion condition.
+        from .cogs.goal import goal_group
 
         # #audit(live-log): register a tree-wide error handler so an expired
         # interaction (10062) or any command raise is handled gracefully
@@ -722,6 +729,7 @@ class ClaudedBot(commands.Bot):
         self.tree.add_command(schedule_group)
         # #292 S3: /workflow group (list/kill/detail)
         self.tree.add_command(workflow_group)
+        self.tree.add_command(goal_group)
         # #185: do NOT sync globally here — historically claudeD synced
         # via both ``tree.sync()`` (global) AND PR-specific per-guild
         # PUT calls, so commands ended up registered in BOTH scopes and
@@ -1848,8 +1856,13 @@ class ClaudedBot(commands.Bot):
         deadline = time.monotonic() + max_life
 
         def _pending() -> bool:
-            return bool(getattr(renderer, "_task_states", None)) or bool(
-                self._pending_subagents.get(thread_id)
+            # #goal: an active /goal keeps the reader warm across the loop's
+            # inter-turn gaps — goal turns aren't Task*/subagents, so they'd
+            # otherwise look idle and the reader would wind down mid-loop.
+            return (
+                bool(getattr(renderer, "_task_states", None))
+                or bool(self._pending_subagents.get(thread_id))
+                or thread_id in self._active_goals
             )
 
         try:
