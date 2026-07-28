@@ -1913,21 +1913,17 @@ class ClaudedBot(commands.Bot):
     ) -> None:
         """Render a post-turn continuation message to Discord.
 
-        #324 G3: was text-only. Now also surfaces tool-use (a compact status
-        line) and a footer on the continuation's ``ResultMessage``, so multi-turn
-        continuations — background follow-ups AND ``/goal`` loop turns — render
-        with real fidelity instead of a bare text blob. Deliberately focused (NOT
-        the main 1,200-line render loop, which stays untouched so normal turns
-        can't regress); full text fidelity (typewriter/tables/images) is
-        simplified for the between-turns channel. Best-effort; never raises.
+        #324: relays the CLI's proactively-pushed post-turn continuation — a
+        background task's follow-up TEXT (e.g. "here's the URL") plus a compact
+        token footer on its ``ResultMessage``. Deliberately text-only: it does
+        NOT surface per-tool activity. (Regression fix after #346: emitting a
+        line per ToolUseBlock posted one Discord message per tool and spammed
+        the channel — tool activity belongs to the MAIN render path, not the
+        between-turns relay, and /goal loops render via the main path anyway,
+        not here.) Best-effort; never raises.
         """
         try:
-            from .claude_bridge import (
-                AssistantMessage,
-                ResultMessage,
-                TextBlock,
-                ToolUseBlock,
-            )
+            from .claude_bridge import AssistantMessage, ResultMessage, TextBlock
             if isinstance(msg, ResultMessage):
                 await self._relay_bg_footer(channel, msg)
                 return
@@ -1936,11 +1932,6 @@ class ClaudedBot(commands.Bot):
             content = getattr(msg, "content", None)
             if not isinstance(content, list):
                 return
-            # Compact tool-use status lines (e.g. a /goal turn running Bash).
-            for b in content:
-                if isinstance(b, ToolUseBlock):
-                    name = getattr(b, "name", "tool") or "tool"
-                    await safe_send_message(channel, content=f"-# 🔧 {name}")
             parts = [
                 b.text for b in content
                 if isinstance(b, TextBlock) and (getattr(b, "text", "") or "").strip()
