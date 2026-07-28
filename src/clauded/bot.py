@@ -1830,25 +1830,51 @@ class ClaudedBot(commands.Bot):
         channel: Any,
         renderer: "DiscordRenderer",
     ) -> None:
-        """Consume late stream messages until idle for CLAUDED_BG_IDLE_TIMEOUT.
+        """Consume late/continuation stream messages until the session is idle.
+
+        #324 G5: pending-aware window. While this thread still has background
+        work in flight (a workflow task tracked by the renderer, or a pending
+        subagent), keep waiting through short quiet gaps; once nothing is
+        pending, a single quiet gap winds the reader down. An absolute
+        max-lifetime backstop bounds a wedged / orphaned counter. This replaces
+        the old flat ``CLAUDED_BG_IDLE_TIMEOUT`` window, which both dropped slow
+        tasks (>600s) and blocked truly-idle sessions for the full window.
 
         Always cancellable; never runs concurrently with a turn (the bridge
         cancels it at the start of the next send_message and on stop).
         """
-        idle = float(os.environ.get("CLAUDED_BG_IDLE_TIMEOUT", "600"))
+        quiet_gap = float(os.environ.get("CLAUDED_BG_QUIET_GAP", "8"))
+        max_life = float(os.environ.get("CLAUDED_BG_MAX_LIFETIME", "3600"))
+        deadline = time.monotonic() + max_life
+
+        def _pending() -> bool:
+            return bool(getattr(renderer, "_task_states", None)) or bool(
+                self._pending_subagents.get(thread_id)
+            )
+
         try:
-            async for msg in bridge.receive_pending(per_message_timeout=idle):
-                # #324 review fix: route Task* through the turn's renderer so a
-                # background task's terminal (✅/❌) finalizes the embed it
-                # started (its task_id lives in this renderer's _task_states);
-                # only non-Task* messages fall through to the text relay.
-                try:
-                    handled = await renderer._dispatch_task_event(msg, {})
-                except Exception:
-                    handled = False
-                    log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
-                if not handled:
-                    await self._relay_bg_message(channel, msg)
+            # #324 G5: poll in rounds. Each receive_pending() call opens a FRESH
+            # iterator, drains the current burst, and returns after `quiet_gap`
+            # of silence (its post-timeout iterator is discarded — resuming a
+            # cancelled anyio receive is unsafe, so we open a new one per round).
+            # We re-enter ONLY while background work is pending, so a paused
+            # /goal or background loop survives inter-turn silence while a truly
+            # idle session winds down after a single quiet gap (was a flat 600s).
+            # The max-lifetime backstop bounds a wedged / orphaned counter.
+            while True:
+                async for msg in bridge.receive_pending(per_message_timeout=quiet_gap):
+                    # #324 review fix: route Task* through the turn's renderer so
+                    # a background task's terminal (✅/❌) finalizes the embed it
+                    # started; only non-Task* messages fall through to the relay.
+                    try:
+                        handled = await renderer._dispatch_task_event(msg, {})
+                    except Exception:
+                        handled = False
+                        log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
+                    if not handled:
+                        await self._relay_bg_message(channel, msg, renderer=renderer)
+                if not _pending() or time.monotonic() > deadline:
+                    break
             # #panel-consolidation: background task stream went idle — finalize
             # the rolling task panel so its last rows land. (On cancellation we
             # skip this; the panel's own trailing-flush task still fires.)
@@ -1864,21 +1890,39 @@ class ClaudedBot(commands.Bot):
             if getattr(bridge, "_bg_reader_task", None) is asyncio.current_task():
                 bridge._bg_reader_task = None
 
-    async def _relay_bg_message(self, channel: Any, msg: Any) -> None:
-        """Relay the agent's post-turn continuation TEXT to Discord.
+    async def _relay_bg_message(
+        self, channel: Any, msg: Any, renderer: "DiscordRenderer | None" = None
+    ) -> None:
+        """Render a post-turn continuation message to Discord.
 
-        Conservative: text only (``AssistantMessage`` ``TextBlock``s). Skips
-        UserMessage / ``<task-notification>`` echoes / stream events / tool
-        noise so the background follow-up (e.g. "here's the URL") shows up
-        without spamming. Best-effort; never raises.
+        #324 G3: was text-only. Now also surfaces tool-use (a compact status
+        line) and a footer on the continuation's ``ResultMessage``, so multi-turn
+        continuations — background follow-ups AND ``/goal`` loop turns — render
+        with real fidelity instead of a bare text blob. Deliberately focused (NOT
+        the main 1,200-line render loop, which stays untouched so normal turns
+        can't regress); full text fidelity (typewriter/tables/images) is
+        simplified for the between-turns channel. Best-effort; never raises.
         """
         try:
-            from .claude_bridge import AssistantMessage, TextBlock
+            from .claude_bridge import (
+                AssistantMessage,
+                ResultMessage,
+                TextBlock,
+                ToolUseBlock,
+            )
+            if isinstance(msg, ResultMessage):
+                await self._relay_bg_footer(channel, msg)
+                return
             if not isinstance(msg, AssistantMessage):
                 return
             content = getattr(msg, "content", None)
             if not isinstance(content, list):
                 return
+            # Compact tool-use status lines (e.g. a /goal turn running Bash).
+            for b in content:
+                if isinstance(b, ToolUseBlock):
+                    name = getattr(b, "name", "tool") or "tool"
+                    await safe_send_message(channel, content=f"-# 🔧 {name}")
             parts = [
                 b.text for b in content
                 if isinstance(b, TextBlock) and (getattr(b, "text", "") or "").strip()
@@ -1894,6 +1938,21 @@ class ClaudedBot(commands.Bot):
                 first = False
         except Exception:
             log.debug("#324: relay bg message failed", exc_info=True)
+
+    async def _relay_bg_footer(self, channel: Any, result: Any) -> None:
+        """#324 G3: post a compact per-continuation footer (tokens) for a
+        ``ResultMessage`` that arrives between turns. Cost is cumulative on the
+        SDK ``ResultMessage`` so we surface only the per-turn token counts here
+        to avoid a misleading cost figure. Best-effort; never raises."""
+        try:
+            usage = getattr(result, "usage", None) or {}
+            it_ = int(usage.get("input_tokens", 0) or 0)
+            ot = int(usage.get("output_tokens", 0) or 0)
+            if not (it_ or ot):
+                return
+            await safe_send_message(channel, content=f"-# 📥 {it_} │ 📤 {ot}")
+        except Exception:
+            log.debug("#324: relay bg footer failed", exc_info=True)
 
     def _make_subagent_start_cb(self, thread_id: int) -> Any:
         """review A4/A5: build a SubagentStart callback that records a pending
