@@ -3000,7 +3000,7 @@ class DiscordRenderer:
                     log.debug("C3 partial-delivery notice failed", exc_info=True)
                 # Don't re-raise — caller (_render_with_retry) won't stop_session.
                 return
-            if "buffer size" in str(exc) or "exceeded maximum buffer" in str(exc):
+            if self._is_oversized_frame_error(exc):
                 # #audit(live-log): a single SDK stdout JSON frame exceeded
                 # max_buffer_size. The bridge is already torn down by
                 # send_message's except path, so log this distinctly (NOT a
@@ -4623,6 +4623,19 @@ class DiscordRenderer:
     # Crash notification with retry
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _is_oversized_frame_error(exc: BaseException) -> bool:
+        """#331: True iff ``exc`` is the SDK's single-frame buffer overflow.
+
+        The SDK raises with "exceeded maximum buffer size" when one CLI stdout
+        NDJSON frame is larger than ``max_buffer_size`` — classically a ``Read``
+        of a large image whose base64 the CLI inlines (and duplicates) in the
+        tool_result. There is no exception subclass to match on, so we probe the
+        message; the render-loop error path uses the same test.
+        """
+        s = str(exc).lower()
+        return "exceeded maximum buffer" in s or "buffer size" in s
+
     async def send_error_with_retry(
         self,
         exc: BaseException,
@@ -4634,6 +4647,37 @@ class DiscordRenderer:
         re-send the last user message through a fresh bridge; this class
         does not know about sessions, so the wiring lives in the bot.
         """
+        if self._is_oversized_frame_error(exc):
+            # #331: a single tool_result frame (typically a Read of a large
+            # image/file whose inlined base64 the CLI duplicates) blew past the
+            # SDK's per-frame buffer, which tore the bridge down. Do NOT offer
+            # the auto-retry here: it re-sends the SAME message, re-Reads the
+            # SAME file, and crashes identically — an infinite loop. Give a
+            # specific, actionable message instead. The bot already dropped the
+            # bridge, but the persisted session_id survives, so the user's next
+            # message resumes from the transcript (the oversized tool_result is
+            # already in history, not re-streamed live) and continues cleanly.
+            embed = discord.Embed(
+                title="⚠️ Tool result too large to stream",
+                description=(
+                    "The last turn read something too large to stream back — "
+                    "usually a big image or file, whose inlined data exceeded "
+                    "the size limit for a single streamed message — so the turn "
+                    "was stopped.\n\n"
+                    "**Just send your next message to continue.** The session "
+                    "picks up from where it left off; avoid re-reading that same "
+                    "large file, or resize/trim it first.\n\n"
+                    f"Detail: `{str(exc)[:300]}`"
+                )[:_RETRY_EMBED_DESC_MAX],
+                color=COLOR_TOOL_FAILURE,
+            )
+            sent = await safe_send_message(self.target, embed=embed)
+            if sent is None:
+                log.warning(
+                    "#331 oversized-frame notice did not post (transient exhaustion)",
+                    extra={"target_id": getattr(self.target, "id", None)},
+                )
+            return
         embed = discord.Embed(
             title="❌ Claude session crashed",
             description=(
