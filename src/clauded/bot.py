@@ -1870,17 +1870,52 @@ class ClaudedBot(commands.Bot):
                 or thread_id in self._active_goals
             )
 
+        # A completed background task makes the agent AUTO-CONTINUE in a fresh
+        # turn (reacting to the result: reporting, committing, fixing) — and that
+        # continuation is delivered to THIS reader via receive_pending. But the
+        # continuation can contain long quiet gaps (a build, a rebase, any
+        # multi-minute tool), and _pending() flips False the instant the task's
+        # own subagents / _task_states clear — which is EXACTLY when the terminal
+        # notif lands and the continuation begins. Gating re-entry on _pending()
+        # alone therefore tears the reader down in the first >quiet_gap lull of
+        # the continuation, dropping its tail (incident: a workflow's build-
+        # failure verdict never reached Discord; the thread sat silent 43 min
+        # until the user poked it). So we also track the continuation lifecycle:
+        # once a background task reaches a terminal state (or the agent starts
+        # emitting continuation output) we stay alive — through arbitrarily long
+        # tool gaps — until that continuation's OWN ResultMessage arrives. The
+        # max-lifetime backstop still bounds a continuation whose Result never
+        # comes (a genuinely wedged turn).
+        from .claude_bridge import AssistantMessage as _AM, ResultMessage as _RM
+
+        def _terminal_task_notif(m: Any) -> bool:
+            # A background Task* reaching completed/failed/stopped means the agent
+            # is about to auto-continue reacting to it.
+            if type(m).__name__ not in ("TaskNotificationMessage", "TaskUpdatedMessage"):
+                return False
+            return str(getattr(m, "status", "") or "").lower() in ("completed", "failed", "stopped")
+
+        continuation_active = False
         try:
             # #324 G5: poll in rounds. Each receive_pending() call opens a FRESH
             # iterator, drains the current burst, and returns after `quiet_gap`
             # of silence (its post-timeout iterator is discarded — resuming a
             # cancelled anyio receive is unsafe, so we open a new one per round).
-            # We re-enter ONLY while background work is pending, so a paused
-            # /goal or background loop survives inter-turn silence while a truly
-            # idle session winds down after a single quiet gap (was a flat 600s).
-            # The max-lifetime backstop bounds a wedged / orphaned counter.
+            # We re-enter while background work is pending OR a continuation is in
+            # flight, so a paused /goal, a background loop, or a post-workflow
+            # continuation survives inter-turn silence while a truly idle session
+            # winds down after a single quiet gap (was a flat 600s). The
+            # max-lifetime backstop bounds a wedged / orphaned counter.
             while True:
                 async for msg in bridge.receive_pending(per_message_timeout=quiet_gap):
+                    # Track the background-continuation lifecycle so a long quiet
+                    # tool gap mid-continuation can't tear us down and drop the
+                    # tail. Terminal task-notif / any continuation output opens the
+                    # window; the continuation's own ResultMessage closes it.
+                    if isinstance(msg, _RM):
+                        continuation_active = False
+                    elif isinstance(msg, _AM) or _terminal_task_notif(msg):
+                        continuation_active = True
                     # #324 review fix: route Task* through the turn's renderer so
                     # a background task's terminal (✅/❌) finalizes the embed it
                     # started; only non-Task* messages fall through to the relay.
@@ -1891,7 +1926,7 @@ class ClaudedBot(commands.Bot):
                         log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
                     if not handled:
                         await self._relay_bg_message(channel, msg, renderer=renderer)
-                if not _pending() or time.monotonic() > deadline:
+                if (not _pending() and not continuation_active) or time.monotonic() > deadline:
                     break
             # #panel-consolidation: background task stream went idle — finalize
             # the rolling task panel so its last rows land. (On cancellation we
