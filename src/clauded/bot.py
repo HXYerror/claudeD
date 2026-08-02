@@ -1846,17 +1846,28 @@ class ClaudedBot(commands.Bot):
         #324 G5: pending-aware window. While this thread still has background
         work in flight (a workflow task tracked by the renderer, or a pending
         subagent), keep waiting through short quiet gaps; once nothing is
-        pending, a single quiet gap winds the reader down. An absolute
-        max-lifetime backstop bounds a wedged / orphaned counter. This replaces
-        the old flat ``CLAUDED_BG_IDLE_TIMEOUT`` window, which both dropped slow
-        tasks (>600s) and blocked truly-idle sessions for the full window.
+        pending, a single quiet gap winds the reader down. An INACTIVITY
+        backstop (``max_life`` elapsed with zero progress) bounds a wedged /
+        orphaned counter. This replaces the old flat ``CLAUDED_BG_IDLE_TIMEOUT``
+        window, which both dropped slow tasks (>600s) and blocked truly-idle
+        sessions for the full window.
 
         Always cancellable; never runs concurrently with a turn (the bridge
         cancels it at the start of the next send_message and on stop).
         """
         quiet_gap = float(os.environ.get("CLAUDED_BG_QUIET_GAP", "8"))
+        # #max-life-inactivity: max_life is an INACTIVITY backstop, not a hard
+        # lifetime cap. A reader genuinely relaying a long workflow — messages
+        # arriving, or its pending set advancing round-to-round — keeps resetting
+        # this clock, so an 80-minute workflow's completion + the agent's
+        # continuation still get relayed. Only a WEDGED reader (pending stuck
+        # True, or a continuation whose ResultMessage never comes) with zero
+        # progress for the FULL window is torn down. Incident: the old HARD cap
+        # (`time.monotonic() > start + 3600`) fired 12 min before an 81-min
+        # workflow finished, so its build report never reached Discord and the
+        # CLI then wedged mid-turn on transport backpressure.
         max_life = float(os.environ.get("CLAUDED_BG_MAX_LIFETIME", "3600"))
-        deadline = time.monotonic() + max_life
+        last_active = time.monotonic()
 
         def _pending() -> bool:
             # #goal (defensive): a thread with an active-goal marker counts as
@@ -1869,6 +1880,21 @@ class ClaudedBot(commands.Bot):
                 or bool(self._pending_subagents.get(thread_id))
                 or thread_id in self._active_goals
             )
+
+        def _pending_sig() -> tuple:
+            # A cheap fingerprint of the in-flight set that ADVANCES on genuine
+            # progress (a subagent starts/stops, a task row appears/clears) but
+            # stays STATIC for a leaked/orphaned counter — so a changed signature
+            # resets the inactivity clock while a stuck-True counter can't forge
+            # liveness. Complements the per-message reset: message traffic covers
+            # a chatty workflow, this covers quiet subagent lifecycle churn.
+            subs = self._pending_subagents.get(thread_id) or {}
+            ts = getattr(renderer, "_task_states", None) or {}
+            try:
+                sk, tk = frozenset(map(str, subs)), frozenset(map(str, ts))
+            except Exception:
+                sk, tk = len(subs), len(ts)
+            return (tk, sk, thread_id in self._active_goals)
 
         # A completed background task makes the agent AUTO-CONTINUE in a fresh
         # turn (reacting to the result: reporting, committing, fixing) — and that
@@ -1906,8 +1932,11 @@ class ClaudedBot(commands.Bot):
             # continuation survives inter-turn silence while a truly idle session
             # winds down after a single quiet gap (was a flat 600s). The
             # max-lifetime backstop bounds a wedged / orphaned counter.
+            prev_sig = _pending_sig()
             while True:
+                got_msg = False
                 async for msg in bridge.receive_pending(per_message_timeout=quiet_gap):
+                    got_msg = True
                     # Track the background-continuation lifecycle so a long quiet
                     # tool gap mid-continuation can't tear us down and drop the
                     # tail. Terminal task-notif / any continuation output opens the
@@ -1926,7 +1955,17 @@ class ClaudedBot(commands.Bot):
                         log.debug("#324: bg Task* dispatch failed thread=%s", thread_id, exc_info=True)
                     if not handled:
                         await self._relay_bg_message(channel, msg, renderer=renderer)
-                if (not _pending() and not continuation_active) or time.monotonic() > deadline:
+                # #max-life-inactivity: genuine progress this round — a relayed
+                # message, or the pending set advancing — resets the backstop, so
+                # a long-but-live workflow is never torn down mid-flight. A wedged
+                # reader produces neither and trips the backstop after max_life.
+                sig = _pending_sig()
+                if got_msg or sig != prev_sig:
+                    last_active = time.monotonic()
+                prev_sig = sig
+                if (not _pending() and not continuation_active) or (
+                    time.monotonic() - last_active > max_life
+                ):
                     break
             # #panel-consolidation: background task stream went idle — finalize
             # the rolling task panel so its last rows land. (On cancellation we
