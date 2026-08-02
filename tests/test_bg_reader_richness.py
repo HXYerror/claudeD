@@ -87,6 +87,66 @@ async def test_bg_reader_exits_when_idle() -> None:
     assert bridge.calls == 1, "idle reader must exit after one round, not loop"
 
 
+class _TaskNotif:
+    """Terminal background-task notification. Named for the attribute the reader
+    keys on (`type(m).__name__`) via a class alias below — a completed/failed/
+    stopped task means the agent is about to auto-continue reacting to it."""
+
+    def __init__(self, status="completed"):
+        self.status = status
+        self.content = None
+
+
+# The reader detects terminal task-notifs by class name; expose this stub under
+# the exact name production checks for.
+_TaskNotif.__name__ = "TaskNotificationMessage"
+
+
+@pytest.mark.asyncio
+async def test_bg_reader_survives_continuation_gap_and_relays_tail() -> None:
+    """Incident regression: a completed background task triggers an auto-
+    continuation that contains a long quiet gap (a build/rebase). _pending() is
+    False the whole time (the workflow's subagents/_task_states already cleared),
+    so the OLD `if not _pending(): break` tore the reader down in the first quiet
+    round and dropped the continuation's tail. The reader must now stay alive —
+    across the empty gap rounds — from the terminal notif through the
+    continuation's OWN ResultMessage, relaying BOTH the head and the tail."""
+    bot = _bot_stub()
+    renderer = _RendererStub(pending=False)  # nothing pending: the incident state
+
+    head = AssistantMessage(content=[TextBlock(text="PART1_head")],
+                            model="claude-x", parent_tool_use_id=None)
+    tail = AssistantMessage(content=[TextBlock(text="PART2_tail")],
+                            model="claude-x", parent_tool_use_id=None)
+    done = ResultMessage(subtype="result", duration_ms=10, duration_api_ms=5,
+                         is_error=False, num_turns=1, session_id="s",
+                         total_cost_usd=0.01,
+                         usage={"input_tokens": 1, "output_tokens": 1})
+    bridge = _RoundBridge([
+        [_TaskNotif("failed"), head],  # terminal notif + continuation head
+        [],                            # ── the quiet gap (a build) ──
+        [],                            # ── still building ──
+        [tail, done],                  # continuation tail + its ResultMessage
+    ])
+
+    await ClaudedBot._bg_reader_loop(bot, 7, bridge, FakeTarget(), renderer)
+
+    # Survived the two empty gap rounds (would be calls==1 under the old gate),
+    # then exited one round after the continuation's ResultMessage.
+    assert bridge.calls == 4, (
+        f"reader must survive the continuation gap; rounds={bridge.calls}"
+    )
+    relayed = [c.args[1] for c in bot._relay_bg_message.await_args_list]
+    texts = [
+        b.text
+        for m in relayed
+        for b in (getattr(m, "content", None) or [])
+        if type(b).__name__ == "TextBlock"
+    ]
+    assert "PART1_head" in texts, "head must be relayed"
+    assert "PART2_tail" in texts, "TAIL must be relayed (the dropped incident text)"
+
+
 # ---------------------------------------------------------------------------
 # G3: richer continuation relay (tool-use + footer)
 # ---------------------------------------------------------------------------
