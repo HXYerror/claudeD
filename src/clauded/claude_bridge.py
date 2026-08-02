@@ -318,37 +318,23 @@ class ClaudeBridge:
         happens FIRST so a rejection from the underlying CLI leaves
         our override unchanged (no lying display).
 
-        #280: also caches the new model's context window from
-        ``KNOWN_MODELS`` into ``_context_window_override``. The SDK's
-        ``get_context_usage()`` does NOT refresh its ``maxTokens`` /
-        ``rawMaxTokens`` until the next turn round-trips, so without
-        this cache ``/context`` and the footer 🧠 segment would
-        display the *previous* model's window (e.g. sonnet's 200k
-        instead of opus's 1M) until the user sends another message.
-        Unknown models leave the override unset so we fall back to
-        whatever the SDK eventually reports.
+        Context window: we do NOT cache a hardcoded window here. The
+        SDK's ``get_context_usage()`` reports the NEW model's
+        ``maxTokens`` immediately after ``set_model`` (verified against
+        CLI 2.1.212 — no round-trip needed), so the CLI is authoritative
+        and dynamic. The old #280 workaround cached a window from a
+        hardcoded ``KNOWN_MODELS`` table; that table inevitably drifts
+        (it can't know ``opus-5`` = 200k vs ``opus-5[1m]`` = 1M) and was
+        itself the source of wrong denominators, so it is removed. The
+        override field stays as a dormant manual escape hatch (default
+        ``None`` ⇒ trust the SDK's live window).
         """
         if self._client is None or not self._active:
             raise RuntimeError("bridge not active")
         await self._client.set_model(model)
         self._model_override = model
-        # #280: cache the new model's context window for /context display.
-        # Local import avoids a hard cog→bridge dependency cycle at import
-        # time; ``cogs.model`` already imports from this module's siblings.
-        from .cogs.model import KNOWN_MODELS
+        # Trust the CLI's live window (see docstring). No KNOWN_MODELS cache.
         self._context_window_override = None
-        # Exact id match first, then alias match. No startswith — it
-        # causes prefix collisions (e.g. sonnet-4-6 swallows sonnet-4-6-1m).
-        best = None
-        for alias, info in KNOWN_MODELS.items():
-            model_id = info["id"]
-            if model == model_id or model == alias:
-                best = info
-                break
-        if best is not None:
-            ctx = best.get("context")
-            if isinstance(ctx, int) and ctx > 0:
-                self._context_window_override = ctx
 
     @property
     def is_active(self) -> bool:
